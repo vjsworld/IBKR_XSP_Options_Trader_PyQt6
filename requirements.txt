@@ -1,0 +1,22 @@
+# SPX 0DTE Options Trading Application - PyQt6 Edition
+# Python 3.11+ required
+
+# Core GUI Framework
+PyQt6>=6.6.0
+PyQt6-WebEngine>=6.6.0
+
+# Charting Library (TradingView lightweight-charts)
+lightweight-charts>=2.0
+
+# Interactive Brokers API
+ibapi>=9.81.1
+
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Options Greeks Calculations
+scipy>=1.11.0
+
+# Optional: Better datetime handling
+python-dateutil>=2.8.2
