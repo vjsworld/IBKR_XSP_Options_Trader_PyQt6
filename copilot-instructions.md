@@ -1,7 +1,145 @@
-# SPX 0DTE Options Trading Application - PyQt6 Edition
+# Dual-Instrument Options Trading Application - PyQt6 Edition (SPX/XSP)
 
 ## Project Overview
-Professional Bloomberg/TWS-style GUI application for automated 0DTE (Zero Days To Expiration) SPX options trading via Interactive Brokers API. Modern PyQt6 architecture with TradingView lightweight-charts for real-time market data visualization.
+Professional Bloomberg/TWS-style GUI application for automated 0DTE (Zero Days To Expiration) options trading via Interactive Brokers API. **Designed to trade TWO separate instruments** (SPX and XSP) with configurable settings. Modern PyQt6 architecture with TradingView lightweight-charts for real-time market data visualization.
+
+## ⚠️ CRITICAL: Symbol-Agnostic Code Design
+
+### Never Hardcode Symbol Names in Functions/Variables
+
+**The application MUST support multiple instruments** (SPX, XSP, etc.) through configuration, not hardcoding.
+
+**✅ CORRECT - Generic naming:**
+```python
+# Functions use generic terms
+def create_option_contract(self, strike: float, right: str, symbol: str, trading_class: str):
+    """Works for ANY symbol (SPX, XSP, etc.)"""
+    pass
+
+def subscribe_underlying_price(self, symbol: str, sec_type: str, exchange: str):
+    """Generic function for any underlying"""
+    pass
+
+# Variables use generic terms
+self.underlying_price = 0.0     # ✓ Generic
+self.underlying_symbol = "SPX"  # ✓ Configuration
+self.option_contracts = []      # ✓ Generic
+self.options_symbol = "SPX"     # ✓ Configuration
+```
+
+**❌ WRONG - Symbol-specific naming:**
+```python
+def create_spx_contract():     # ✗ Hardcoded SPX
+def subscribe_spx_price():     # ✗ Hardcoded SPX
+self.spx_price = 0.0           # ✗ Hardcoded SPX
+self.spx_contracts = []        # ✗ Hardcoded SPX
+```
+
+### Dual-Instrument Configuration Pattern
+
+Configure instruments at the top of the application:
+
+```python
+# ============================================================================
+# INSTRUMENT CONFIGURATION - Two separate tradable instruments
+# ============================================================================
+
+INSTRUMENT_CONFIG = {
+    'SPX': {
+        'name': 'SPX',
+        'underlying_symbol': 'SPX',          # Index symbol
+        'options_symbol': 'SPX',             # Options symbol
+        'options_trading_class': 'SPXW',    # Weekly options
+        'underlying_type': 'IND',            # Index
+        'underlying_exchange': 'CBOE',
+        'multiplier': '100',
+        'strike_increment': 5.0,
+        'tick_size_above_3': 0.10,           # >= $3.00
+        'tick_size_below_3': 0.05,           # < $3.00
+        'description': 'S&P 500 Index Options (Full size)'
+    },
+    'XSP': {
+        'name': 'XSP',
+        'underlying_symbol': 'XSP',          # Mini-SPX symbol
+        'options_symbol': 'XSP',
+        'options_trading_class': 'XSP',
+        'underlying_type': 'STK',            # Stock/ETF type
+        'underlying_exchange': 'ARCA',
+        'multiplier': '100',
+        'strike_increment': 1.0,
+        'tick_size_above_3': 0.05,
+        'tick_size_below_3': 0.05,
+        'description': 'Mini-SPX Options (1/10 size)'
+    }
+}
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        
+        # Select instrument via settings or UI
+        self.current_instrument = 'SPX'  # Default, or from settings
+        self.instrument = INSTRUMENT_CONFIG[self.current_instrument]
+        
+        # Extract configuration for easy access
+        self.underlying_symbol = self.instrument['underlying_symbol']
+        self.options_symbol = self.instrument['options_symbol']
+        self.trading_class = self.instrument['options_trading_class']
+```
+
+### Generic Function Implementation
+
+All functions must accept symbol parameters, never hardcode:
+
+```python
+def subscribe_underlying_price(self):
+    """Subscribe to underlying price - works for any configured instrument"""
+    underlying_contract = Contract()
+    underlying_contract.symbol = self.underlying_symbol  # From config
+    underlying_contract.secType = self.instrument['underlying_type']
+    underlying_contract.currency = "USD"
+    underlying_contract.exchange = self.instrument['underlying_exchange']
+    
+    req_id = self.next_req_id()
+    self.app_state['underlying_req_id'] = req_id
+    self.ibkr_client.reqMktData(req_id, underlying_contract, "", False, False, [])
+    logger.info(f"Subscribed to {self.underlying_symbol} underlying price")
+
+def create_option_contract(self, strike: float, right: str) -> Contract:
+    """Create option contract for current instrument"""
+    contract = Contract()
+    contract.symbol = self.options_symbol  # From config
+    contract.secType = "OPT"
+    contract.currency = "USD"
+    contract.exchange = "SMART"
+    contract.tradingClass = self.trading_class  # From config
+    contract.strike = strike
+    contract.right = right
+    contract.lastTradeDateOrContractMonth = self.current_expiry
+    contract.multiplier = self.instrument['multiplier']
+    return contract
+
+def round_to_tick_size(self, price: float) -> float:
+    """Round price to instrument-specific tick size"""
+    if price >= 3.00:
+        tick_size = self.instrument['tick_size_above_3']
+    else:
+        tick_size = self.instrument['tick_size_below_3']
+    return round(price / tick_size) * tick_size
+```
+
+### UI Must Show Current Instrument
+
+```python
+# Update window title
+self.setWindowTitle(f"{self.instrument['name']} 0DTE Options Trader - PyQt6 Professional Edition")
+
+# Update labels
+self.underlying_price_label = QLabel(f"{self.instrument['name']}: Loading...")
+
+# Log messages should include symbol
+logger.info(f"Requesting {self.options_symbol} option chain for 0DTE...")
+```
 
 ## Python Environment (CRITICAL!)
 
