@@ -149,6 +149,40 @@ except ImportError:
 
 
 # ============================================================================
+# INSTRUMENT CONFIGURATION - Dual-Instrument Support
+# ============================================================================
+
+INSTRUMENT_CONFIG = {
+    'SPX': {
+        'name': 'SPX',
+        'underlying_symbol': 'SPX',          # Index symbol
+        'options_symbol': 'SPX',             # Options symbol  
+        'options_trading_class': 'SPXW',    # Weekly options
+        'underlying_type': 'IND',            # Index
+        'underlying_exchange': 'CBOE',
+        'multiplier': '100',
+        'strike_increment': 5.0,             # $5 increments
+        'tick_size_above_3': 0.10,           # >= $3.00: $0.10 tick
+        'tick_size_below_3': 0.05,           # < $3.00: $0.05 tick
+        'description': 'S&P 500 Index Options (Full size, $100 multiplier)'
+    },
+    'XSP': {
+        'name': 'XSP',
+        'underlying_symbol': 'XSP',          # Mini-SPX symbol
+        'options_symbol': 'XSP',
+        'options_trading_class': 'XSP',
+        'underlying_type': 'STK',            # Stock/ETF type
+        'underlying_exchange': 'ARCA',
+        'multiplier': '100',
+        'strike_increment': 1.0,             # $1 increments (1/10 of SPX)
+        'tick_size_above_3': 0.05,
+        'tick_size_below_3': 0.05,
+        'description': 'Mini-SPX Options (1/10 size of SPX, $100 multiplier)'
+    }
+}
+
+
+# ============================================================================
 # BLACK-SCHOLES GREEKS CALCULATIONS
 # ============================================================================
 
