@@ -122,10 +122,9 @@ except ImportError as e:
     sys.exit(1)
 
 # Data processing
-logger.info("Loading data processing libraries (pandas, numpy, scipy)...")
+logger.info("Loading data processing libraries (pandas, numpy)...")
 import pandas as pd
 import numpy as np
-from scipy.stats import norm
 logger.info("Data processing libraries loaded successfully")
 
 # Interactive Brokers API
@@ -183,77 +182,11 @@ INSTRUMENT_CONFIG = {
 
 
 # ============================================================================
-# BLACK-SCHOLES GREEKS CALCULATIONS
-# ============================================================================
-
-def calculate_greeks(option_type: str, spot_price: float, strike: float, 
-                     time_to_expiry: float, volatility: float, risk_free_rate: float = 0.05) -> dict:
-    """
-    Calculate option greeks using Black-Scholes model
-    
-    Args:
-        option_type: 'C' for call, 'P' for put
-        spot_price: Current price of underlying (SPX)
-        strike: Strike price of option
-        time_to_expiry: Time to expiration in years
-        volatility: Implied volatility as decimal (e.g., 0.20 for 20%)
-        risk_free_rate: Risk-free interest rate as decimal (default 0.05 for 5%)
-    
-    Returns:
-        dict with keys: delta, gamma, theta, vega, iv
-    """
-    try:
-        logger.debug(f"Calculating greeks: {option_type} spot={spot_price} strike={strike} tte={time_to_expiry} vol={volatility}")
-        if time_to_expiry <= 0:
-            # At expiration
-            if option_type == 'C':
-                delta = 1.0 if spot_price > strike else 0.0
-            else:
-                delta = -1.0 if spot_price < strike else 0.0
-            return {'delta': delta, 'gamma': 0.0, 'theta': 0.0, 'vega': 0.0, 'iv': volatility}
-        
-        if volatility <= 0 or spot_price <= 0 or strike <= 0:
-            return {'delta': 0.0, 'gamma': 0.0, 'theta': 0.0, 'vega': 0.0, 'iv': 0.0}
-        
-        # Calculate d1 and d2
-        d1 = (math.log(spot_price / strike) + (risk_free_rate + 0.5 * volatility ** 2) * time_to_expiry) / (volatility * math.sqrt(time_to_expiry))
-        d2 = d1 - volatility * math.sqrt(time_to_expiry)
-        
-        N_d1 = norm.cdf(d1)
-        N_d2 = norm.cdf(d2)
-        n_d1 = norm.pdf(d1)
-        
-        # Delta
-        delta = N_d1 if option_type == 'C' else N_d1 - 1.0
-        
-        # Gamma (same for calls and puts)
-        gamma = n_d1 / (spot_price * volatility * math.sqrt(time_to_expiry))
-        
-        # Theta (per day)
-        if option_type == 'C':
-            theta = (-(spot_price * n_d1 * volatility) / (2 * math.sqrt(time_to_expiry)) 
-                    - risk_free_rate * strike * math.exp(-risk_free_rate * time_to_expiry) * N_d2) / 365
-        else:
-            theta = (-(spot_price * n_d1 * volatility) / (2 * math.sqrt(time_to_expiry)) 
-                    + risk_free_rate * strike * math.exp(-risk_free_rate * time_to_expiry) * (1 - N_d2)) / 365
-        
-        # Vega (per 1% change)
-        vega = spot_price * math.sqrt(time_to_expiry) * n_d1 / 100
-        
-        return {
-            'delta': round(float(delta), 4),
-            'gamma': round(float(gamma), 4),
-            'theta': round(float(theta), 4),
-            'vega': round(float(vega), 4),
-            'iv': round(volatility, 4)
-        }
-    except Exception as e:
-        logger.error(f"Error calculating greeks: {e}", exc_info=True)
-        return {'delta': 0.0, 'gamma': 0.0, 'theta': 0.0, 'vega': 0.0, 'iv': 0.0}
-
-
-# ============================================================================
 # CONNECTION STATE MACHINE
+# ============================================================================
+# Note: Greeks (delta, gamma, theta, vega, IV) are calculated by IBKR
+# and received via tickOptionComputation callback using mid-price model.
+# No local Black-Scholes calculation needed.
 # ============================================================================
 
 class ConnectionState(Enum):

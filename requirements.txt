@@ -15,8 +15,5 @@ ibapi>=9.81.1
 pandas>=2.0.0
 numpy>=1.24.0
 
-# Options Greeks Calculations
-scipy>=1.11.0
-
 # Optional: Better datetime handling
 python-dateutil>=2.8.2
