@@ -143,6 +143,7 @@ try:
     from lightweight_charts import Chart
     CHARTS_AVAILABLE = True
 except ImportError:
+    Chart = None  # Define as None when not available
     CHARTS_AVAILABLE = False
     logger.warning("lightweight-charts not installed. Charts will be disabled.")
 
@@ -444,7 +445,7 @@ class ChartWidget(QWidget):
         header.setStyleSheet("font-size: 12pt; font-weight: bold; color: #e0e0e0; padding: 5px;")
         layout.addWidget(header)
         
-        if CHARTS_AVAILABLE:
+        if CHARTS_AVAILABLE and Chart is not None:
             try:
                 # Create lightweight-charts instance
                 self.chart = Chart(width=600, height=400, title=self.title)
@@ -1367,7 +1368,7 @@ class MainWindow(QMainWindow):
     # WINDOW LIFECYCLE
     # ========================================================================
     
-    def closeEvent(self, event):
+    def closeEvent(self, a0):  # type: ignore[override]
         """Handle window close event"""
         reply = QMessageBox.question(
             self,
@@ -1382,9 +1383,9 @@ class MainWindow(QMainWindow):
             if self.connection_state == ConnectionState.CONNECTED:
                 self.disconnect_from_ibkr()
             
-            event.accept()
+            a0.accept()
         else:
-            event.ignore()
+            a0.ignore()
 
 
 # ============================================================================

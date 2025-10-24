@@ -174,12 +174,78 @@ logger.info(f"Requesting {self.options_symbol} option chain for 0DTE...")
 - `lightweight-charts-python>=2.0`: TradingView charting library
 - `ibapi>=9.81.1`: Interactive Brokers API
 - `pandas>=2.0.0`, `numpy>=1.24.0`: Data processing
-- `scipy>=1.11.0`: Black-Scholes greeks calculations
 
 **Install all dependencies**: 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
+
+### ⚠️ CRITICAL: Greeks Calculation - DO NOT Use Black-Scholes
+
+**✅ CORRECT - Use IBKR's model-based greeks:**
+```python
+# Greeks are automatically provided by IBKR via tickOptionComputation callback
+def tickOptionComputation(self, reqId, tickType, tickAttrib, 
+                          impliedVol, delta, optPrice, pvDividend,
+                          gamma, vega, theta, undPrice):
+    """
+    IBKR provides model-based greeks calculated using bid/ask mid-price.
+    This is MORE ACCURATE than custom Black-Scholes calculations.
+    
+    tickType 13 = MODEL_OPTION (computed greeks)
+    - delta: Position delta
+    - gamma: Gamma (rate of change of delta)
+    - theta: Theta (time decay per day)
+    - vega: Vega (sensitivity to volatility per 1%)
+    - impliedVol: Implied volatility
+    """
+    if tickType == 13:  # MODEL_OPTION
+        contract_key = self.app.market_data_map.get(reqId)
+        if contract_key:
+            self.app.market_data[contract_key].update({
+                'delta': delta,
+                'gamma': gamma,
+                'theta': theta,
+                'vega': vega,
+                'iv': impliedVol
+            })
+            # Emit signal for GUI update
+            self.app.main_window.market_data_updated.emit(contract_key, 
+                                                          self.app.market_data[contract_key])
+```
+
+**❌ WRONG - Do NOT implement Black-Scholes:**
+```python
+# ✗ DO NOT DO THIS - Removed from codebase
+from scipy.stats import norm  # ✗ Dependency removed
+
+def calculate_greeks(spot, strike, tte, vol, rate):  # ✗ Function removed
+    """
+    This approach is LESS ACCURATE than IBKR's model-based greeks because:
+    1. IBKR uses actual bid/ask mid-price (real market conditions)
+    2. IBKR's model accounts for dividends, rates, early exercise
+    3. Custom Black-Scholes requires manual volatility/rate inputs
+    4. Adds unnecessary scipy dependency
+    """
+    d1 = (math.log(spot / strike) + (rate + 0.5 * vol**2) * tte) / (vol * math.sqrt(tte))
+    d2 = d1 - vol * math.sqrt(tte)
+    # ... ✗ Don't implement this
+```
+
+**Why IBKR's greeks are superior:**
+1. ✅ **Real-time accuracy**: Calculated from actual bid/ask mid-price
+2. ✅ **Professional model**: Uses IBKR's institutional-grade pricing
+3. ✅ **Market conditions**: Accounts for dividends, interest rates, early exercise
+4. ✅ **No manual inputs**: No need to estimate volatility or risk-free rate
+5. ✅ **Simpler code**: Eliminates 60+ lines of Black-Scholes calculations
+6. ✅ **Fewer dependencies**: Removes scipy requirement
+
+**Implementation notes:**
+- Subscribe to market data with `reqMktData()` for each option contract
+- Greeks arrive automatically via `tickOptionComputation` callback
+- Update GUI using PyQt signals from the callback (thread-safe)
+- Store greeks in `market_data[contract_key]` dictionary
+- No calculation code needed - IBKR does all the work
 
 ## Core Architecture
 
