@@ -529,6 +529,7 @@ class MainWindow(QMainWindow):
             'account': '',
             'market_data_map': {},  # reqId -> contract_key
             'historical_data_requests': {},  # reqId -> contract_key
+            'active_option_req_ids': [],  # Track active option chain request IDs
         }
         
         # Trading state
@@ -1131,6 +1132,19 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(2000, self.request_option_chain)
             return
         
+        # Cancel existing option chain subscriptions to avoid duplicate ticker ID errors
+        if self.app_state.get('active_option_req_ids'):
+            self.log_message(f"Canceling {len(self.app_state['active_option_req_ids'])} existing subscriptions...", "INFO")
+            for req_id in self.app_state['active_option_req_ids']:
+                try:
+                    self.ibkr_client.cancelMktData(req_id)
+                except Exception as e:
+                    logger.debug(f"Error canceling reqId {req_id}: {e}")
+            self.app_state['active_option_req_ids'] = []
+            # Clear market data map for old requests
+            self.app_state['market_data_map'] = {k: v for k, v in self.app_state['market_data_map'].items() 
+                                                  if not (isinstance(k, int) and 100 <= k <= 999)}
+        
         spx_price = self.app_state['spx_price']
         center_strike = round(spx_price / 5) * 5
         
@@ -1150,6 +1164,7 @@ class MainWindow(QMainWindow):
         
         # Subscribe to market data for each strike
         req_id = 100  # Start from 100 for option contracts
+        new_req_ids = []  # Track new request IDs
         
         for row, strike in enumerate(strikes):
             # Create call contract
@@ -1167,6 +1182,7 @@ class MainWindow(QMainWindow):
             call_key = f"SPX_{strike}_C_{self.current_expiry}"
             self.app_state['market_data_map'][req_id] = call_key
             self.ibkr_client.reqMktData(req_id, call_contract, "", False, False, [])
+            new_req_ids.append(req_id)
             req_id += 1
             
             # Create put contract
@@ -1184,6 +1200,7 @@ class MainWindow(QMainWindow):
             put_key = f"SPX_{strike}_P_{self.current_expiry}"
             self.app_state['market_data_map'][req_id] = put_key
             self.ibkr_client.reqMktData(req_id, put_contract, "", False, False, [])
+            new_req_ids.append(req_id)
             req_id += 1
             
             # Set strike in table
@@ -1193,6 +1210,8 @@ class MainWindow(QMainWindow):
             strike_item.setBackground(QColor("#2a4a6a"))
             self.option_table.setItem(row, 10, strike_item)
         
+        # Store active request IDs for future cleanup
+        self.app_state['active_option_req_ids'] = new_req_ids
         self.log_message(f"Subscribed to {len(strikes) * 2} option contracts", "SUCCESS")
     
     def on_option_cell_clicked(self, row: int, col: int):
