@@ -99,11 +99,11 @@ try:
     QHeaderView, QMessageBox, QDialog, QFormLayout, QDialogButtonBox,
     QStatusBar, QGroupBox
 )
-    from PyQt6.QtCore import (
+    from PyQt6.QtCore import (  # type: ignore[import-untyped]
         Qt, QTimer, pyqtSignal, QObject, QThread, pyqtSlot
     )
-    from PyQt6.QtGui import QColor, QFont, QPalette
-    from PyQt6.QtWebEngineWidgets import QWebEngineView
+    from PyQt6.QtGui import QColor, QFont, QPalette  # type: ignore[import-untyped]
+    from PyQt6.QtWebEngineWidgets import QWebEngineView  # type: ignore[import-untyped]
     logger.info("PyQt6 loaded successfully")
     PYQT6_AVAILABLE = True
 except ImportError as e:
@@ -123,8 +123,8 @@ except ImportError as e:
 
 # Data processing
 logger.info("Loading data processing libraries (pandas, numpy)...")
-import pandas as pd
-import numpy as np
+import pandas as pd  # type: ignore[import-untyped]
+import numpy as np  # type: ignore[import-untyped]
 logger.info("Data processing libraries loaded successfully")
 
 # Interactive Brokers API
@@ -140,7 +140,7 @@ logger.info("IBKR API loaded successfully")
 # lightweight-charts (will be integrated in chart widgets)
 logger.info("Loading lightweight-charts...")
 try:
-    from lightweight_charts import Chart
+    from lightweight_charts import Chart  # type: ignore[import-untyped]
     CHARTS_AVAILABLE = True
 except ImportError:
     Chart = None  # Define as None when not available
@@ -448,11 +448,11 @@ class ChartWidget(QWidget):
         if CHARTS_AVAILABLE and Chart is not None:
             try:
                 # Create lightweight-charts instance
-                self.chart = Chart(width=600, height=400, title=self.title)
-                self.candlestick_series = self.chart.create_candlestick_series()
+                self.chart = Chart(width=600, height=400, title=self.title)  # type: ignore[misc]
+                self.candlestick_series = self.chart.create_candlestick_series()  # type: ignore[attr-defined]
                 
                 # Get HTML for WebEngineView
-                html = self.chart.get_webview_html()
+                html = self.chart.get_webview_html()  # type: ignore[attr-defined]
                 
                 # Create WebEngineView
                 self.web_view = QWebEngineView()
@@ -657,7 +657,7 @@ class MainWindow(QMainWindow):
             "Bid", "Ask", "Last", "CHANGE %", "Volume", "Gamma", "Vega", "Theta", "Delta", "Imp Vol"
         ]
         self.option_table.setHorizontalHeaderLabels(headers)
-        self.option_table.verticalHeader().setVisible(False)
+        self.option_table.verticalHeader().setVisible(False)  # type: ignore[union-attr]
         self.option_table.setMinimumHeight(300)
         self.option_table.cellClicked.connect(self.on_option_cell_clicked)
         layout.addWidget(self.option_table)
@@ -686,7 +686,7 @@ class MainWindow(QMainWindow):
         self.positions_table.setHorizontalHeaderLabels([
             "Contract", "Qty", "Entry", "Current", "P&L", "P&L %", "Action"
         ])
-        self.positions_table.verticalHeader().setVisible(False)
+        self.positions_table.verticalHeader().setVisible(False)  # type: ignore[union-attr]
         self.positions_table.setMaximumHeight(200)
         self.positions_table.cellClicked.connect(self.on_position_cell_clicked)
         pos_layout.addWidget(self.positions_table)
@@ -700,7 +700,7 @@ class MainWindow(QMainWindow):
         self.orders_table.setHorizontalHeaderLabels([
             "Order ID", "Contract", "Action", "Qty", "Price", "Status", "Action"
         ])
-        self.orders_table.verticalHeader().setVisible(False)
+        self.orders_table.verticalHeader().setVisible(False)  # type: ignore[union-attr]
         self.orders_table.setMaximumHeight(200)
         self.orders_table.cellClicked.connect(self.on_order_cell_clicked)
         orders_layout.addWidget(self.orders_table)
@@ -1383,9 +1383,9 @@ class MainWindow(QMainWindow):
             if self.connection_state == ConnectionState.CONNECTED:
                 self.disconnect_from_ibkr()
             
-            a0.accept()
+            a0.accept()  # type: ignore[union-attr]
         else:
-            a0.ignore()
+            a0.ignore()  # type: ignore[union-attr]
 
 
 # ============================================================================
