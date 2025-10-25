@@ -1024,8 +1024,8 @@ class MainWindow(QMainWindow):
         
         self.market_data[contract_key][tick_type] = value
         
-        # Update option chain display (debounced)
-        # TODO: Implement debounced update
+        # Update option chain display immediately
+        self.update_option_chain_cell(contract_key)
     
     @pyqtSlot(str, dict)
     def on_greeks_updated(self, contract_key: str, greeks: dict):
@@ -1037,6 +1037,9 @@ class MainWindow(QMainWindow):
             }
         
         self.market_data[contract_key].update(greeks)
+        
+        # Update option chain display
+        self.update_option_chain_cell(contract_key)
     
     @pyqtSlot(str, dict)
     def on_position_update(self, contract_key: str, position_data: dict):
@@ -1213,6 +1216,71 @@ class MainWindow(QMainWindow):
         # Store active request IDs for future cleanup
         self.app_state['active_option_req_ids'] = new_req_ids
         self.log_message(f"Subscribed to {len(strikes) * 2} option contracts", "SUCCESS")
+    
+    def update_option_chain_cell(self, contract_key: str):
+        """Update a single option chain row with market data"""
+        try:
+            # Parse contract_key: "SPX_6740_C_20251024"
+            parts = contract_key.split('_')
+            if len(parts) != 4:
+                return
+            
+            symbol, strike, right, expiry = parts
+            strike = float(strike)
+            
+            # Find the row for this strike
+            for row in range(self.option_table.rowCount()):
+                strike_item = self.option_table.item(row, 10)  # Strike column
+                if strike_item and float(strike_item.text()) == strike:
+                    # Get market data
+                    data = self.market_data.get(contract_key, {})
+                    
+                    if right == 'C':  # Call options (left side)
+                        # Columns: Imp Vol, Delta, Theta, Vega, Gamma, Volume, CHANGE %, Last, Ask, Bid
+                        self.option_table.setItem(row, 0, QTableWidgetItem(f"{data.get('iv', 0):.2f}"))
+                        self.option_table.setItem(row, 1, QTableWidgetItem(f"{data.get('delta', 0):.3f}"))
+                        self.option_table.setItem(row, 2, QTableWidgetItem(f"{data.get('theta', 0):.2f}"))
+                        self.option_table.setItem(row, 3, QTableWidgetItem(f"{data.get('vega', 0):.2f}"))
+                        self.option_table.setItem(row, 4, QTableWidgetItem(f"{data.get('gamma', 0):.4f}"))
+                        self.option_table.setItem(row, 5, QTableWidgetItem(f"{int(data.get('volume', 0))}"))
+                        
+                        # Calculate change %
+                        last = data.get('last', 0)
+                        prev = data.get('prev_close', 0)
+                        change_pct = ((last - prev) / prev * 100) if prev > 0 else 0
+                        change_item = QTableWidgetItem(f"{change_pct:.1f}%")
+                        change_item.setForeground(QColor("#00ff00" if change_pct >= 0 else "#ff0000"))
+                        self.option_table.setItem(row, 6, change_item)
+                        
+                        self.option_table.setItem(row, 7, QTableWidgetItem(f"{last:.2f}"))
+                        self.option_table.setItem(row, 8, QTableWidgetItem(f"{data.get('ask', 0):.2f}"))
+                        self.option_table.setItem(row, 9, QTableWidgetItem(f"{data.get('bid', 0):.2f}"))
+                    
+                    elif right == 'P':  # Put options (right side)
+                        # Columns: Bid, Ask, Last, CHANGE %, Volume, Gamma, Vega, Theta, Delta, Imp Vol
+                        self.option_table.setItem(row, 11, QTableWidgetItem(f"{data.get('bid', 0):.2f}"))
+                        self.option_table.setItem(row, 12, QTableWidgetItem(f"{data.get('ask', 0):.2f}"))
+                        self.option_table.setItem(row, 13, QTableWidgetItem(f"{data.get('last', 0):.2f}"))
+                        
+                        # Calculate change %
+                        last = data.get('last', 0)
+                        prev = data.get('prev_close', 0)
+                        change_pct = ((last - prev) / prev * 100) if prev > 0 else 0
+                        change_item = QTableWidgetItem(f"{change_pct:.1f}%")
+                        change_item.setForeground(QColor("#00ff00" if change_pct >= 0 else "#ff0000"))
+                        self.option_table.setItem(row, 14, change_item)
+                        
+                        self.option_table.setItem(row, 15, QTableWidgetItem(f"{int(data.get('volume', 0))}"))
+                        self.option_table.setItem(row, 16, QTableWidgetItem(f"{data.get('gamma', 0):.4f}"))
+                        self.option_table.setItem(row, 17, QTableWidgetItem(f"{data.get('vega', 0):.2f}"))
+                        self.option_table.setItem(row, 18, QTableWidgetItem(f"{data.get('theta', 0):.2f}"))
+                        self.option_table.setItem(row, 19, QTableWidgetItem(f"{data.get('delta', 0):.3f}"))
+                        self.option_table.setItem(row, 20, QTableWidgetItem(f"{data.get('iv', 0):.2f}"))
+                    
+                    break
+        
+        except Exception as e:
+            logger.debug(f"Error updating option chain cell for {contract_key}: {e}")
     
     def on_option_cell_clicked(self, row: int, col: int):
         """Handle option chain cell click"""
