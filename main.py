@@ -1237,45 +1237,70 @@ class MainWindow(QMainWindow):
                     
                     if right == 'C':  # Call options (left side)
                         # Columns: Imp Vol, Delta, Theta, Vega, Gamma, Volume, CHANGE %, Last, Ask, Bid
-                        self.option_table.setItem(row, 0, QTableWidgetItem(f"{data.get('iv', 0):.2f}"))
-                        self.option_table.setItem(row, 1, QTableWidgetItem(f"{data.get('delta', 0):.3f}"))
-                        self.option_table.setItem(row, 2, QTableWidgetItem(f"{data.get('theta', 0):.2f}"))
-                        self.option_table.setItem(row, 3, QTableWidgetItem(f"{data.get('vega', 0):.2f}"))
-                        self.option_table.setItem(row, 4, QTableWidgetItem(f"{data.get('gamma', 0):.4f}"))
-                        self.option_table.setItem(row, 5, QTableWidgetItem(f"{int(data.get('volume', 0))}"))
+                        items = [
+                            QTableWidgetItem(f"{data.get('iv', 0):.2f}"),
+                            QTableWidgetItem(f"{data.get('delta', 0):.3f}"),
+                            QTableWidgetItem(f"{data.get('theta', 0):.2f}"),
+                            QTableWidgetItem(f"{data.get('vega', 0):.2f}"),
+                            QTableWidgetItem(f"{data.get('gamma', 0):.4f}"),
+                            QTableWidgetItem(f"{int(data.get('volume', 0))}")
+                        ]
+                        for col, item in enumerate(items):
+                            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                            self.option_table.setItem(row, col, item)
                         
                         # Calculate change %
                         last = data.get('last', 0)
                         prev = data.get('prev_close', 0)
                         change_pct = ((last - prev) / prev * 100) if prev > 0 else 0
                         change_item = QTableWidgetItem(f"{change_pct:.1f}%")
+                        change_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                         change_item.setForeground(QColor("#00ff00" if change_pct >= 0 else "#ff0000"))
                         self.option_table.setItem(row, 6, change_item)
                         
-                        self.option_table.setItem(row, 7, QTableWidgetItem(f"{last:.2f}"))
-                        self.option_table.setItem(row, 8, QTableWidgetItem(f"{data.get('ask', 0):.2f}"))
-                        self.option_table.setItem(row, 9, QTableWidgetItem(f"{data.get('bid', 0):.2f}"))
+                        price_items = [
+                            (7, f"{last:.2f}"),
+                            (8, f"{data.get('ask', 0):.2f}"),
+                            (9, f"{data.get('bid', 0):.2f}")
+                        ]
+                        for col, text in price_items:
+                            item = QTableWidgetItem(text)
+                            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                            self.option_table.setItem(row, col, item)
                     
                     elif right == 'P':  # Put options (right side)
                         # Columns: Bid, Ask, Last, CHANGE %, Volume, Gamma, Vega, Theta, Delta, Imp Vol
-                        self.option_table.setItem(row, 11, QTableWidgetItem(f"{data.get('bid', 0):.2f}"))
-                        self.option_table.setItem(row, 12, QTableWidgetItem(f"{data.get('ask', 0):.2f}"))
-                        self.option_table.setItem(row, 13, QTableWidgetItem(f"{data.get('last', 0):.2f}"))
+                        price_items = [
+                            (11, f"{data.get('bid', 0):.2f}"),
+                            (12, f"{data.get('ask', 0):.2f}"),
+                            (13, f"{data.get('last', 0):.2f}")
+                        ]
+                        for col, text in price_items:
+                            item = QTableWidgetItem(text)
+                            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                            self.option_table.setItem(row, col, item)
                         
                         # Calculate change %
                         last = data.get('last', 0)
                         prev = data.get('prev_close', 0)
                         change_pct = ((last - prev) / prev * 100) if prev > 0 else 0
                         change_item = QTableWidgetItem(f"{change_pct:.1f}%")
+                        change_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                         change_item.setForeground(QColor("#00ff00" if change_pct >= 0 else "#ff0000"))
                         self.option_table.setItem(row, 14, change_item)
                         
-                        self.option_table.setItem(row, 15, QTableWidgetItem(f"{int(data.get('volume', 0))}"))
-                        self.option_table.setItem(row, 16, QTableWidgetItem(f"{data.get('gamma', 0):.4f}"))
-                        self.option_table.setItem(row, 17, QTableWidgetItem(f"{data.get('vega', 0):.2f}"))
-                        self.option_table.setItem(row, 18, QTableWidgetItem(f"{data.get('theta', 0):.2f}"))
-                        self.option_table.setItem(row, 19, QTableWidgetItem(f"{data.get('delta', 0):.3f}"))
-                        self.option_table.setItem(row, 20, QTableWidgetItem(f"{data.get('iv', 0):.2f}"))
+                        greeks_items = [
+                            (15, f"{int(data.get('volume', 0))}"),
+                            (16, f"{data.get('gamma', 0):.4f}"),
+                            (17, f"{data.get('vega', 0):.2f}"),
+                            (18, f"{data.get('theta', 0):.2f}"),
+                            (19, f"{data.get('delta', 0):.3f}"),
+                            (20, f"{data.get('iv', 0):.2f}")
+                        ]
+                        for col, text in greeks_items:
+                            item = QTableWidgetItem(text)
+                            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                            self.option_table.setItem(row, col, item)
                     
                     break
         
