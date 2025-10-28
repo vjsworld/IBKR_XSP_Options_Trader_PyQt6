@@ -3018,15 +3018,18 @@ class MainWindow(QMainWindow):
                 return
             
             # Get settings from Master Settings panel
+            target_delta = self.target_delta_spin.value()
             max_risk = self.max_risk_spin.value()
             
-            # Find best call option within max risk
-            result = self.find_option_by_max_risk("C", max_risk)
+            self.log_message(f"Automated CALL Entry: Target Δ={target_delta}, Max Risk=${max_risk:.0f}", "INFO")
+            
+            # Find call option by delta (same as manual)
+            result = self.find_option_by_delta("C", target_delta)
             if not result:
                 self.log_message("No suitable call options found for automated entry", "WARNING")
                 return
             
-            contract_key, ask_price = result
+            contract_key, ask_price, actual_delta = result
             
             # Calculate mid price for order
             mid_price = self.calculate_mid_price(contract_key)
@@ -3034,7 +3037,7 @@ class MainWindow(QMainWindow):
                 self.log_message("Cannot calculate mid price - using ask price", "WARNING")
                 mid_price = ask_price
             
-            # Calculate quantity based on position size mode
+            # Calculate quantity based on position size mode (same as manual)
             if self.position_size_mode == "fixed":
                 quantity = self.trade_qty_spin.value()
                 size_description = f"{quantity} contract(s) (Fixed)"
@@ -3054,7 +3057,7 @@ class MainWindow(QMainWindow):
             
             if order_id:
                 self.log_message(
-                    f"✓ Automated CALL order #{order_id}: {quantity} × ${mid_price:.2f} ({size_description})",
+                    f"✓ Automated CALL order #{order_id}: {contract_key} Δ={actual_delta:.1f}, {quantity} × ${mid_price:.2f} ({size_description})",
                     "SUCCESS"
                 )
                 # Track as straddle leg
@@ -3086,15 +3089,18 @@ class MainWindow(QMainWindow):
                 return
             
             # Get settings from Master Settings panel
+            target_delta = self.target_delta_spin.value()
             max_risk = self.max_risk_spin.value()
             
-            # Find best put option within max risk
-            result = self.find_option_by_max_risk("P", max_risk)
+            self.log_message(f"Automated PUT Entry: Target Δ={target_delta}, Max Risk=${max_risk:.0f}", "INFO")
+            
+            # Find put option by delta (same as manual)
+            result = self.find_option_by_delta("P", target_delta)
             if not result:
                 self.log_message("No suitable put options found for automated entry", "WARNING")
                 return
             
-            contract_key, ask_price = result
+            contract_key, ask_price, actual_delta = result
             
             # Calculate mid price for order
             mid_price = self.calculate_mid_price(contract_key)
@@ -3102,7 +3108,7 @@ class MainWindow(QMainWindow):
                 self.log_message("Cannot calculate mid price - using ask price", "WARNING")
                 mid_price = ask_price
             
-            # Calculate quantity based on position size mode
+            # Calculate quantity based on position size mode (same as manual)
             if self.position_size_mode == "fixed":
                 quantity = self.trade_qty_spin.value()
                 size_description = f"{quantity} contract(s) (Fixed)"
@@ -3122,7 +3128,7 @@ class MainWindow(QMainWindow):
             
             if order_id:
                 self.log_message(
-                    f"✓ Automated PUT order #{order_id}: {quantity} × ${mid_price:.2f} ({size_description})",
+                    f"✓ Automated PUT order #{order_id}: {contract_key} Δ={actual_delta:.1f}, {quantity} × ${mid_price:.2f} ({size_description})",
                     "SUCCESS"
                 )
                 # Track as straddle leg
