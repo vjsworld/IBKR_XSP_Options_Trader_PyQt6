@@ -1,7 +1,49 @@
 # Dual-Instrument Options Trading Application - PyQt6 Edition (SPX/XSP)
 
 ## Project Overview
-Professional Bloomberg/TWS-style GUI application for automated 0DTE (Zero Days To Expiration) options trading via Interactive Brokers API. **Designed to trade TWO separate instruments** (SPX and XSP) with configurable settings. Modern PyQt6 architecture with TradingView lightweight-charts for real-time market data visualization.
+Professional Bloomberg/TWS-style GUI application for automated 0DTE (Zero Days To Expiration) options trading via Interactive Brokers API. **Designed to trade TWO separate instruments** (SPX and XSP) with configurable settings. Modern PyQt6 architecture with **matplotlib/mplfinance** for professional TradingView-style candlestick visualization.
+
+## ⚙️ Instrument Selection (How to Switch Between SPX and XSP)
+
+**The instrument selection is at the very top of `main.py` for easy access:**
+
+```python
+# ============================================================================
+# ⚙️ TRADING INSTRUMENT SELECTION - CHANGE THIS TO SWITCH INSTRUMENTS
+# ============================================================================
+# Set this to either 'SPX' (full-size S&P 500) or 'XSP' (mini 1/10 size)
+# This controls which instrument the application will trade
+SELECTED_INSTRUMENT = 'SPX'  # Change to 'XSP' for mini-SPX trading
+# ============================================================================
+```
+
+**To switch instruments:**
+1. Open `main.py`
+2. Go to line ~19 (right after the module docstring and imports)
+3. Change `SELECTED_INSTRUMENT = 'SPX'` to `SELECTED_INSTRUMENT = 'XSP'` (or vice versa)
+4. Restart the application
+
+**The application will automatically:**
+- Use the correct symbol, trading class, and exchange
+- Apply correct tick sizes and strike increments
+- Update window title and all labels
+- Log the selected instrument on startup
+
+**Key Differences:**
+- **SPX**: Full-size S&P 500 Index, $5 strike increments, tick sizes: ≥$3.00→$0.10, <$3.00→$0.05
+- **XSP**: Mini-SPX (1/10 size), $1 strike increments, tick size: $0.05 always
+
+**Implementation Pattern:**
+```python
+# In MainWindow.__init__():
+self.trading_instrument = SELECTED_INSTRUMENT  # From top of file
+self.instrument = INSTRUMENT_CONFIG[self.trading_instrument]
+
+# All functions use self.instrument configuration:
+contract.symbol = self.instrument['options_symbol']
+contract.tradingClass = self.instrument['options_trading_class']
+tick_size = self.instrument['tick_size_above_3'] if price >= 3.0 else self.instrument['tick_size_below_3']
+```
 
 ## ⚠️ CRITICAL: Symbol-Agnostic Code Design
 
@@ -170,8 +212,9 @@ logger.info(f"Requesting {self.options_symbol} option chain for 0DTE...")
 
 ### Current Dependencies
 - `PyQt6>=6.6.0`: Modern Qt6 framework for Python
-- `PyQt6-WebEngine>=6.6.0`: For lightweight-charts WebView integration
-- `lightweight-charts-python>=2.0`: TradingView charting library
+- `PyQt6-WebEngine>=6.6.0`: For web content rendering (optional)
+- `matplotlib>=3.8.0`: Industry-standard plotting library
+- `mplfinance>=0.12.10`: Specialized financial charting for candlesticks
 - `ibapi>=9.81.1`: Interactive Brokers API
 - `pandas>=2.0.0`, `numpy>=1.24.0`: Data processing
 
@@ -258,8 +301,8 @@ QApplication → MainWindow(QMainWindow)
     │   ├── TradingTab (QWidget)
     │   │   ├── Option Chain (QTableWidget)
     │   │   ├── Charts Panel (QSplitter)
-    │   │   │   ├── Call Chart (ChartWidget with WebEngineView)
-    │   │   │   └── Put Chart (ChartWidget with WebEngineView)
+    │   │   │   ├── Call Chart (ChartWidget with matplotlib/mplfinance)
+    │   │   │   └── Put Chart (ChartWidget with matplotlib/mplfinance)
     │   │   ├── Positions/Orders (QSplitter)
     │   │   │   ├── Positions (QTableWidget)
     │   │   │   └── Orders (QTableWidget)
@@ -317,50 +360,138 @@ self.chart_update_timer.setSingleShot(True)  # Debounce mode
 self.chart_update_timer.timeout.connect(self._update_chart_now)
 ```
 
-### Lightweight-Charts Integration
+### matplotlib/mplfinance Integration (Professional Candlestick Charts)
 
 #### Chart Widget Architecture
+**We use matplotlib with mplfinance for professional TradingView-style charts:**
+
 ```python
-from PyQt6.QtWebEngineWidgets import QWebEngineView
-from lightweight_charts import Chart
+import matplotlib
+matplotlib.use('QtAgg')  # Qt backend for PyQt6 integration
+
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from matplotlib.figure import Figure
+import mplfinance as mpf
+import pandas as pd
 
 class ChartWidget(QWidget):
-    def __init__(self, parent=None):
+    """Professional candlestick chart using matplotlib/mplfinance"""
+    
+    def __init__(self, title="Chart", parent=None):
         super().__init__(parent)
-        self.chart = Chart()
-        
-        # Create WebEngineView to display chart
-        self.web_view = QWebEngineView()
-        self.web_view.setHtml(self.chart.get_webview_html())
-        
+        self.title = title
+        self.bars = []
+        self.setup_ui()
+    
+    def setup_ui(self):
+        """Setup matplotlib figure with TradingView dark theme"""
         layout = QVBoxLayout(self)
-        layout.addWidget(self.web_view)
         layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Header
+        header = QLabel(self.title)
+        header.setStyleSheet("font-size: 12pt; font-weight: bold; color: #e0e0e0;")
+        layout.addWidget(header)
+        
+        # Create matplotlib figure with dark background
+        self.figure = Figure(figsize=(8, 6), facecolor='#131722')
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        self.ax = self.figure.add_subplot(111, facecolor='#1e222d')
+        
+        # TradingView-style theme
+        self.ax.tick_params(colors='#787b86', which='both')
+        self.ax.spines['bottom'].set_color('#2a2e39')
+        self.ax.spines['top'].set_color('#2a2e39')
+        self.ax.spines['left'].set_color('#2a2e39')
+        self.ax.spines['right'].set_color('#2a2e39')
+        
+        layout.addWidget(self.canvas)
     
     def update_data(self, bars: list):
-        """Update chart with new candlestick data"""
-        # Lightweight-charts expects: [{'time': '2023-01-01', 'open': 100, 'high': 101, ...}]
-        self.chart.set(bars)
+        """Update chart with candlestick data using mplfinance"""
+        if not bars:
+            return
+        
+        self.bars = bars
+        self.ax.clear()
+        
+        # Convert bars to pandas DataFrame
+        data = []
+        for bar in bars:
+            date_str = bar['date']
+            data.append({
+                'Date': pd.to_datetime(date_str, format='%Y%m%d'),
+                'Open': float(bar['open']),
+                'High': float(bar['high']),
+                'Low': float(bar['low']),
+                'Close': float(bar['close']),
+                'Volume': int(bar.get('volume', 0))
+            })
+        
+        df = pd.DataFrame(data)
+        df.set_index('Date', inplace=True)
+        
+        # Create TradingView-style market colors
+        mc = mpf.make_marketcolors(
+            up='#26a69a',      # Teal green (bullish)
+            down='#ef5350',    # Red (bearish)
+            edge='inherit',
+            wick='inherit',
+            volume='in',
+            alpha=1.0
+        )
+        
+        # Create style with dark theme
+        s = mpf.make_mpf_style(
+            marketcolors=mc,
+            gridcolor='#2a2e39',
+            gridstyle='-',
+            y_on_right=False,
+            facecolor='#1e222d',
+            figcolor='#131722',
+            edgecolor='#2a2e39',
+            rc={'axes.labelcolor': '#787b86',
+                'xtick.color': '#787b86',
+                'ytick.color': '#787b86'}
+        )
+        
+        # Plot candlesticks directly on our axes
+        mpf.plot(df, type='candle', style=s, ax=self.ax, 
+                 volume=False, show_nontrading=False)
+        
+        self.canvas.draw()
+    
+    def add_bar(self, bar: dict):
+        """Add single bar for real-time updates"""
+        self.bars.append(bar)
+        # Keep only last 200 bars for performance
+        if len(self.bars) > 200:
+            self.bars = self.bars[-200:]
+        self.update_data(self.bars)
 ```
+
+#### Key Advantages Over PyQt6-Charts
+
+✅ **Simpler Code**: 160 lines vs 250+ lines (36% reduction)  
+✅ **Industry Standard**: matplotlib is the most widely-used Python plotting library  
+✅ **Professional Styling**: Built-in TradingView dark theme  
+✅ **Better Display**: Actual candlesticks instead of buggy dots  
+✅ **Proven Reliability**: mplfinance is specialized for financial charts  
+✅ **Easier Maintenance**: Well-documented with large community support  
 
 #### Real-Time Data Streaming
 ```python
 # Add single candle in real-time
 def on_new_bar(self, bar_data):
-    self.chart.update({
-        'time': bar_data['date'],
-        'open': bar_data['open'],
-        'high': bar_data['high'],
-        'low': bar_data['low'],
-        'close': bar_data['close']
-    })
+    """bar_data format: {'date': '20251027', 'open': 100, 'high': 101, 'low': 99, 'close': 100.5}"""
+    self.chart_widget.add_bar(bar_data)
 ```
 
 #### Performance Optimization
-- Use `set()` for bulk data loading
-- Use `update()` for single-bar updates (real-time)
-- Limit visible bars to reduce rendering overhead
-- Debounce chart updates with QTimer (100-200ms)
+- Limit visible bars to last 200 for smooth rendering
+- Use `self.ax.clear()` before updates
+- `canvas.draw()` only after data changes
+- Disable animations (matplotlib default)
 
 ### Dark Theme Styling
 
@@ -485,24 +616,83 @@ DISCONNECTED → CONNECTING → CONNECTED
 
 ## Trading Strategy Implementation
 
-### Manual Trading Mode
-**Risk-based one-click trading with mid-price chasing**
+### Universal Order Chasing System
+**⚠️ CRITICAL: ALL orders MUST use the same mid-price chasing with "give in" logic**
 
-#### Entry System:
-1. BUY CALL/PUT buttons scan chain for max risk ≤ specified amount
-2. Place limit order at mid-price (bid+ask)/2
-3. Monitor with QTimer every 1 second
-4. Auto-adjust price if mid moves (cancel/replace)
-5. Continue until filled or cancelled
+**Design Principle**: Every order - whether manual entry, automated entry, or exit - MUST use the unified `place_order()` function with `enable_chasing=True`. No special cases or separate logic paths.
 
-#### SPX Tick Size Rules:
-- Prices ≥ $3.00: Round to $0.10 increments
-- Prices < $3.00: Round to $0.05 increments
+#### Unified Order Flow (for ALL orders):
+1. **Order Placement**: All orders call `place_order(contract_key, action, quantity, limit_price, enable_chasing=True)`
+2. **Initial Limit Price**: Set to current mid-price (bid+ask)/2 rounded to tick size
+3. **Order Tracking**: Added to `self.chasing_orders` dictionary with tracking info
+4. **Continuous Monitoring**: `update_orders()` timer runs every 1 second for all chasing orders
+5. **Auto-Adjustment**: Price updates if:
+   - Mid-price moves ≥ $0.05 (recalculate: current_mid ± X_ticks)
+   - Every 10 seconds without fill → increment X_ticks, recalculate price
+6. **"Give In" Logic** (applies to ALL orders):
+   - X_ticks starts at 0 (initial order at pure mid)
+   - After 10 sec: X_ticks = 1 → price = mid ± (1 × tick_size)
+   - After 20 sec: X_ticks = 2 → price = mid ± (2 × tick_size)
+   - After 30 sec: X_ticks = 3 → price = mid ± (3 × tick_size)
+   - For BUY: price = mid + X_ticks (creeping toward ask)
+   - For SELL: price = mid - X_ticks (creeping toward bid)
+   - Uses instrument tick size rules (SPX: ≥$3.00→$0.10, <$3.00→$0.05)
 
-#### Exit System:
-- "Close" button in QTableWidget delegates
-- Exit at mid-price with same chasing logic
-- Confirmation QMessageBox shows current P&L
+#### Order Types (all use same system):
+- **Manual Entry Orders** (BUY CALL/PUT buttons): `place_order()` with chasing enabled
+- **Automated Entry Orders** (hourly straddles, etc.): `place_order()` with chasing enabled
+- **Exit Orders** (Close button): `place_order()` with chasing enabled
+- **Any Future Order Type**: MUST use `place_order()` with chasing enabled
+
+#### Implementation Pattern:
+```python
+# ✅ CORRECT - All order types use unified function
+def manual_buy_call(self):
+    """Manual call entry - uses unified chasing"""
+    contract_key, mid_price = self.find_option_by_max_risk("C", max_risk)
+    self.place_order(contract_key, "BUY", 1, mid_price, enable_chasing=True)
+
+def manual_close_position(self, contract_key):
+    """Exit order - uses same unified chasing"""
+    mid_price = self.calculate_mid_price(contract_key)
+    self.place_order(contract_key, "SELL", qty, mid_price, enable_chasing=True)
+
+def hourly_straddle_entry(self):
+    """Automated entry - uses same unified chasing"""
+    call_key, call_price = self.find_cheapest_option("C")
+    self.place_order(call_key, "BUY", 1, call_price, enable_chasing=True)
+
+# ❌ WRONG - Don't create separate order placement logic
+def place_exit_order(self, ...):  # ✗ Don't create separate functions
+    # Special exit logic here...  # ✗ No special cases!
+```
+
+#### Order Tracking Structure:
+```python
+# All chasing orders stored in self.chasing_orders
+self.chasing_orders[order_id] = {
+    'contract_key': contract_key,
+    'contract': contract,
+    'action': action,  # "BUY" or "SELL"
+    'quantity': quantity,
+    'initial_mid': limit_price,
+    'last_mid': limit_price,
+    'last_price': limit_price,  # Actual order price (mid ± X_ticks)
+    'give_in_count': 0,  # Increments every 10 seconds
+    'attempts': 1,
+    'timestamp': datetime.now(),  # Reset on each price update
+    'order': order
+}
+```
+
+#### Why This Matters:
+1. **Consistency**: All orders get filled using the same proven strategy
+2. **Simplicity**: One code path = easier to maintain and debug
+3. **Reliability**: Exit orders get same aggressive filling as entry orders
+4. **Fairness**: No order type is disadvantaged or gets special treatment
+5. **Testability**: Single system to test and verify
+
+**Never create custom order placement logic for specific order types!**
 
 ### Hourly Straddle Entry (Automated)
 1. Triggered at top of hour by QTimer
@@ -603,22 +793,22 @@ python main.py
 1. **IBKR Setup**: TWS or IB Gateway on port 7497 (paper trading)
 2. **Market Data**: SPX + SPXW subscriptions
 3. **Market Hours**: 9:30 AM - 4:00 PM ET for full functionality
-4. **WebEngine**: Ensure PyQt6-WebEngine installed for charts
+4. **matplotlib**: Ensure matplotlib and mplfinance installed for charts
 
 ## Critical Constraints
 
 - **Cross-platform**: PyQt6 works on Windows/Mac/Linux (prefer Windows for IBKR)
 - **Real-money risk**: Always test with paper trading first (port 7497)
 - **Market hours dependency**: Most functionality requires active market
-- **WebEngine dependency**: lightweight-charts requires QWebEngineView
+- **matplotlib charts**: Professional TradingView-style candlesticks with mplfinance
 
 ## Performance Optimization
 
 ### Chart Rendering
-1. Debounce updates with QTimer (100-200ms)
-2. Limit visible candles (e.g., last 500 bars)
-3. Use `update()` for single bars, not `set()`
-4. Disable animations if needed for speed
+1. Update only when data changes (matplotlib handles efficiently)
+2. Limit visible candles to last 200 bars for performance
+3. Use `ax.clear()` before updates, then `canvas.draw()`
+4. Consider debouncing with QTimer if needed (100-200ms)
 
 ### Table Updates
 1. Use `setUpdatesEnabled(False)` during bulk updates
@@ -651,15 +841,16 @@ python main.py
 | `tksheet.Sheet` | `QTableWidget` |
 | Grid/Pack layout | `QVBoxLayout`, `QHBoxLayout`, `QGridLayout` |
 | Thread-safe queue | PyQt signals/slots |
-| Matplotlib canvas | lightweight-charts with QWebEngineView |
+| Matplotlib canvas | matplotlib with `FigureCanvasQTAgg` + mplfinance |
 
-### Advantages of PyQt6
+### Advantages of PyQt6 + matplotlib
 ✅ True thread safety with signals/slots  
 ✅ Better performance for large datasets  
 ✅ Native look and feel on all platforms  
 ✅ Rich widget library (QSplitter, QDockWidget, etc.)  
 ✅ Professional styling with QSS  
-✅ Better WebView integration for TradingView charts  
+✅ Industry-standard charting with matplotlib/mplfinance  
+✅ TradingView-style charts out of the box  
 ✅ Active development and long-term support  
 
 ## Error Handling

@@ -11,6 +11,14 @@ Technology Stack:
 - Dual-instrument support: SPX and XSP with symbol-agnostic architecture
 """
 
+# ============================================================================
+# ⚙️ TRADING INSTRUMENT SELECTION - CHANGE THIS TO SWITCH INSTRUMENTS
+# ============================================================================
+# Set this to either 'SPX' (full-size S&P 500) or 'XSP' (mini 1/10 size)
+# This controls which instrument the application will trade
+SELECTED_INSTRUMENT = 'XSP'  # Change to 'XSP' for mini-SPX trading
+# ============================================================================
+
 import sys
 import json
 import math
@@ -98,7 +106,7 @@ try:
     QTabWidget, QTableWidget, QTableWidgetItem, QPushButton, QLabel,
     QLineEdit, QComboBox, QTextEdit, QSplitter, QFrame, QGridLayout,
     QHeaderView, QMessageBox, QDialog, QFormLayout, QDialogButtonBox,
-    QStatusBar, QGroupBox, QSpinBox, QDoubleSpinBox, QRadioButton, QButtonGroup
+    QStatusBar, QGroupBox, QSpinBox, QDoubleSpinBox, QRadioButton, QButtonGroup, QScrollArea, QCheckBox
 )
     from PyQt6.QtCore import (  # type: ignore[import-untyped]
         Qt, QTimer, pyqtSignal, QObject, QThread, pyqtSlot, QMargins, QMetaObject, Q_ARG
@@ -162,16 +170,16 @@ INSTRUMENT_CONFIG = {
     },
     'XSP': {
         'name': 'XSP',
-        'underlying_symbol': 'XSP',          # Mini-SPX symbol
+        'underlying_symbol': 'XSP',          # Mini-SPX Index symbol
         'options_symbol': 'XSP',
         'options_trading_class': 'XSP',
-        'underlying_type': 'STK',            # Stock/ETF type
-        'underlying_exchange': 'ARCA',
+        'underlying_type': 'IND',            # Index (NOT stock)
+        'underlying_exchange': 'CBOE',       # CBOE exchange like SPX
         'multiplier': '100',
         'strike_increment': 1.0,             # $1 increments (1/10 of SPX)
         'tick_size_above_3': 0.05,
         'tick_size_below_3': 0.05,
-        'description': 'Mini-SPX Options (1/10 size of SPX, $100 multiplier)'
+        'description': 'Mini-SPX Index Options (1/10 size of SPX, $100 multiplier)'
     }
 }
 
@@ -201,7 +209,7 @@ class IBKRSignals(QObject):
     connection_message = pyqtSignal(str, str)  # message, level
     
     # Market data signals
-    spx_price_updated = pyqtSignal(float)
+    underlying_price_updated = pyqtSignal(float)  # Underlying instrument price (SPX, XSP, etc.)
     es_price_updated = pyqtSignal(float)  # ES futures price (23/6 trading)
     market_data_tick = pyqtSignal(str, str, float)  # contract_key, tick_type, value
     greeks_updated = pyqtSignal(str, dict)  # contract_key, greeks_dict
@@ -333,11 +341,11 @@ class IBKRWrapper(EWrapper):
         # Order modification errors (filled orders) - STOP CHASING
         if errorCode in [103, 104]:  # 103=Duplicate order id, 104=Cannot modify filled order
             logger.warning(f"Order #{reqId} cannot be modified (code {errorCode}) - likely filled/cancelled")
-            # Signal to remove from manual_orders
+            # Signal to remove from chasing_orders
             if hasattr(self, '_main_window'):
                 QMetaObject.invokeMethod(
                     self._main_window, 
-                    "remove_from_manual_orders",
+                    "remove_from_chasing_orders",
                     Qt.ConnectionType.QueuedConnection,
                     Q_ARG(int, reqId)
                 )
@@ -377,11 +385,11 @@ class IBKRWrapper(EWrapper):
     
     def tickPrice(self, reqId: TickerId, tickType: TickType, price: float, attrib: TickAttrib):
         """Receives real-time price updates"""
-        # SPX underlying price (for display)
-        if reqId == self.app.get('spx_req_id'):
+        # Underlying instrument price (SPX, XSP, etc.) for display
+        if reqId == self.app.get('underlying_req_id'):
             if tickType == 4:  # LAST price
-                self.app['spx_price'] = price
-                self.signals.spx_price_updated.emit(price)
+                self.app['underlying_price'] = price
+                self.signals.underlying_price_updated.emit(price)
             return
         
         # ES futures price (for strike calculations - always available)
@@ -598,16 +606,14 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         logger.info("Initializing MainWindow")
-        self.setWindowTitle("SPX 0DTE Options Trader - PyQt6 Professional Edition")
-        self.setGeometry(100, 100, 1600, 900)
         
         # Application state (shared with IBKR wrapper)
         self.app_state = {
             'next_order_id': 1,
             'next_req_id': 1000,  # For market data requests
-            'spx_price': 0.0,
+            'underlying_price': 0.0,  # Current underlying price (SPX, XSP, etc.)
             'es_price': 0.0,  # ES futures price (23/6 trading for strike calculations)
-            'spx_req_id': None,
+            'underlying_req_id': None,  # Request ID for underlying price subscription
             'es_req_id': None,  # ES futures request ID
             'data_server_ok': False,
             'managed_accounts': [],
@@ -617,12 +623,18 @@ class MainWindow(QMainWindow):
             'active_option_req_ids': [],  # Track active option chain request IDs
         }
         
+        # ES to cash offset tracking
+        self.es_to_cash_offset = 0.0  # ES futures premium/discount to cash index (persistent)
+        self.last_underlying_price = 0.0  # Last seen underlying price for offset calculation
+        self.last_offset_update_time = 0  # Timestamp of last offset update
+        self.offset_update_enabled = True  # True during market hours, False overnight
+        
         # Trading state
         self.positions = {}  # contract_key -> position_data
         self.saved_positions = {}  # Loaded from positions.json for entryTime persistence
         self.market_data = {}  # contract_key -> market_data
         self.pending_orders = {}  # order_id -> (contract_key, action, quantity)
-        self.manual_orders = {}  # order_id -> manual_order_info
+        self.chasing_orders = {}  # order_id -> chasing_order_info (for all orders with mid-price chasing enabled)
         self.historical_data = {}  # contract_key -> bars
         
         # Connection settings
@@ -635,11 +647,15 @@ class MainWindow(QMainWindow):
         self.connection_state = ConnectionState.DISCONNECTED
         
         # ========================================================================
-        # INSTRUMENT SELECTION - Choose SPX or XSP
+        # INSTRUMENT SELECTION - Uses global variable from top of file
         # ========================================================================
-        # CHANGE THIS TO SWITCH BETWEEN SPX (full-size) AND XSP (mini)
-        self.trading_instrument = 'SPX'  # Options: 'SPX' or 'XSP'
+        # The instrument is now controlled by SELECTED_INSTRUMENT at the top of this file
+        self.trading_instrument = SELECTED_INSTRUMENT
         self.instrument = INSTRUMENT_CONFIG[self.trading_instrument]
+        
+        # Set window title based on selected instrument
+        self.setWindowTitle(f"{self.instrument['name']} 0DTE Options Trader - PyQt6 Professional Edition")
+        self.setGeometry(100, 100, 1600, 900)
         
         logger.info(f"═══════════════════════════════════════════════════════")
         logger.info(f"TRADING INSTRUMENT: {self.instrument['name']}")
@@ -659,11 +675,17 @@ class MainWindow(QMainWindow):
         self.current_expiry = self.calculate_expiry_date(0)
         self.chain_refresh_interval = 3600  # Auto-refresh chain every hour (in seconds)
         self.last_chain_center_strike = 0  # Track last center strike for drift detection
+        self.chain_drift_threshold = 5  # Number of strikes to drift before auto-recentering (default: 5)
         
         # Auto-refresh timer for 4:00 PM ET expiration switch
         self.market_close_timer = QTimer()
         self.market_close_timer.timeout.connect(self.check_market_close_refresh)
         self.market_close_timer.start(60000)  # Check every 60 seconds
+        
+        # ES offset monitoring timer (check market hours every 5 minutes)
+        self.offset_monitor_timer = QTimer()
+        self.offset_monitor_timer.timeout.connect(self.check_offset_monitoring)
+        self.offset_monitor_timer.start(300000)  # Check every 5 minutes
         
         # Manual trading settings
         self.give_in_interval = 10.0  # Seconds between "give in" price adjustments (configurable)
@@ -730,7 +752,7 @@ class MainWindow(QMainWindow):
         """Connect IBKR signals to GUI slots"""
         self.signals.connection_status.connect(self.on_connection_status)
         self.signals.connection_message.connect(self.log_message)
-        self.signals.spx_price_updated.connect(self.update_spx_display)
+        self.signals.underlying_price_updated.connect(self.update_underlying_display)
         self.signals.es_price_updated.connect(self.update_es_display)
         self.signals.market_data_tick.connect(self.on_market_data_tick)
         self.signals.greeks_updated.connect(self.on_greeks_updated)
@@ -780,25 +802,34 @@ class MainWindow(QMainWindow):
     def create_trading_tab(self):
         """Create the main trading dashboard tab"""
         tab = QWidget()
-        layout = QVBoxLayout(tab)
+        main_layout = QVBoxLayout(tab)  # This is the main layout for the tab
         
-        # Header with SPX price
+        # Header with underlying price and expiration selector
         header = QFrame()
         header_layout = QHBoxLayout(header)
         
-        title_label = QLabel("SPX Option Chain")
-        title_label.setStyleSheet("font-size: 14pt; font-weight: bold;")
-        header_layout.addWidget(title_label)
+        # Underlying price label (SPX, XSP, etc.)
+        self.underlying_price_label = QLabel(f"{self.instrument['underlying_symbol']}: Loading...")
+        self.underlying_price_label.setStyleSheet("font-size: 14pt; font-weight: bold; color: #FF8C00;")
+        header_layout.addWidget(self.underlying_price_label)
         
-        self.spx_price_label = QLabel("SPX: Loading...")
-        self.spx_price_label.setStyleSheet("font-size: 14pt; font-weight: bold; color: #FF8C00;")
-        header_layout.addWidget(self.spx_price_label)
+        # Add 25-pixel spacing
+        header_layout.addSpacing(25)
         
         # ES futures price (for strike calculations - trades 23/6)
         self.es_price_label = QLabel("ES: Loading...")
         self.es_price_label.setStyleSheet("font-size: 14pt; font-weight: bold; color: #00CED1;")
         self.es_price_label.setToolTip("ES front month futures (used for strike calculations - trades 23 hours/day)")
         header_layout.addWidget(self.es_price_label)
+        
+        # Add 25-pixel spacing
+        header_layout.addSpacing(25)
+        
+        # ES to SPX offset display
+        self.es_offset_label = QLabel("ES to SPX offset: N/A")
+        self.es_offset_label.setStyleSheet("font-size: 12pt; color: #90EE90;")
+        self.es_offset_label.setToolTip("ES futures premium/discount to cash index (persistent during overnight)")
+        header_layout.addWidget(self.es_offset_label)
         
         header_layout.addStretch()
         
@@ -817,8 +848,18 @@ class MainWindow(QMainWindow):
         recenter_btn.setToolTip("Center chain around current SPX price (ATM)")
         header_layout.addWidget(recenter_btn)
         
-        layout.addWidget(header)
+        main_layout.addWidget(header)
+
+        # Main content area - split vertically: top for trading data, bottom for controls
+        main_splitter = QSplitter(Qt.Orientation.Vertical)
         
+        # ========================================================================
+        # TOP SECTION: Trading Data (Option Chain, Charts, Positions)
+        # ========================================================================
+        trading_widget = QWidget()
+        trading_layout = QVBoxLayout(trading_widget)
+        trading_layout.setContentsMargins(0, 0, 0, 0)
+
         # Option chain table
         self.option_table = QTableWidget()
         self.option_table.setColumnCount(21)
@@ -829,10 +870,22 @@ class MainWindow(QMainWindow):
         ]
         self.option_table.setHorizontalHeaderLabels(headers)
         self.option_table.verticalHeader().setVisible(False)  # type: ignore[union-attr]
-        self.option_table.setMinimumHeight(300)
+        self.option_table.setMinimumHeight(225)  # Reduced by 25% (was 300)
         self.option_table.cellClicked.connect(self.on_option_cell_clicked)
-        layout.addWidget(self.option_table)
-        
+        # Add orange border to option table and reduce row height by 25%
+        self.option_table.setStyleSheet("""
+            QTableWidget { 
+                border: 1px solid #FF8C00; 
+            }
+            QTableWidget::item { 
+                height: 18px; 
+            }
+            QHeaderView::section { 
+                height: 18px; 
+            }
+        """)
+        trading_layout.addWidget(self.option_table)
+
         # Charts panel (TODO: Implement ChartWidget)
         charts_splitter = QSplitter(Qt.Orientation.Horizontal)
         
@@ -849,8 +902,8 @@ class MainWindow(QMainWindow):
         charts_splitter.addWidget(put_chart_placeholder)
         charts_splitter.setSizes([400, 400])
         
-        layout.addWidget(charts_splitter)
-        
+        trading_layout.addWidget(charts_splitter)
+
         # Positions and Orders panel
         pos_order_splitter = QSplitter(Qt.Orientation.Horizontal)
         
@@ -864,8 +917,17 @@ class MainWindow(QMainWindow):
             "Contract", "Qty", "Entry", "Current", "P&L", "P&L %", "EntryTime", "TimeSpan", "Action"
         ])
         self.positions_table.verticalHeader().setVisible(False)  # type: ignore[union-attr]
-        self.positions_table.setMaximumHeight(200)
+        self.positions_table.setMaximumHeight(113)  # Reduced by 25% (was 150)
         self.positions_table.cellClicked.connect(self.on_position_cell_clicked)
+        # Reduce row height by 25%
+        self.positions_table.setStyleSheet("""
+            QTableWidget::item { 
+                height: 18px; 
+            }
+            QHeaderView::section { 
+                height: 18px; 
+            }
+        """)
         pos_layout.addWidget(self.positions_table)
         
         # Orders
@@ -878,173 +940,212 @@ class MainWindow(QMainWindow):
             "Order ID", "Contract", "Action", "Qty", "Price", "Status", "Action"
         ])
         self.orders_table.verticalHeader().setVisible(False)  # type: ignore[union-attr]
-        self.orders_table.setMaximumHeight(200)
+        self.orders_table.setMaximumHeight(113)  # Reduced by 25% (was 150)
         self.orders_table.cellClicked.connect(self.on_order_cell_clicked)
+        # Reduce row height by 25%
+        self.orders_table.setStyleSheet("""
+            QTableWidget::item { 
+                height: 18px; 
+            }
+            QHeaderView::section { 
+                height: 18px; 
+            }
+        """)
         orders_layout.addWidget(self.orders_table)
         
         pos_order_splitter.addWidget(positions_group)
         pos_order_splitter.addWidget(orders_group)
         pos_order_splitter.setSizes([400, 400])
         
-        layout.addWidget(pos_order_splitter)
+        trading_layout.addWidget(pos_order_splitter)
+        
+        main_splitter.addWidget(trading_widget)
         
         # ========================================================================
-        # TRADING CONTROL PANELS (5 panels in horizontal layout)
+        # BOTTOM SECTION: Controls and Activity Log (Horizontal Layout)
         # ========================================================================
-        panels_frame = QFrame()
-        panels_frame.setFrameStyle(QFrame.Shape.Box | QFrame.Shadow.Raised)
-        panels_layout = QHBoxLayout(panels_frame)
-        panels_layout.setSpacing(5)
+        bottom_widget = QWidget()
+        bottom_widget.setMaximumHeight(200)  # Constrain bottom section height
+        bottom_layout = QHBoxLayout(bottom_widget)
+        bottom_layout.setContentsMargins(5, 5, 5, 5)
         
-        # --- PANEL 1: Master Settings (Strategy Control) ---
+        # LEFT: Activity Log (Expanded)
+        log_section = QWidget()
+        log_section.setMinimumWidth(420)  # Increased from 250 to 420
+        log_section.setMaximumWidth(450)  # Increased from 300 to 450
+        log_layout = QVBoxLayout(log_section)
+        log_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        # Add orange border to activity log
+        self.log_text.setStyleSheet("QTextEdit { border: 1px solid #FF8C00; }")
+        log_layout.addWidget(self.log_text)
+        
+        bottom_layout.addWidget(log_section)
+        
+        # RIGHT: Control Panels (6 compact panels horizontally)
+        panels_scroll = QScrollArea()
+        panels_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        panels_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        panels_scroll.setWidgetResizable(True)
+        
+        panels_container = QWidget()
+        panels_layout = QHBoxLayout(panels_container)
+        panels_layout.setContentsMargins(0, 0, 0, 0)
+        panels_layout.setSpacing(5)        # --- PANEL 1: Master Settings (Strategy Control) - EXPANDED ---
         self.master_group = QGroupBox("Master Settings")
-        self.master_group.setFixedWidth(300)
+        self.master_group.setFixedWidth(280)  # Expanded from 220 to 280
         master_layout = QGridLayout(self.master_group)
+        master_layout.setVerticalSpacing(3)  # Reduce vertical spacing
+        master_layout.setHorizontalSpacing(8)  # Increase horizontal spacing for better organization
         
-        # Row 0: Strategy ON/OFF buttons
+        # Row 0: Strategy ON/OFF buttons (span full width)
         master_layout.addWidget(QLabel("<b>Auto:</b>"), 0, 0)
         
         button_frame = QWidget()
         button_layout = QHBoxLayout(button_frame)
         button_layout.setContentsMargins(0, 0, 0, 0)
-        button_layout.setSpacing(5)
+        button_layout.setSpacing(3)
         
         self.strategy_on_btn = QPushButton("ON")
         self.strategy_on_btn.setProperty("success", True)
-        self.strategy_on_btn.setFixedWidth(40)
+        self.strategy_on_btn.setFixedWidth(60)  # Increased from 50 to 60
         self.strategy_on_btn.clicked.connect(lambda: self.set_strategy_enabled(True))
         button_layout.addWidget(self.strategy_on_btn)
         
         self.strategy_off_btn = QPushButton("OFF")
         self.strategy_off_btn.setProperty("danger", True)
-        self.strategy_off_btn.setFixedWidth(40)
+        self.strategy_off_btn.setFixedWidth(60)  # Increased from 50 to 60
         self.strategy_off_btn.clicked.connect(lambda: self.set_strategy_enabled(False))
         button_layout.addWidget(self.strategy_off_btn)
         
         self.strategy_status_label = QLabel("OFF")
-        self.strategy_status_label.setStyleSheet("font-weight: bold; color: #808080;")
+        self.strategy_status_label.setStyleSheet("font-weight: bold; color: #808080; font-size: 8pt;")
         button_layout.addWidget(self.strategy_status_label)
-        button_layout.addStretch()
+        button_layout.addStretch()  # Push everything left
         
         master_layout.addWidget(button_frame, 0, 1, 1, 3)
         
-        # LEFT COLUMN (0-1)
-        # Row 1: VIX Threshold
-        master_layout.addWidget(QLabel("VIX Thresh:"), 1, 0)
+        # Row 1: VIX, Delta, Max Risk (3 columns)
+        master_layout.addWidget(QLabel("VIX:"), 1, 0)
         self.vix_threshold_spin = QDoubleSpinBox()
         self.vix_threshold_spin.setRange(0, 100)
         self.vix_threshold_spin.setValue(self.vix_threshold)
         self.vix_threshold_spin.setDecimals(1)
+        self.vix_threshold_spin.setFixedWidth(60)  # Increased from 50 to 60
         self.vix_threshold_spin.valueChanged.connect(self.on_master_settings_changed)
         master_layout.addWidget(self.vix_threshold_spin, 1, 1)
         
-        # Row 2: Time Stop
-        master_layout.addWidget(QLabel("Time Stop:"), 2, 0)
-        time_stop_frame = QWidget()
-        time_stop_layout = QHBoxLayout(time_stop_frame)
-        time_stop_layout.setContentsMargins(0, 0, 0, 0)
-        self.time_stop_spin = QSpinBox()
-        self.time_stop_spin.setRange(1, 300)
-        self.time_stop_spin.setValue(self.time_stop)
-        self.time_stop_spin.valueChanged.connect(self.on_master_settings_changed)
-        time_stop_layout.addWidget(self.time_stop_spin)
-        time_stop_layout.addWidget(QLabel("min"))
-        master_layout.addWidget(time_stop_frame, 2, 1)
-        
-        # Row 3: Target Delta
-        master_layout.addWidget(QLabel("Target Δ:"), 3, 0)
+        master_layout.addWidget(QLabel("Δ:"), 1, 2)
         self.target_delta_spin = QSpinBox()
         self.target_delta_spin.setRange(10, 50)
         self.target_delta_spin.setSingleStep(10)
         self.target_delta_spin.setValue(self.target_delta)
-        self.target_delta_spin.setToolTip("Target delta for option selection (10, 20, 30, 40, 50)")
+        self.target_delta_spin.setFixedWidth(55)  # Increased from 45 to 55
         self.target_delta_spin.valueChanged.connect(self.on_master_settings_changed)
-        master_layout.addWidget(self.target_delta_spin, 3, 1)
+        master_layout.addWidget(self.target_delta_spin, 1, 3)
         
-        # RIGHT COLUMN (2-3)
-        # Row 1: Max Risk
-        master_layout.addWidget(QLabel("Max Risk:"), 1, 2)
-        max_risk_frame = QWidget()
-        max_risk_layout = QHBoxLayout(max_risk_frame)
-        max_risk_layout.setContentsMargins(0, 0, 0, 0)
-        max_risk_layout.addWidget(QLabel("$"))
+        # Row 2: Max Risk, Trade Qty (2 columns)
+        master_layout.addWidget(QLabel("Risk $:"), 2, 0)
         self.max_risk_spin = QSpinBox()
         self.max_risk_spin.setRange(100, 10000)
         self.max_risk_spin.setSingleStep(50)
         self.max_risk_spin.setValue(self.max_risk)
+        self.max_risk_spin.setFixedWidth(80)  # Increased from 60 to 80
         self.max_risk_spin.valueChanged.connect(self.on_master_settings_changed)
-        max_risk_layout.addWidget(self.max_risk_spin)
-        master_layout.addWidget(max_risk_frame, 1, 3)
+        master_layout.addWidget(self.max_risk_spin, 2, 1)
         
-        # Row 2: Trade Quantity
-        master_layout.addWidget(QLabel("Trade Qty:"), 2, 2)
+        master_layout.addWidget(QLabel("Qty:"), 2, 2)
         self.trade_qty_spin = QSpinBox()
         self.trade_qty_spin.setRange(1, 100)
         self.trade_qty_spin.setValue(self.trade_qty)
+        self.trade_qty_spin.setFixedWidth(55)  # Increased from 45 to 55
         self.trade_qty_spin.valueChanged.connect(self.on_master_settings_changed)
         master_layout.addWidget(self.trade_qty_spin, 2, 3)
         
-        # Row 3: Position Size Mode (Radio buttons)
-        master_layout.addWidget(QLabel("<b>Pos. Size:</b>"), 3, 2)
+        # Row 3: Position Size Mode (compact horizontal layout)
+        master_layout.addWidget(QLabel("Size:"), 3, 0)
         
         radio_frame = QWidget()
-        radio_layout = QVBoxLayout(radio_frame)
+        radio_layout = QHBoxLayout(radio_frame)
         radio_layout.setContentsMargins(0, 0, 0, 0)
-        radio_layout.setSpacing(2)
+        radio_layout.setSpacing(8)
         
         self.fixed_radio = QRadioButton("Fixed")
         self.fixed_radio.setChecked(self.position_size_mode == "fixed")
         self.fixed_radio.toggled.connect(self.on_position_mode_changed)
         radio_layout.addWidget(self.fixed_radio)
         
-        self.by_risk_radio = QRadioButton("By Risk")
+        self.by_risk_radio = QRadioButton("Risk")
         self.by_risk_radio.setChecked(self.position_size_mode == "calculated")
         self.by_risk_radio.toggled.connect(self.on_position_mode_changed)
         radio_layout.addWidget(self.by_risk_radio)
+        radio_layout.addStretch()
         
-        master_layout.addWidget(radio_frame, 3, 3)
+        master_layout.addWidget(radio_frame, 3, 1, 1, 3)
         
-        # Row 4: Separator
+        # Row 4: Separator (reduced height)
         separator = QLabel()
         separator.setFrameStyle(QLabel.Shape.HLine | QLabel.Shadow.Sunken)
+        separator.setMaximumHeight(1)
         master_layout.addWidget(separator, 4, 0, 1, 4)
         
-        # Row 5: Chain Settings Label
-        master_layout.addWidget(QLabel("<b>Chain:</b>"), 5, 0, 1, 4)
-        
-        # Row 6: Strikes Above
-        master_layout.addWidget(QLabel("Strikes +:"), 6, 0)
+        # Row 5: Chain Settings (compact layout)
+        master_layout.addWidget(QLabel("±Strikes:"), 5, 0)
         self.strikes_above_spin = QSpinBox()
         self.strikes_above_spin.setRange(5, 50)
         self.strikes_above_spin.setValue(self.strikes_above)
-        self.strikes_above_spin.setToolTip("Number of strikes above ATM")
+        self.strikes_above_spin.setToolTip("Strikes above ATM")
+        self.strikes_above_spin.setFixedWidth(50)  # Increased from 40 to 50
         self.strikes_above_spin.valueChanged.connect(self.on_chain_settings_changed)
-        master_layout.addWidget(self.strikes_above_spin, 6, 1)
+        master_layout.addWidget(self.strikes_above_spin, 5, 1)
         
-        # Row 6: Strikes Below
-        master_layout.addWidget(QLabel("Strikes -:"), 6, 2)
         self.strikes_below_spin = QSpinBox()
         self.strikes_below_spin.setRange(5, 50)
         self.strikes_below_spin.setValue(self.strikes_below)
-        self.strikes_below_spin.setToolTip("Number of strikes below ATM")
+        self.strikes_below_spin.setToolTip("Strikes below ATM")
+        self.strikes_below_spin.setFixedWidth(50)  # Increased from 40 to 50
         self.strikes_below_spin.valueChanged.connect(self.on_chain_settings_changed)
-        master_layout.addWidget(self.strikes_below_spin, 6, 3)
+        master_layout.addWidget(self.strikes_below_spin, 5, 2)
         
-        # Row 7: Chain Refresh Interval
-        master_layout.addWidget(QLabel("Refresh (s):"), 7, 0)
+        # Time Stop in same row
+        master_layout.addWidget(QLabel("Stop:"), 5, 3)
+        self.time_stop_spin = QSpinBox()
+        self.time_stop_spin.setRange(1, 300)
+        self.time_stop_spin.setSingleStep(5)
+        self.time_stop_spin.setValue(self.time_stop)
+        self.time_stop_spin.setToolTip("Time stop (min)")
+        self.time_stop_spin.setFixedWidth(55)  # Increased from 45 to 55
+        self.time_stop_spin.valueChanged.connect(self.on_master_settings_changed)
+        master_layout.addWidget(self.time_stop_spin, 5, 4)
+        
+        # Row 6: Chain Refresh and Drift (compact)
+        master_layout.addWidget(QLabel("Refresh:"), 6, 0)
         self.chain_refresh_spin = QSpinBox()
-        self.chain_refresh_spin.setRange(0, 7200)  # 0 = disabled, up to 2 hours
+        self.chain_refresh_spin.setRange(0, 7200)
         self.chain_refresh_spin.setSingleStep(60)
         self.chain_refresh_spin.setValue(self.chain_refresh_interval)
-        self.chain_refresh_spin.setToolTip("Auto-refresh chain every X seconds (0=disabled)")
+        self.chain_refresh_spin.setToolTip("Auto-refresh (sec)")
+        self.chain_refresh_spin.setFixedWidth(60)  # Increased from 50 to 60
         self.chain_refresh_spin.valueChanged.connect(self.on_chain_settings_changed)
-        master_layout.addWidget(self.chain_refresh_spin, 7, 1, 1, 3)
+        master_layout.addWidget(self.chain_refresh_spin, 6, 1)
+        
+        master_layout.addWidget(QLabel("Drift:"), 6, 2)
+        self.chain_drift_spin = QSpinBox()
+        self.chain_drift_spin.setRange(1, 20)
+        self.chain_drift_spin.setSingleStep(1)
+        self.chain_drift_spin.setValue(self.chain_drift_threshold)
+        self.chain_drift_spin.setToolTip("Drift threshold (strikes)")
+        self.chain_drift_spin.setFixedWidth(50)  # Increased from 40 to 50
+        self.chain_drift_spin.valueChanged.connect(self.on_chain_settings_changed)
+        master_layout.addWidget(self.chain_drift_spin, 6, 3)
         
         panels_layout.addWidget(self.master_group)
         
         # --- PANEL 2: Confirmation Settings ---
         confirm_group = QGroupBox("Confirmation Settings")
-        confirm_group.setFixedWidth(180)
+        confirm_group.setFixedWidth(280)  # Expanded from 220 to 280
         confirm_layout = QGridLayout(confirm_group)
         
         confirm_layout.addWidget(QLabel("EMA Len:"), 0, 0)
@@ -1077,7 +1178,7 @@ class MainWindow(QMainWindow):
         
         # --- PANEL 3: Trade Chart Settings ---
         trade_chart_group = QGroupBox("Trade Chart Settings")
-        trade_chart_group.setFixedWidth(180)
+        trade_chart_group.setFixedWidth(280)  # Expanded from 220 to 280
         trade_layout = QGridLayout(trade_chart_group)
         
         trade_layout.addWidget(QLabel("EMA Len:"), 0, 0)
@@ -1110,7 +1211,7 @@ class MainWindow(QMainWindow):
         
         # --- PANEL 4: Auto Entry (Straddle) ---
         straddle_group = QGroupBox("Auto Entry")
-        straddle_group.setFixedWidth(180)
+        straddle_group.setFixedWidth(280)  # Expanded from 220 to 280
         straddle_layout = QGridLayout(straddle_group)
         
         # Row 0: Straddle ON/OFF
@@ -1123,13 +1224,13 @@ class MainWindow(QMainWindow):
         
         self.straddle_on_btn = QPushButton("ON")
         self.straddle_on_btn.setProperty("success", True)
-        self.straddle_on_btn.setFixedWidth(35)
+        self.straddle_on_btn.setFixedWidth(60)  # Increased from 50 to 60
         self.straddle_on_btn.clicked.connect(lambda: self.set_straddle_enabled(True))
         straddle_btn_layout.addWidget(self.straddle_on_btn)
         
         self.straddle_off_btn = QPushButton("OFF")
         self.straddle_off_btn.setProperty("danger", True)
-        self.straddle_off_btn.setFixedWidth(35)
+        self.straddle_off_btn.setFixedWidth(60)  # Increased from 50 to 60
         self.straddle_off_btn.clicked.connect(lambda: self.set_straddle_enabled(False))
         straddle_btn_layout.addWidget(self.straddle_off_btn)
         
@@ -1168,7 +1269,7 @@ class MainWindow(QMainWindow):
         
         # --- PANEL 5: Quick Entry (Manual Mode) ---
         manual_group = QGroupBox("Quick Entry")
-        manual_group.setFixedWidth(180)
+        manual_group.setFixedWidth(280)  # Expanded from 220 to 280
         manual_layout = QVBoxLayout(manual_group)
         
         self.buy_call_btn = QPushButton("BUY CALL")
@@ -1189,23 +1290,46 @@ class MainWindow(QMainWindow):
         
         panels_layout.addWidget(manual_group)
         
-        panels_layout.addStretch()
+        # --- PANEL 6: Chain Settings ---
+        chain_settings_group = QGroupBox("Chain Settings")
+        chain_settings_group.setFixedWidth(280)  # Expanded from 220 to 280
+        chain_settings_layout = QGridLayout(chain_settings_group)
+        
+        # Strikes to show
+        chain_settings_layout.addWidget(QLabel("Strikes:"), 0, 0)
+        self.strikes_display_spin = QSpinBox()
+        self.strikes_display_spin.setRange(5, 50)
+        self.strikes_display_spin.setValue(20)
+        self.strikes_display_spin.setFixedWidth(50)
+        chain_settings_layout.addWidget(self.strikes_display_spin, 0, 1)
+        
+        # Refresh frequency
+        chain_settings_layout.addWidget(QLabel("Refresh:"), 1, 0)
+        self.refresh_freq_spin = QSpinBox()
+        self.refresh_freq_spin.setRange(1, 30)
+        self.refresh_freq_spin.setValue(2)
+        self.refresh_freq_spin.setFixedWidth(50)
+        chain_settings_layout.addWidget(self.refresh_freq_spin, 1, 1)
+        chain_settings_layout.addWidget(QLabel("s"), 1, 2)
+        
+        panels_layout.addWidget(chain_settings_group)
+        
+        # Complete the scroll area setup
+        panels_scroll.setWidget(panels_container)
+        bottom_layout.addWidget(panels_scroll)
         
         # Initialize button states
         self.update_strategy_button_states()
         self.update_straddle_button_states()
         
-        layout.addWidget(panels_frame)
+        # Add the bottom widget to main splitter
+        main_splitter.addWidget(bottom_widget)
         
-        # Activity log
-        log_label = QLabel("Activity Log")
-        log_label.setStyleSheet("font-weight: bold; font-size: 12pt;")
-        layout.addWidget(log_label)
+        # Set splitter proportions (80% top, 20% bottom)
+        main_splitter.setSizes([800, 200])
         
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(150)
-        layout.addWidget(self.log_text)
+        # Add the main splitter to the main layout  
+        main_layout.addWidget(main_splitter)
         
         return tab
     
@@ -1251,7 +1375,7 @@ class MainWindow(QMainWindow):
         return tab
     
     def apply_dark_theme(self):
-        """Apply IBKR TWS dark color scheme"""
+        """Apply IBKR TWS dark color scheme with minimal Bloomberg-style orange accents"""
         stylesheet = """
         QMainWindow {
             background-color: #000000;
@@ -1268,7 +1392,6 @@ class MainWindow(QMainWindow):
             gridline-color: #1a1a1a;
             selection-background-color: #1a2a3a;
             selection-color: #ffffff;
-            border: 1px solid #1a1a1a;
         }
         
         QHeaderView::section {
@@ -1317,7 +1440,7 @@ class MainWindow(QMainWindow):
         }
         
         QGroupBox {
-            border: 1px solid #3a3a3a;
+            border: 1px solid #FF8C00;
             border-radius: 5px;
             margin-top: 10px;
             font-weight: bold;
@@ -1447,7 +1570,7 @@ class MainWindow(QMainWindow):
             # Initialize after connection
             self.ibkr_client.reqAccountUpdates(True, "")
             self.ibkr_client.reqPositions()  # This will trigger position() callbacks, which auto-subscribe to market data
-            self.subscribe_spx_price()  # SPX for display
+            self.subscribe_underlying_price()  # Subscribe to underlying instrument (SPX, XSP, etc.) for display
             self.subscribe_es_price()   # ES for strike calculations (23/6 trading)
             self.request_option_chain()
         elif status == "DISCONNECTED":
@@ -1468,29 +1591,122 @@ class MainWindow(QMainWindow):
     # MARKET DATA HANDLING
     # ========================================================================
     
-    def subscribe_spx_price(self):
-        """Subscribe to SPX underlying price"""
-        spx_contract = Contract()
-        spx_contract.symbol = "SPX"
-        spx_contract.secType = "IND"
-        spx_contract.currency = "USD"
-        spx_contract.exchange = "CBOE"
+    def subscribe_underlying_price(self):
+        """Subscribe to underlying price (SPX or XSP based on SELECTED_INSTRUMENT)"""
+        underlying_contract = Contract()
+        underlying_contract.symbol = self.instrument['underlying_symbol']
+        underlying_contract.secType = self.instrument['underlying_type']
+        underlying_contract.currency = "USD"
+        underlying_contract.exchange = self.instrument['underlying_exchange']
         
         req_id = 1
-        self.app_state['spx_req_id'] = req_id
+        self.app_state['underlying_req_id'] = req_id
         
         # Request delayed market data type (3 = delayed frozen for after-hours)
         self.ibkr_client.reqMarketDataType(3)
         
         # Subscribe to market data (snapshot=True for delayed data when market closed)
-        self.ibkr_client.reqMktData(req_id, spx_contract, "", True, False, [])
-        self.log_message("Subscribed to SPX underlying price (with delayed data support)", "INFO")
+        self.ibkr_client.reqMktData(req_id, underlying_contract, "", True, False, [])
+        self.log_message(f"Subscribed to {self.instrument['underlying_symbol']} underlying price (with delayed data support)", "INFO")
     
     @pyqtSlot(float)
-    def update_spx_display(self, price: float):
-        """Update SPX price display"""
-        self.app_state['spx_price'] = price
-        self.spx_price_label.setText(f"SPX: {price:.2f}")
+    def update_underlying_display(self, price: float):
+        """Update underlying price display (SPX or XSP based on SELECTED_INSTRUMENT)"""
+        self.app_state['underlying_price'] = price
+        self.underlying_price_label.setText(f"{self.instrument['underlying_symbol']}: {price:.2f}")
+        
+        # Update ES-to-cash offset if conditions are met
+        self.update_es_to_cash_offset(price, None)
+    
+    def is_market_hours(self):
+        """Check if it's during regular market hours (9:30 AM - 4:00 PM ET)"""
+        import pytz
+        et_tz = pytz.timezone('US/Eastern')
+        now_et = datetime.now(et_tz)
+        
+        # Market is open Monday-Friday, 9:30 AM - 4:00 PM ET
+        if now_et.weekday() >= 5:  # Weekend
+            return False
+        
+        market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+        
+        return market_open <= now_et <= market_close
+    
+    def update_es_to_cash_offset(self, underlying_price=None, es_price=None):
+        """Calculate and update ES-to-cash offset during market hours"""
+        # Use current prices if not provided
+        if underlying_price is None:
+            underlying_price = self.app_state['underlying_price']
+        if es_price is None:
+            es_price = self.app_state['es_price']
+        
+        # Need both prices to calculate offset
+        if underlying_price <= 0 or es_price <= 0:
+            return
+        
+        # Only update offset during market hours when both prices are moving
+        if not self.is_market_hours():
+            self.offset_update_enabled = False
+            return
+        
+        self.offset_update_enabled = True
+        
+        # For XSP, we need to scale ES to match XSP scale (ES/10)
+        if self.instrument['underlying_symbol'] == 'XSP':
+            # ES futures vs XSP cash: ES/10 - XSP
+            scaled_es = es_price / 10.0
+            offset = scaled_es - underlying_price
+        else:
+            # ES futures vs SPX cash: ES - SPX
+            offset = es_price - underlying_price
+        
+        # Update offset and timestamp
+        old_offset = self.es_to_cash_offset
+        self.es_to_cash_offset = offset
+        self.last_offset_update_time = time.time()
+        
+        # Update display
+        self.update_offset_display()
+        
+        # Log significant offset changes (more than 1 point)
+        if abs(offset - old_offset) > 1.0:
+            symbol = self.instrument['underlying_symbol']
+            logger.info(f"ES-to-{symbol} offset updated: {offset:.2f} points (was {old_offset:.2f})")
+    
+    def update_offset_display(self):
+        """Update the ES offset display label"""
+        symbol = self.instrument['underlying_symbol']
+        if self.es_to_cash_offset == 0.0:
+            self.es_offset_label.setText(f"ES to {symbol} offset: N/A")
+        else:
+            status = "(live)" if self.offset_update_enabled else "(frozen)"
+            self.es_offset_label.setText(f"ES to {symbol} offset: {self.es_to_cash_offset:+.2f} {status}")
+            
+            # Color coding: green for premium, red for discount, yellow for frozen
+            if not self.offset_update_enabled:
+                color = "#FFD700"  # Gold for frozen
+            elif self.es_to_cash_offset > 0:
+                color = "#90EE90"  # Light green for premium
+            else:
+                color = "#FFA07A"  # Light salmon for discount
+            
+            self.es_offset_label.setStyleSheet(f"font-size: 12pt; color: {color};")
+    
+    def get_adjusted_es_price(self):
+        """Get ES price adjusted for the cash offset for strike calculations"""
+        es_price = self.app_state['es_price']
+        if es_price <= 0:
+            return 0
+        
+        # Apply the offset to get a price closer to cash
+        if self.instrument['underlying_symbol'] == 'XSP':
+            # For XSP: (ES - offset*10) / 10
+            adjusted_es = es_price - (self.es_to_cash_offset * 10.0)
+            return adjusted_es / 10.0
+        else:
+            # For SPX: ES - offset
+            return es_price - self.es_to_cash_offset
     
     def get_es_front_month(self):
         """
@@ -1578,6 +1794,9 @@ class MainWindow(QMainWindow):
         """Update ES futures price display"""
         self.app_state['es_price'] = price
         self.es_price_label.setText(f"ES: {price:.2f}")
+        
+        # Update ES-to-cash offset if conditions are met
+        self.update_es_to_cash_offset(None, price)
     
     @pyqtSlot(str, str, float)
     def on_market_data_tick(self, contract_key: str, tick_type: str, value: float):
@@ -1695,10 +1914,10 @@ class MainWindow(QMainWindow):
             if status in ['Filled', 'Cancelled', 'Inactive']:
                 self.log_message(f"Order #{order_id} {status}", "SUCCESS")
                 
-                # CRITICAL: Remove from manual_orders to stop chasing
-                if order_id in self.manual_orders:
-                    logger.info(f"Removing order #{order_id} from manual_orders (status: {status})")
-                    del self.manual_orders[order_id]
+                # CRITICAL: Remove from chasing_orders to stop chasing
+                if order_id in self.chasing_orders:
+                    logger.info(f"Removing order #{order_id} from chasing_orders (status: {status})")
+                    del self.chasing_orders[order_id]
                 
                 # Keep in pending_orders for display but mark as complete
             
@@ -1708,11 +1927,11 @@ class MainWindow(QMainWindow):
             self.log_message(f"Received status for unknown order #{order_id}: {status_data.get('status')}", "INFO")
     
     @pyqtSlot(int)
-    def remove_from_manual_orders(self, order_id: int):
-        """Remove order from manual tracking (called when order is filled/cancelled)"""
-        if order_id in self.manual_orders:
-            logger.info(f"Force-removing order #{order_id} from manual_orders (order filled/cancelled)")
-            del self.manual_orders[order_id]
+    def remove_from_chasing_orders(self, order_id: int):
+        """Remove order from chasing tracking (called when order is filled/cancelled)"""
+        if order_id in self.chasing_orders:
+            logger.info(f"Force-removing order #{order_id} from chasing_orders (order filled/cancelled)")
+            del self.chasing_orders[order_id]
             self.update_orders_display()
     
     @pyqtSlot(str)
@@ -1826,8 +2045,8 @@ class MainWindow(QMainWindow):
         # Start from today
         target_date = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
         
-        # SPX has Mon/Wed/Fri expirations (0=Mon, 2=Wed, 4=Fri)
-        expiry_days = [0, 2, 4]
+        # XSP/SPX now have daily expirations Monday through Friday (0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri)
+        expiry_days = [0, 1, 2, 3, 4]  # Mon-Fri daily expirations
         
         expirations_found = 0
         days_checked = 0
@@ -1931,21 +2150,41 @@ class MainWindow(QMainWindow):
             self.app_state['market_data_map'] = {k: v for k, v in self.app_state['market_data_map'].items() 
                                                   if not (isinstance(k, int) and 100 <= k <= 999)}
         
-        # Use ES futures price for strike calculation (available 23 hours/day)
+        # Use ES futures price for strike calculations (available 23 hours/day)
         es_price = self.app_state['es_price']
-        center_strike = round(es_price / 5) * 5
+        if es_price == 0:
+            self.log_message("Waiting for ES futures price...", "INFO")
+            QTimer.singleShot(2000, self.request_option_chain)
+            return
+        
+        # Get ES price adjusted for cash offset
+        adjusted_es_price = self.get_adjusted_es_price()
+        if adjusted_es_price == 0:
+            # Fallback to raw ES if adjustment fails
+            adjusted_es_price = es_price / 10.0 if self.instrument['underlying_symbol'] == 'XSP' else es_price
+        
+        reference_price = adjusted_es_price
+        
+        # Log the adjustment being applied
+        if self.instrument['underlying_symbol'] == 'XSP':
+            logger.info(f"Using adjusted ES price ${reference_price:.2f} for XSP (ES: {es_price:.2f}, offset: {self.es_to_cash_offset:+.2f})")
+        else:
+            logger.info(f"Using adjusted ES price ${reference_price:.2f} for SPX (ES: {es_price:.2f}, offset: {self.es_to_cash_offset:+.2f})")
+        
+        strike_increment = self.instrument['strike_increment']
+        center_strike = round(reference_price / strike_increment) * strike_increment
         
         # Track center strike for drift detection
         self.last_chain_center_strike = center_strike
-        logger.info(f"Chain centered at strike {center_strike} (ES: {es_price:.2f})")
+        logger.info(f"Chain centered at strike {center_strike} (Reference: ${reference_price:.2f})")
         
         strikes = []
-        current_strike = center_strike - (self.strikes_below * 5)
-        end_strike = center_strike + (self.strikes_above * 5)
+        current_strike = center_strike - (self.strikes_below * strike_increment)
+        end_strike = center_strike + (self.strikes_above * strike_increment)
         
         while current_strike <= end_strike:
             strikes.append(current_strike)
-            current_strike += 5
+            current_strike += strike_increment
         
         self.log_message(f"Creating option chain: {len(strikes)} strikes from {min(strikes)} to {max(strikes)}", "INFO")
         
@@ -1958,8 +2197,12 @@ class MainWindow(QMainWindow):
         new_req_ids = []  # Track new request IDs
         
         for row, strike in enumerate(strikes):
-            # Create call contract using helper function
-            call_contract = self.create_option_contract(strike, "C", "SPX", "SPXW")
+            # Create call contract using helper function and instrument configuration
+            call_contract = self.create_option_contract(
+                strike, "C", 
+                self.instrument['options_symbol'], 
+                self.instrument['options_trading_class']
+            )
             
             # Log the contract details for debugging
             logger.info(
@@ -1970,15 +2213,19 @@ class MainWindow(QMainWindow):
                 f"multiplier={call_contract.multiplier}"
             )
             
-            call_key = f"SPX_{strike}_C_{self.current_expiry}"
+            call_key = f"{self.instrument['options_symbol']}_{strike}_C_{self.current_expiry}"
             self.app_state['market_data_map'][req_id] = call_key
             self.ibkr_client.reqMktData(req_id, call_contract, "", False, False, [])
             logger.info(f"Requested market data for {call_key} with reqId={req_id}")
             new_req_ids.append(req_id)
             req_id += 1
             
-            # Create put contract using helper function
-            put_contract = self.create_option_contract(strike, "P", "SPX", "SPXW")
+            # Create put contract using helper function and instrument configuration
+            put_contract = self.create_option_contract(
+                strike, "P", 
+                self.instrument['options_symbol'], 
+                self.instrument['options_trading_class']
+            )
             
             # Log the contract details for debugging
             logger.info(
@@ -1989,7 +2236,7 @@ class MainWindow(QMainWindow):
                 f"multiplier={put_contract.multiplier}"
             )
             
-            put_key = f"SPX_{strike}_P_{self.current_expiry}"
+            put_key = f"{self.instrument['options_symbol']}_{strike}_P_{self.current_expiry}"
             self.app_state['market_data_map'][req_id] = put_key
             self.ibkr_client.reqMktData(req_id, put_contract, "", False, False, [])
             logger.info(f"Requested market data for {put_key} with reqId={req_id}")
@@ -2001,10 +2248,10 @@ class MainWindow(QMainWindow):
             strike_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             strike_item.setFont(QFont("Arial", 10, QFont.Weight.Bold))
             
-            # Dynamic strike background based on ATM position (using ES price)
-            # Strikes above ES = lighter blue (#2a4a6a)
-            # Strikes below ES = darker blue (#1a2a3a)
-            if strike >= es_price:
+            # Dynamic strike background based on ATM position (using adjusted ES price)
+            # Strikes above reference price = lighter blue (#2a4a6a)
+            # Strikes below reference price = darker blue (#1a2a3a)
+            if strike >= reference_price:
                 strike_item.setBackground(QColor("#2a4a6a"))  # Above ATM: lighter blue
             else:
                 strike_item.setBackground(QColor("#1a2a3a"))  # Below ATM: darker blue
@@ -2018,7 +2265,7 @@ class MainWindow(QMainWindow):
     def update_option_chain_cell(self, contract_key: str):
         """Update a single option chain row with market data"""
         try:
-            # Parse contract_key: "SPX_6740_C_20251024"
+            # Parse contract_key format: "{SYMBOL}_{STRIKE}_{RIGHT}_{EXPIRY}" (e.g., "SPX_6740_C_20251024" or "XSP_673_P_20251024")
             parts = contract_key.split('_')
             if len(parts) != 4:
                 return
@@ -2129,11 +2376,11 @@ class MainWindow(QMainWindow):
             
             # Determine if call or put was clicked
             if col < 10:  # Call side
-                contract_key = f"SPX_{strike}_C_{self.current_expiry}"
+                contract_key = f"{self.instrument['options_symbol']}_{strike}_C_{self.current_expiry}"
                 self.log_message(f"Selected CALL: Strike {strike}", "INFO")
                 self.request_historical_data(contract_key)
             elif col > 10:  # Put side
-                contract_key = f"SPX_{strike}_P_{self.current_expiry}"
+                contract_key = f"{self.instrument['options_symbol']}_{strike}_P_{self.current_expiry}"
                 self.log_message(f"Selected PUT: Strike {strike}", "INFO")
                 self.request_historical_data(contract_key)
             else:
@@ -2152,7 +2399,7 @@ class MainWindow(QMainWindow):
         Universal order placement function with comprehensive validation and debugging
         
         Args:
-            contract_key: Contract identifier (e.g., "SPX_6740_C_20251024")
+            contract_key: Contract identifier format "{SYMBOL}_{STRIKE}_{RIGHT}_{EXPIRY}" (e.g., "SPX_6740_C_20251024" or "XSP_673_P_20251024")
             action: "BUY" or "SELL"
             quantity: Number of contracts
             limit_price: Limit price (0 = market order)
@@ -2230,6 +2477,8 @@ class MainWindow(QMainWindow):
             order.tif = "DAY"
             order.transmit = True
             order.outsideRth = True  # CRITICAL: Enable "Fill outside RTH" for after-hours trading
+            order.eTradeOnly = False  # CRITICAL: Disable eTradeOnly to prevent TWS rejection (error 10268)
+            order.firmQuoteOnly = False  # CRITICAL: Disable firmQuoteOnly for better fill rates
             
             # Set account if available
             if self.app_state.get('account'):
@@ -2307,9 +2556,9 @@ class MainWindow(QMainWindow):
                 'filled': 0
             }
             
-            # Track for manual chasing if enabled
+            # Track for chasing if enabled
             if enable_chasing:
-                self.manual_orders[order_id] = {
+                self.chasing_orders[order_id] = {
                     'contract_key': contract_key,
                     'contract': contract,
                     'action': action,
@@ -2327,9 +2576,11 @@ class MainWindow(QMainWindow):
             self.update_orders_display()
             
             # STEP 9: Start mid-price chasing if enabled
-            if enable_chasing and not hasattr(self, '_manual_order_timer_running'):
-                self._manual_order_timer_running = True
-                QTimer.singleShot(1000, self.update_manual_orders)
+            if enable_chasing:
+                # Start timer if not already running
+                if not hasattr(self, '_chasing_timer_running') or not self._chasing_timer_running:
+                    self._chasing_timer_running = True
+                    QTimer.singleShot(1000, self.update_orders)
             
             return order_id
             
@@ -2347,7 +2598,7 @@ class MainWindow(QMainWindow):
     # MID-PRICE CHASING SYSTEM (Item 3)
     # ========================================================================
     
-    def round_to_spx_increment(self, price: float) -> float:
+    def round_to_option_tick(self, price: float) -> float:
         """
         Round price to options tick size based on current trading instrument
         
@@ -2382,7 +2633,7 @@ class MainWindow(QMainWindow):
             return 0.0
         
         mid = (bid + ask) / 2.0
-        return self.round_to_spx_increment(mid)
+        return self.round_to_option_tick(mid)
     
     def find_option_by_max_risk(self, option_type: str, max_risk_dollars: float) -> tuple[str, float] | None:
         """
@@ -2507,9 +2758,9 @@ class MainWindow(QMainWindow):
             logger.error(f"Error in find_option_by_delta: {e}", exc_info=True)
             return None
     
-    def update_manual_orders(self):
+    def update_orders(self):
         """
-        Monitor all manual orders with intelligent mid-price chasing and "give in" logic
+        Monitor all orders with intelligent mid-price chasing and "give in" logic
         
         Runs every 1 second to check if:
         1. Order is still open (not filled/cancelled)
@@ -2525,15 +2776,15 @@ class MainWindow(QMainWindow):
         - For SELL: price = mid - X_ticks (creeping toward bid)
         - Uses SPX tick size rules (≥$3.00→$0.10, <$3.00→$0.05)
         """
-        if not self.manual_orders:
+        if not self.chasing_orders:
             # No orders to monitor - stop timer
-            if hasattr(self, '_manual_order_timer_running'):
-                self._manual_order_timer_running = False
+            if hasattr(self, '_chasing_timer_running'):
+                self._chasing_timer_running = False
             return
         
         orders_to_remove = []
         
-        for order_id, order_info in list(self.manual_orders.items()):
+        for order_id, order_info in list(self.chasing_orders.items()):
             # Check if order is still pending
             if order_id not in self.pending_orders:
                 # Order was filled or cancelled - stop monitoring
@@ -2589,7 +2840,7 @@ class MainWindow(QMainWindow):
             # Calculate new price: ALWAYS current_mid ± (give_in_ticks * tick_size)
             if action == "BUY":
                 # Buy: mid + X_ticks (creep toward ask)
-                new_price = self.round_to_spx_increment(
+                new_price = self.round_to_option_tick(
                     current_mid + (give_in_ticks * tick_size)
                 )
                 # Don't exceed ask price
@@ -2598,7 +2849,7 @@ class MainWindow(QMainWindow):
                 price_formula = f"${current_mid:.2f} + ({give_in_ticks} × ${tick_size:.2f}) = ${new_price:.2f}"
             else:  # SELL
                 # Sell: mid - X_ticks (creep toward bid)
-                new_price = self.round_to_spx_increment(
+                new_price = self.round_to_option_tick(
                     current_mid - (give_in_ticks * tick_size)
                 )
                 # Don't go below bid price
@@ -2661,16 +2912,16 @@ class MainWindow(QMainWindow):
         
         # Remove filled/cancelled orders from monitoring
         for order_id in orders_to_remove:
-            if order_id in self.manual_orders:
-                del self.manual_orders[order_id]
+            if order_id in self.chasing_orders:
+                del self.chasing_orders[order_id]
         
         # Continue monitoring if orders remain
-        if self.manual_orders:
-            QTimer.singleShot(1000, self.update_manual_orders)
+        if self.chasing_orders:
+            QTimer.singleShot(1000, self.update_orders)
         else:
             # No more orders - stop timer
-            if hasattr(self, '_manual_order_timer_running'):
-                self._manual_order_timer_running = False
+            if hasattr(self, '_chasing_timer_running'):
+                self._chasing_timer_running = False
     
     # ========================================================================
     # HISTORICAL DATA
@@ -2748,21 +2999,21 @@ class MainWindow(QMainWindow):
             row = self.orders_table.rowCount()
             self.orders_table.insertRow(row)
             
-            # Check if this is a manually chasing order
-            manual_info = self.manual_orders.get(order_id)
+            # Check if this is a chasing order
+            chasing_info = self.chasing_orders.get(order_id)
             
-            # Get price string - use manual_info for live chase price
-            if manual_info:
-                current_price = manual_info.get('last_price', manual_info.get('last_mid', 0))
+            # Get price string - use chasing_info for live chase price
+            if chasing_info:
+                current_price = chasing_info.get('last_price', chasing_info.get('last_mid', 0))
                 price_str = f"${current_price:.2f}"
             elif order_info.get('price', 0) == 0:
                 price_str = "MKT"
             else:
                 price_str = f"${order_info['price']:.2f}"
             
-            # Get status string - show chase status for manual orders
-            if manual_info:
-                give_in_ticks = manual_info.get('give_in_count', 0)
+            # Get status string - show chase status for chasing orders
+            if chasing_info:
+                give_in_ticks = chasing_info.get('give_in_count', 0)
                 if give_in_ticks == 0:
                     status_str = "Chasing Mid"
                 else:
@@ -2786,8 +3037,8 @@ class MainWindow(QMainWindow):
                 
                 # Status column - color based on chase status
                 if col == 5:
-                    if manual_info:
-                        give_in_ticks = manual_info.get('give_in_count', 0)
+                    if chasing_info:
+                        give_in_ticks = chasing_info.get('give_in_count', 0)
                         if give_in_ticks == 0:
                             item.setForeground(QColor("#00CED1"))  # Cyan for chasing mid
                         else:
@@ -3158,7 +3409,7 @@ class MainWindow(QMainWindow):
                     current_price = (bid + ask) / 2
                     pos['currentPrice'] = current_price
                     pos['pnl'] = (current_price - pos['avgCost']) * pos['position'] * 100
-                    logger.debug(f"Position {contract_key}: Mid=${current_price:.2f} (Bid=${bid:.2f}, Ask=${ask:.2f}), P&L=${pos['pnl']:.2f}")
+                    # Removed debug spam - position updates every second don't need logging
             
             pnl = pos.get('pnl', 0)
             pnl_pct = (pos['currentPrice'] / pos['avgCost'] - 1) * 100 if pos['avgCost'] > 0 else 0
@@ -3258,7 +3509,7 @@ class MainWindow(QMainWindow):
         
         # PROTECTION: Check for pending exit orders for this contract
         pending_exit_orders = []
-        for order_id, order_info in self.manual_orders.items():
+        for order_id, order_info in self.chasing_orders.items():
             if order_info['contract_key'] == contract_key:
                 # Check if this is an exit order (opposite direction of position)
                 is_exit_order = (position_size > 0 and order_info['action'] == "SELL") or \
@@ -3439,15 +3690,17 @@ class MainWindow(QMainWindow):
         old_above = self.strikes_above
         old_below = self.strikes_below
         old_interval = self.chain_refresh_interval
+        old_drift = self.chain_drift_threshold
         
         self.strikes_above = self.strikes_above_spin.value()
         self.strikes_below = self.strikes_below_spin.value()
         self.chain_refresh_interval = self.chain_refresh_spin.value()
+        self.chain_drift_threshold = self.chain_drift_spin.value()
         
         self.log_message(
             f"Chain Settings: Strikes +{self.strikes_above}/-{self.strikes_below}, "
-            f"Refresh: {self.chain_refresh_interval}s "
-            f"(was +{old_above}/-{old_below}, {old_interval}s)",
+            f"Refresh: {self.chain_refresh_interval}s, Drift: {self.chain_drift_threshold} strikes "
+            f"(was +{old_above}/-{old_below}, {old_interval}s, {old_drift} strikes)",
             "INFO"
         )
         self.save_settings()
@@ -3664,16 +3917,39 @@ class MainWindow(QMainWindow):
         if self.connection_state == ConnectionState.CONNECTED and self.chain_refresh_interval > 0:
             es_price = self.app_state.get('es_price', 0)
             if es_price > 0 and self.last_chain_center_strike > 0:
-                current_center = round(es_price / 5) * 5
+                # Use adjusted ES price (same as in request_option_chain)
+                adjusted_es_price = self.get_adjusted_es_price()
+                if adjusted_es_price == 0:
+                    # Fallback to raw ES if adjustment fails
+                    adjusted_es_price = es_price / 10.0 if self.instrument['underlying_symbol'] == 'XSP' else es_price
+                
+                reference_price = adjusted_es_price
+                strike_increment = self.instrument['strike_increment']
+                current_center = round(reference_price / strike_increment) * strike_increment
                 drift = abs(current_center - self.last_chain_center_strike)
                 
-                # If drifted more than 25 points (5 strikes), auto-recenter
-                if drift >= 25:
+                # Auto-recenter if drifted more than threshold (configurable number of strikes)
+                drift_threshold = self.chain_drift_threshold * strike_increment
+                if drift >= drift_threshold:
                     logger.info(
-                        f"ES drifted {drift:.0f} points from center strike {self.last_chain_center_strike} "
-                        f"to {current_center}, auto-recentering chain"
+                        f"Price drifted {drift:.0f} points from center strike {self.last_chain_center_strike} "
+                        f"to {current_center} (threshold: {drift_threshold:.0f}), auto-recentering chain"
                     )
                     self.request_option_chain()
+    
+    def check_offset_monitoring(self):
+        """
+        Check market hours and update ES offset monitoring status.
+        Called every 5 minutes to determine if offset updates should be enabled.
+        """
+        old_status = self.offset_update_enabled
+        self.offset_update_enabled = self.is_market_hours()
+        
+        # Update display if status changed
+        if old_status != self.offset_update_enabled:
+            status_text = "enabled" if self.offset_update_enabled else "disabled"
+            logger.info(f"ES offset monitoring {status_text} (market hours: {self.offset_update_enabled})")
+            self.update_offset_display()
     
     def recenter_option_chain(self):
         """
@@ -3688,10 +3964,18 @@ class MainWindow(QMainWindow):
             self.log_message("Cannot recenter - ES futures price not available", "WARNING")
             return
         
-        # Calculate ATM strike (round to nearest 5)
-        atm_strike = round(es_price / 5) * 5
+        # Get ES price adjusted for cash offset (same as in request_option_chain)
+        adjusted_es_price = self.get_adjusted_es_price()
+        if adjusted_es_price == 0:
+            # Fallback to raw ES if adjustment fails
+            adjusted_es_price = es_price / 10.0 if self.instrument['underlying_symbol'] == 'XSP' else es_price
         
-        self.log_message(f"Recentering option chain around ATM strike: {atm_strike} (ES: {es_price:.2f})", "INFO")
+        # Calculate ATM strike using instrument-specific increment
+        strike_increment = self.instrument['strike_increment']
+        atm_strike = round(adjusted_es_price / strike_increment) * strike_increment
+        
+        symbol = self.instrument['underlying_symbol']
+        self.log_message(f"Recentering option chain around ATM strike: {atm_strike} (Adjusted ES: {adjusted_es_price:.2f}, Raw ES: {es_price:.2f})", "INFO")
         
         # Refresh option chain (will use current strikes_above/strikes_below settings)
         if self.connection_state == ConnectionState.CONNECTED:
@@ -3734,6 +4018,7 @@ class MainWindow(QMainWindow):
             self.strikes_above = self.strikes_above_spin.value()
             self.strikes_below = self.strikes_below_spin.value()
             self.chain_refresh_interval = self.chain_refresh_spin.value()
+            self.chain_drift_threshold = self.chain_drift_spin.value()
             self.strikes_above_edit.setText(str(self.strikes_above))
             self.strikes_below_edit.setText(str(self.strikes_below))
             
@@ -3747,6 +4032,11 @@ class MainWindow(QMainWindow):
                 'strikes_above': self.strikes_above,
                 'strikes_below': self.strikes_below,
                 'chain_refresh_interval': self.chain_refresh_interval,
+                'chain_drift_threshold': self.chain_drift_threshold,
+                
+                # ES Offset Settings (persistent through restarts)
+                'es_to_cash_offset': self.es_to_cash_offset,
+                'last_offset_update_time': self.last_offset_update_time,
                 
                 # Master Settings
                 'strategy_enabled': self.strategy_enabled,
@@ -3791,6 +4081,14 @@ class MainWindow(QMainWindow):
                 self.strikes_above = settings.get('strikes_above', 20)
                 self.strikes_below = settings.get('strikes_below', 20)
                 self.chain_refresh_interval = settings.get('chain_refresh_interval', 3600)
+                self.chain_drift_threshold = settings.get('chain_drift_threshold', 5)
+                
+                # ES Offset Settings (restore persistent offset)
+                self.es_to_cash_offset = settings.get('es_to_cash_offset', 0.0)
+                self.last_offset_update_time = settings.get('last_offset_update_time', 0)
+                
+                # Update offset display after loading
+                self.update_offset_display()
                 
                 # Master Settings
                 self.strategy_enabled = settings.get('strategy_enabled', False)
@@ -3831,6 +4129,7 @@ class MainWindow(QMainWindow):
                 self.strikes_above_spin.setValue(self.strikes_above)  # Chain settings
                 self.strikes_below_spin.setValue(self.strikes_below)  # Chain settings
                 self.chain_refresh_spin.setValue(self.chain_refresh_interval)  # Chain refresh
+                self.chain_drift_spin.setValue(self.chain_drift_threshold)  # Chain drift threshold
                 
                 if self.position_size_mode == "fixed":
                     self.fixed_radio.setChecked(True)

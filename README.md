@@ -1,7 +1,7 @@
 # SPX 0DTE Options Trading Application - PyQt6 Edition
 
 ## Overview
-Professional Bloomberg/TWS-style GUI application for automated 0DTE (Zero Days To Expiration) SPX options trading via Interactive Brokers API. Built with modern PyQt6 framework and TradingView lightweight-charts for real-time market data visualization.
+Professional Bloomberg/TWS-style GUI application for automated 0DTE (Zero Days To Expiration) SPX options trading via Interactive Brokers API. Built with modern PyQt6 framework and **matplotlib/mplfinance** for professional TradingView-style candlestick charts.
 
 ## Features
 
@@ -9,7 +9,7 @@ Professional Bloomberg/TWS-style GUI application for automated 0DTE (Zero Days T
 - ✅ **Real-time SPX Price Tracking**: Live underlying index price updates
 - ✅ **Option Chain Display**: IBKR TWS-style layout with calls/strikes/puts
 - ✅ **Real-time Market Data**: Bid/ask/last prices, volume, greeks streaming
-- ✅ **TradingView Charts**: Professional candlestick charts for calls and puts
+- ✅ **Professional Charts**: matplotlib/mplfinance candlestick charts with TradingView theme
 - ✅ **Position Management**: Real-time P&L tracking with entry/exit management
 - ✅ **Order Management**: Live order status with intelligent execution
 - ✅ **Manual Trading**: One-click BUY CALL/PUT with risk-based sizing
@@ -24,9 +24,8 @@ Professional Bloomberg/TWS-style GUI application for automated 0DTE (Zero Days T
 
 ### Technology Stack
 - **PyQt6**: Modern Qt6 framework for native performance and thread safety
-- **lightweight-charts**: TradingView charting library for real-time candlesticks
+- **matplotlib/mplfinance**: Industry-standard charting for professional candlestick charts
 - **IBKR API**: Professional-grade market data and order execution
-- **Black-Scholes**: Greeks calculations for options analysis
 - **Signal/Slot Architecture**: Thread-safe GUI updates from API callbacks
 
 ## Installation
@@ -69,12 +68,11 @@ Professional Bloomberg/TWS-style GUI application for automated 0DTE (Zero Days T
 ### Dependencies
 The application requires:
 - `PyQt6>=6.6.0` - GUI framework
-- `PyQt6-WebEngine>=6.6.0` - For chart WebView
-- `lightweight-charts>=2.0` - TradingView charts
+- `matplotlib>=3.8.0` - Industry-standard plotting library
+- `mplfinance>=0.12.10` - Financial charting (candlesticks)
 - `ibapi>=9.81.1` - Interactive Brokers API
 - `pandas>=2.0.0` - Data processing
 - `numpy>=1.24.0` - Numerical operations
-- `scipy>=1.11.0` - Black-Scholes calculations
 
 ## Running the Application
 
@@ -126,9 +124,10 @@ python main.py
 
 ### Charts
 - **Dual Panel**: Call chart (left) | Put chart (right)
-- **Real-time Updates**: Candlestick charts with TradingView rendering
+- **TradingView Style**: Professional dark theme with matplotlib/mplfinance
+- **Real-time Updates**: Candlestick charts with smooth rendering
 - **Historical Data**: Automatically loads when option selected
-- **Responsive**: Smooth rendering optimized for real-time data
+- **Performance Optimized**: Last 200 bars for smooth updates
 
 ### Manual Trading
 1. **Set Max Risk**: Enter maximum risk per contract (e.g., 500 = $5.00)
@@ -161,7 +160,7 @@ IBKR API Thread → Signals → Main Thread (GUI)
 - `IBKRWrapper`: Handles IBKR API callbacks (data in)
 - `IBKRClient`: Sends IBKR API requests (commands out)
 - `IBKRSignals`: Qt signals for thread-safe GUI updates
-- `ChartWidget`: TradingView chart with WebEngineView
+- `ChartWidget`: matplotlib/mplfinance candlestick chart (in chart_widget_matplotlib.py)
 - `QTableWidget`: Option chain, positions, orders display
 
 ### Data Flow
@@ -195,9 +194,9 @@ Edit in Settings tab or `settings.json`:
 - **"Data server not ready"**: Wait for "✓ Data server connection confirmed" message
 
 ### Chart Issues
-- **"Chart unavailable"**: Install `pip install lightweight-charts`
+- **"Chart unavailable"**: Verify `pip install matplotlib mplfinance`
 - **Empty charts**: Select an option from the option chain first
-- **Slow rendering**: Historical data may be limited in paper trading account
+- **Slow rendering**: Limit to last 200 bars (automatically done)
 
 ### Order Issues
 - **"Order rejected"**: Check TWS API settings allow order placement
@@ -214,9 +213,10 @@ Edit in Settings tab or `settings.json`:
 ### Key Differences
 - ✅ **Better Performance**: PyQt6 native rendering vs tkinter
 - ✅ **True Thread Safety**: Signals/slots vs queue polling
-- ✅ **Professional Charts**: TradingView vs Matplotlib
+- ✅ **Professional Charts**: matplotlib/mplfinance TradingView-style
 - ✅ **Responsive UI**: No blocking updates or lag
 - ✅ **Native Look**: Platform-native widgets
+- ✅ **Simpler Code**: 160-line chart widget vs 250+ lines
 
 ### Preserved Features
 All features from the tkinter version are preserved:
@@ -224,14 +224,15 @@ All features from the tkinter version are preserved:
 - Real-time position P&L tracking ✅
 - IBKR TWS dark color scheme ✅
 - Intelligent order management ✅
-- Black-Scholes greeks calculations ✅
+- IBKR model-based greeks (more accurate than Black-Scholes) ✅
 
 ## Development
 
 ### Project Structure
 ```
 IBKR XSP Option Trader1 (PyQt6)/
-├── main.py                      # Main application (~1300 lines)
+├── main.py                      # Main application (~1850 lines)
+├── chart_widget_matplotlib.py   # Chart widget with matplotlib/mplfinance (160 lines)
 ├── requirements.txt             # Python dependencies
 ├── setup.ps1                    # Setup script
 ├── copilot-instructions.md      # AI agent instructions
@@ -240,11 +241,12 @@ IBKR XSP Option Trader1 (PyQt6)/
 ```
 
 ### Code Organization
-- **Lines 1-100**: Imports and Black-Scholes calculations
-- **Lines 100-200**: Connection state and IBKR signals
-- **Lines 200-400**: IBKR wrapper with signal emissions
-- **Lines 400-500**: Chart widget with lightweight-charts
-- **Lines 500-1300**: MainWindow with all GUI components
+- **chart_widget_matplotlib.py**: ChartWidget class with matplotlib/mplfinance (160 lines)
+- **main.py Lines 1-100**: Imports and configuration
+- **main.py Lines 100-200**: Connection state and IBKR signals
+- **main.py Lines 200-400**: IBKR wrapper with signal emissions
+- **main.py Lines 450-460**: Import ChartWidget from chart_widget_matplotlib
+- **main.py Lines 460-1850**: MainWindow with all GUI components
 
 ### Extending the Application
 1. **Add new signals**: Define in `IBKRSignals` class
@@ -273,7 +275,8 @@ IBKR XSP Option Trader1 (PyQt6)/
 ### Resources
 - **IBKR API Docs**: https://interactivebrokers.github.io/tws-api/
 - **PyQt6 Docs**: https://doc.qt.io/qtforpython-6/
-- **lightweight-charts**: https://github.com/tradingview/lightweight-charts
+- **matplotlib**: https://matplotlib.org/
+- **mplfinance**: https://github.com/matplotlib/mplfinance
 - **Copilot Instructions**: See `copilot-instructions.md`
 
 ### Common Questions
@@ -293,7 +296,7 @@ IBKR XSP Option Trader1 (PyQt6)/
 This software is provided for educational purposes. Use at your own risk.
 
 ## Version
-- **Version**: 2.0 (PyQt6 Edition)
-- **Date**: October 24, 2025
+- **Version**: 2.0 (PyQt6 Edition with matplotlib/mplfinance)
+- **Date**: October 27, 2025
 - **Author**: VJS World
-- **Technology**: PyQt6 + lightweight-charts + IBKR API
+- **Technology**: PyQt6 + matplotlib/mplfinance + IBKR API

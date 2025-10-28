@@ -3,10 +3,6 @@
 
 # Core GUI Framework
 PyQt6>=6.6.0
-PyQt6-WebEngine>=6.6.0
-
-# Charting Library (TradingView lightweight-charts)
-lightweight-charts>=2.0
 
 # Interactive Brokers API
 ibapi>=9.81.1
@@ -14,6 +10,13 @@ ibapi>=9.81.1
 # Data Processing
 pandas>=2.0.0
 numpy>=1.24.0
+
+# Charting Libraries (Professional Financial Charts)
+matplotlib>=3.8.0
+mplfinance>=0.12.10
+
+# Timezone handling (for Eastern Time market hours)
+pytz>=2024.1
 
 # Optional: Better datetime handling
 python-dateutil>=2.8.2
