@@ -442,8 +442,12 @@ class IBKRWrapper(EWrapper):
     def openOrder(self, orderId: int, contract: Contract, order: Order, orderState):
         """Receives open order information"""
         contract_key = f"{contract.symbol}_{contract.strike}_{contract.right}_{contract.lastTradeDateOrContractMonth[:8]}"
+        logger.info(f"✓ openOrder callback received for order #{orderId}")
+        logger.info(f"   Contract: {contract_key}")
+        logger.info(f"   Action: {order.action} {order.totalQuantity}")
+        logger.info(f"   OrderState status: {orderState.status}")
         self.signals.connection_message.emit(
-            f"✓ TWS received Order #{orderId}: {contract_key} {order.action} {order.totalQuantity}",
+            f"✓ TWS received Order #{orderId}: {contract_key} {order.action} {order.totalQuantity} (Status: {orderState.status})",
             "SUCCESS"
         )
     
@@ -2179,6 +2183,10 @@ class MainWindow(QMainWindow):
             symbol, strike_str, right, expiry = parts
             trading_class = "SPXW" if symbol == "SPX" else "XSP"
             
+            logger.info(f"Parsing contract_key: {contract_key}")
+            logger.info(f"  Symbol: {symbol}, Strike: {strike_str}, Right: {right}, Expiry: {expiry}")
+            logger.info(f"  Trading Class: {trading_class}")
+            
             # Create contract with full validation
             contract = self.create_option_contract(
                 strike=float(strike_str),
@@ -2297,23 +2305,39 @@ class MainWindow(QMainWindow):
             
             # STEP 7: Place order via IBKR API
             try:
+                logger.info(f"Calling ibkr_client.placeOrder({order_id}, contract, order)...")
                 self.ibkr_client.placeOrder(order_id, contract, order)
                 logger.info(f"✓ placeOrder() API call completed for order #{order_id}")
-                self.log_message(f"✓ Order #{order_id} sent to TWS", "SUCCESS")
+                self.log_message(f"✓ Order #{order_id} sent to TWS - waiting for confirmation...", "INFO")
                 
                 # STEP 8: Schedule timeout check for callbacks
                 def check_order_callback():
-                    if order_id in self.pending_orders and self.pending_orders[order_id]['status'] == 'Submitted':
-                        warning_msg = (
-                            f"⚠️ WARNING: No callbacks received for order #{order_id} after 3 seconds\n"
-                            f"This usually means:\n"
-                            f"  1. TWS rejected the order silently (check TWS Messages)\n"
-                            f"  2. Order precautions not bypassed (check TWS API settings)\n"
-                            f"  3. Contract format issue (check TradingClass)\n"
-                            f"  4. auxPrice issue for LMT orders"
-                        )
-                        self.log_message(warning_msg, "WARNING")
-                        logger.warning(warning_msg)
+                    if order_id not in self.pending_orders:
+                        # Order was removed (likely filled/cancelled quickly)
+                        logger.info(f"Order #{order_id} already processed (filled/cancelled)")
+                        return
+                        
+                    order_status = self.pending_orders[order_id].get('status', 'Submitted')
+                    
+                    # If status changed from 'Submitted', we got callbacks
+                    if order_status != 'Submitted':
+                        logger.info(f"✓ Order #{order_id} confirmed by TWS (Status: {order_status})")
+                        return
+                    
+                    # Still in 'Submitted' state after 3 seconds = no callbacks received
+                    warning_msg = (
+                        f"⚠️ WARNING: No callbacks received for order #{order_id} after 3 seconds\n"
+                        f"This usually means:\n"
+                        f"  1. TWS rejected the order silently (check TWS Messages)\n"
+                        f"  2. Order precautions not bypassed (check TWS API settings)\n"
+                        f"  3. Contract format issue (check TradingClass)\n"
+                        f"  4. Market might be closed or contract expired\n"
+                        f"\n"
+                        f"Contract: {contract_key}\n"
+                        f"Check TWS Messages window for rejection details"
+                    )
+                    self.log_message(warning_msg, "WARNING")
+                    logger.warning(warning_msg)
                 
                 QTimer.singleShot(3000, check_order_callback)
                 
