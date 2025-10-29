@@ -16,7 +16,7 @@ Technology Stack:
 # ============================================================================
 # Set this to either 'SPX' (full-size S&P 500) or 'XSP' (mini 1/10 size)
 # This controls which instrument the application will trade
-SELECTED_INSTRUMENT = 'XSP'  # Change to 'XSP' for mini-SPX trading
+SELECTED_INSTRUMENT = 'SPX'  # Change to 'XSP' for mini-SPX trading
 # ============================================================================
 
 import sys
@@ -106,7 +106,8 @@ try:
     QTabWidget, QTableWidget, QTableWidgetItem, QPushButton, QLabel,
     QLineEdit, QComboBox, QTextEdit, QSplitter, QFrame, QGridLayout,
     QHeaderView, QMessageBox, QDialog, QFormLayout, QDialogButtonBox,
-    QStatusBar, QGroupBox, QSpinBox, QDoubleSpinBox, QRadioButton, QButtonGroup, QScrollArea, QCheckBox
+    QStatusBar, QGroupBox, QSpinBox, QDoubleSpinBox, QRadioButton, QButtonGroup, QScrollArea, QCheckBox,
+    QSizePolicy
 )
     from PyQt6.QtCore import (  # type: ignore[import-untyped]
         Qt, QTimer, pyqtSignal, QObject, QThread, pyqtSlot, QMargins, QMetaObject, Q_ARG
@@ -146,6 +147,16 @@ import pandas as pd  # type: ignore[import-untyped]
 import numpy as np  # type: ignore[import-untyped]
 logger.info("Data processing libraries loaded successfully")
 
+# Matplotlib for charting
+logger.info("Loading matplotlib/mplfinance for professional charts...")
+import mplfinance as mpf
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qt import NavigationToolbar2QT as NavigationToolbar
+from matplotlib.patches import Rectangle
+import matplotlib.dates as mdates
+logger.info("Chart libraries loaded successfully")
+
 # Interactive Brokers API
 logger.info("Loading IBKR API modules...")
 from ibapi.client import EClient
@@ -156,7 +167,7 @@ from ibapi.common import TickerId, TickAttrib
 from ibapi.ticktype import TickType
 logger.info("IBKR API loaded successfully")
 
-# Charts are now handled by matplotlib/mplfinance (see chart_widget_matplotlib.py)
+# Charts are now handled by matplotlib/mplfinance
 CHARTS_AVAILABLE = True  # Always available with matplotlib
 logger.info("Using matplotlib/mplfinance for professional charts")
 
@@ -233,6 +244,7 @@ class IBKRSignals(QObject):
     # Historical data signals
     historical_bar = pyqtSignal(str, dict)  # contract_key, bar_data
     historical_complete = pyqtSignal(str)  # contract_key
+    historical_bar_update = pyqtSignal(str, dict)  # contract_key, bar_data (real-time updates)
     
     # Account signals
     next_order_id = pyqtSignal(int)
@@ -397,20 +409,36 @@ class IBKRWrapper(EWrapper):
         self.signals.managed_accounts.emit(accountsList)
         self.signals.connection_message.emit(f"✓ Using account: {self.app['account']}", "SUCCESS")
     
+    def tickSnapshotEnd(self, reqId: int):
+        """Called when snapshot market data is complete"""
+        if reqId == self.app.get('es_req_id'):
+            logger.info("ES futures snapshot data complete")
+            self.signals.connection_message.emit("ES futures snapshot received", "INFO")
+        elif reqId == self.app.get('underlying_req_id'):
+            logger.info("Underlying snapshot data complete")
+            self.signals.connection_message.emit("Underlying snapshot received", "INFO")
+    
     def tickPrice(self, reqId: TickerId, tickType: TickType, price: float, attrib: TickAttrib):
         """Receives real-time price updates"""
         # Underlying instrument price (SPX, XSP, etc.) for display
         if reqId == self.app.get('underlying_req_id'):
-            if tickType == 4:  # LAST price
+            # Accept LAST (4), CLOSE (9), DELAYED_LAST (68) for snapshot/delayed data
+            if tickType in [4, 9, 68]:
+                logger.info(f"Underlying price tick: type={tickType}, price={price}")
                 self.app['underlying_price'] = price
                 self.signals.underlying_price_updated.emit(price)
             return
         
         # ES futures price (for strike calculations - always available)
         if reqId == self.app.get('es_req_id'):
-            if tickType == 4:  # LAST price
+            # Accept LAST (4), CLOSE (9), DELAYED_LAST (68) for snapshot/delayed data
+            if tickType in [4, 9, 68]:
+                logger.info(f"ES futures price tick: type={tickType}, price={price}")
                 self.app['es_price'] = price
                 self.signals.es_price_updated.emit(price)
+            else:
+                # Log other tick types to help debug what we're receiving
+                logger.debug(f"ES futures tick (ignored): reqId={reqId}, type={tickType}, price={price}")
             return
         
         # Option contract prices
@@ -583,6 +611,46 @@ class IBKRWrapper(EWrapper):
             
         if contract_key:
             self.signals.historical_complete.emit(contract_key)
+    
+    def historicalDataUpdate(self, reqId: int, bar):
+        """
+        Called when keepUpToDate=True and new bar data arrives in real-time.
+        This is the proper IBAPI way to get real-time bar updates.
+        
+        NOTE: Real-time bar.date is Unix epoch timestamp (int), not formatted string!
+        """
+        # Check both old and new request mapping systems
+        contract_key = None
+        if reqId in self.app.get('historical_data_requests', {}):
+            contract_key = self.app['historical_data_requests'][reqId]
+        elif self._main_window and hasattr(self._main_window, 'request_id_map') and reqId in self._main_window.request_id_map:
+            contract_key = self._main_window.request_id_map[reqId]
+            
+        if contract_key:
+            # CRITICAL: Convert epoch timestamp to datetime string format
+            # Real-time updates use epoch int, historical uses formatted string
+            from datetime import datetime
+            
+            date_value = bar.date
+            # Check if it's an epoch timestamp (integer) or formatted string
+            if isinstance(date_value, (int, float)):
+                # Unix epoch timestamp - convert to datetime string
+                dt = datetime.fromtimestamp(date_value)
+                formatted_date = dt.strftime('%Y%m%d %H:%M:%S')
+            else:
+                # Already a string, use as-is
+                formatted_date = str(date_value)
+            
+            bar_data = {
+                'date': formatted_date,
+                'open': bar.open,
+                'high': bar.high,
+                'low': bar.low,
+                'close': bar.close,
+                'volume': bar.volume
+            }
+            # Emit on a special real-time update signal
+            self.signals.historical_bar_update.emit(contract_key, bar_data)
 
 
 class IBKRClient(EClient):
@@ -608,18 +676,844 @@ class IBKRThread(QThread):
 
 
 # ============================================================================
-# CHART WIDGET - PROFESSIONAL MATPLOTLIB/MPLFINANCE
+# PROFESSIONAL CHART WIDGETS - LINE CHARTS FOR OPTIONS & CANDLESTICKS FOR UNDERLYING
 # ============================================================================
-# Import the simple, professional matplotlib-based chart widget
-# from chart_widget_matplotlib import ChartWidget  # TODO: Implement chart widget
+
+class ProfessionalChart(QWidget):
+    """
+    Professional line chart for options (mid-price data)
+    Features:
+    - Line chart for mid-price display
+    - Right-aligned price axis
+    - Time labels on bottom
+    - Dark theme matching TradeStation
+    - Real-time updates with blitting for high-frequency trading
+    """
+    
+    def __init__(self, title: str, border_color: str = "#FF8C00", parent=None):
+        super().__init__(parent)
+        self.title = title
+        self.border_color = border_color
+        self.chart_data = []
+        self.background = None  # Cached background for blitting
+        self.line_artist = None  # Line object for fast updates
+        self.needs_full_redraw = True  # Flag to force full redraw
+        self.last_update_time = 0  # Throttle updates - track last update timestamp
+        self.update_interval = 0.25  # Minimum 250ms between updates (4 FPS) for trading
+        self.pending_update = None  # QTimer for pending update
+        
+        # Create layout
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(2)
+        
+        # Top toolbar
+        toolbar = QWidget()
+        toolbar_layout = QHBoxLayout(toolbar)
+        toolbar_layout.setContentsMargins(5, 2, 5, 2)
+        toolbar_layout.setSpacing(10)
+        
+        # Title label
+        self.title_label = QLabel(title)
+        self.title_label.setStyleSheet(f"""
+            QLabel {{
+                color: {border_color};
+                font-weight: bold;
+                font-size: 11pt;
+                border: none;
+            }}
+        """)
+        toolbar_layout.addWidget(self.title_label)
+        
+        toolbar_layout.addStretch()
+        
+        # Interval selector
+        toolbar_layout.addWidget(QLabel("Interval:"))
+        self.interval_combo = QComboBox()
+        self.interval_combo.addItems(["15 secs", "30 secs", "1 min", "5 min", "15 min", "30 min", "1 hour"])
+        self.interval_combo.setCurrentText("1 min")
+        self.interval_combo.setFixedWidth(80)
+        self.interval_combo.setStyleSheet(f"""
+            QComboBox {{
+                background-color: #2a2a2a;
+                border: 1px solid {border_color};
+                padding: 2px 5px;
+                color: white;
+                border-radius: 2px;
+            }}
+        """)
+        toolbar_layout.addWidget(self.interval_combo)
+        
+        # Days selector
+        toolbar_layout.addWidget(QLabel("Days:"))
+        self.days_combo = QComboBox()
+        self.days_combo.addItems(["1", "2", "3", "5"])
+        self.days_combo.setCurrentText("1")
+        self.days_combo.setFixedWidth(50)
+        self.days_combo.setStyleSheet(self.interval_combo.styleSheet())
+        toolbar_layout.addWidget(self.days_combo)
+        
+        # Refresh button
+        self.refresh_btn = QPushButton("⟳")
+        self.refresh_btn.setFixedSize(24, 24)
+        self.refresh_btn.setToolTip("Refresh Chart")
+        self.refresh_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #2a2a2a;
+                border: 1px solid {border_color};
+                color: {border_color};
+                font-weight: bold;
+                font-size: 14pt;
+                border-radius: 2px;
+            }}
+            QPushButton:hover {{
+                background-color: #3a3a3a;
+            }}
+            QPushButton:pressed {{
+                background-color: #1a1a1a;
+            }}
+        """)
+        toolbar_layout.addWidget(self.refresh_btn)
+        
+        layout.addWidget(toolbar)
+        
+        # Create figure and canvas - use constrained_layout
+        self.figure = Figure(figsize=(8, 5), dpi=100, facecolor='#0a0a0a', constrained_layout=True)
+        self.canvas = FigureCanvas(self.figure)
+        self.canvas.setStyleSheet(f"border: 2px solid {border_color};")
+        self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        
+        # Enable mouse wheel zoom
+        self.canvas.mpl_connect('scroll_event', self.on_scroll)
+        
+        # Add navigation toolbar for pan/zoom
+        self.nav_toolbar = NavigationToolbar(self.canvas, self)
+        self.nav_toolbar.setStyleSheet(f"""
+            QToolBar {{
+                background-color: #1a1a1a;
+                border: 1px solid {border_color};
+                spacing: 3px;
+            }}
+            QToolButton {{
+                background-color: #2a2a2a;
+                border: 1px solid {border_color};
+                color: white;
+                padding: 3px;
+            }}
+            QToolButton:hover {{
+                background-color: #3a3a3a;
+            }}
+        """)
+        layout.addWidget(self.nav_toolbar)
+        
+        layout.addWidget(self.canvas)
+        
+        # Set widget size policy
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        
+        # Initialize empty chart
+        self.ax = None
+        self.draw_empty_chart()
+        
+        # Apply dark theme
+        self.setStyleSheet(f"""
+            QWidget {{
+                background-color: #0a0a0a;
+                color: white;
+            }}
+            QLabel {{
+                color: white;
+                border: none;
+            }}
+            QComboBox {{
+                background-color: #2a2a2a;
+                border: 1px solid {border_color};
+                padding: 2px 5px;
+                color: white;
+                border-radius: 2px;
+            }}
+            QComboBox:hover {{
+                background-color: #3a3a3a;
+                border: 1px solid {border_color};
+            }}
+            QComboBox::drop-down {{
+                border: none;
+                width: 20px;
+            }}
+            QComboBox::down-arrow {{
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 4px solid white;
+                width: 0px;
+                height: 0px;
+                margin-right: 5px;
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: #2a2a2a;
+                color: white;
+                selection-background-color: {border_color};
+                border: 1px solid {border_color};
+            }}
+        """)
+    
+    def draw_empty_chart(self):
+        """Draw empty chart with 'No Data' message"""
+        self.figure.clear()
+        ax = self.figure.add_subplot(111, facecolor='#0a0a0a')
+        ax.text(0.5, 0.5, 'No Data Available',
+                ha='center', va='center',
+                color='#808080',
+                fontsize=14,
+                transform=ax.transAxes)
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.axis('off')
+        self.canvas.draw()
+    
+    def on_scroll(self, event):
+        """Handle mouse wheel scroll for zoom in/out on x-axis"""
+        if event.inaxes is None or not hasattr(self, 'ax') or self.ax is None:
+            return
+        
+        if event.xdata is None:
+            return
+            
+        # Get current x-axis limits
+        cur_xlim = self.ax.get_xlim()
+        xdata = event.xdata  # Mouse x position in data coordinates
+        
+        # Zoom factor
+        base_scale = 1.2
+        if event.button == 'up':
+            # Zoom in (show less data, bars appear wider)
+            scale_factor = 1 / base_scale
+        elif event.button == 'down':
+            # Zoom out (show more data, bars appear narrower)
+            scale_factor = base_scale
+        else:
+            return
+        
+        # Calculate new limits centered on mouse position
+        new_width = (cur_xlim[1] - cur_xlim[0]) * scale_factor
+        relx = (cur_xlim[1] - xdata) / (cur_xlim[1] - cur_xlim[0])
+        
+        new_left = xdata - new_width * (1 - relx)
+        new_right = xdata + new_width * relx
+        
+        # Apply new limits
+        self.ax.set_xlim(new_left, new_right)
+        self.canvas.draw_idle()
+    
+    def update_chart_throttled(self, price_data, contract_description: str = ""):
+        """Throttled chart update - limits update frequency to prevent UI freezing"""
+        import time
+        current_time = time.time()
+        
+        # Check if enough time has passed since last update
+        if current_time - self.last_update_time >= self.update_interval:
+            # Update immediately
+            self.last_update_time = current_time
+            self.update_chart(price_data, contract_description)
+        else:
+            # Schedule update for later if not already scheduled
+            if self.pending_update is None:
+                remaining_time = self.update_interval - (current_time - self.last_update_time)
+                delay_ms = int(remaining_time * 1000)
+                self.pending_update = QTimer.singleShot(
+                    delay_ms, 
+                    lambda: self._execute_pending_update(price_data, contract_description)
+                )
+    
+    def _execute_pending_update(self, price_data, contract_description: str = ""):
+        """Execute the pending chart update"""
+        import time
+        self.pending_update = None
+        self.last_update_time = time.time()
+        self.update_chart(price_data, contract_description)
+    
+    def update_chart(self, price_data, contract_description: str = ""):
+        """Update chart with price data (line chart for mid-price)"""
+        if not price_data or len(price_data) < 2:
+            self.draw_empty_chart()
+            return
+        
+        try:
+            # Save current view limits BEFORE clearing figure
+            saved_xlim = None
+            if hasattr(self, 'ax') and self.ax is not None:
+                try:
+                    saved_xlim = self.ax.get_xlim()
+                except:
+                    pass
+            
+            # Convert to DataFrame
+            df = pd.DataFrame(price_data)
+            df['time'] = pd.to_datetime(df['time'])
+            df.set_index('time', inplace=True)
+            
+            # Ensure numeric columns
+            for col in ['open', 'high', 'low', 'close']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            df = df.dropna()
+            
+            # Sort by time to ensure proper chronological order
+            df = df.sort_index()
+            
+            # Remove duplicate timestamps (keep last)
+            df = df[~df.index.duplicated(keep='last')]
+            
+            if len(df) < 2:
+                self.draw_empty_chart()
+                return
+            
+            # Clear figure
+            self.figure.clear()
+            self.ax = self.figure.add_subplot(111)
+            
+            # Convert timestamps to matplotlib date numbers for proper spacing
+            from matplotlib.dates import date2num
+            x_dates = date2num(df.index)
+            
+            # Plot line chart (mid-price) using date numbers for x-axis
+            self.ax.plot(x_dates, df['close'].values.tolist(), color=self.border_color, 
+                        linewidth=2, alpha=0.9, label='Mid Price')
+            
+            # Format x-axis as datetime
+            self.ax.xaxis_date()
+            
+            # Style the chart
+            self.ax.set_facecolor('#0a0a0a')
+            self.ax.grid(True, color='#1a1a1a', linestyle='-', linewidth=0.5, alpha=0.5)
+            self.ax.tick_params(colors='#e0e0e0', labelsize=9)
+            self.ax.set_ylabel('Price', color='#e0e0e0', fontsize=9)
+            self.ax.set_xlabel('Time', color='#e0e0e0', fontsize=9)
+            self.ax.yaxis.tick_right()
+            self.ax.yaxis.set_label_position("right")
+            
+            # Format x-axis with time labels
+            self.ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+            self.ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+            self.ax.tick_params(axis='x', rotation=0, colors='#e0e0e0')
+            
+            # Style spines
+            for spine in self.ax.spines.values():
+                spine.set_color(self.border_color)
+                spine.set_linewidth(1.5)
+            
+            # Set title with contract description
+            current_price = float(df['close'].iloc[-1])
+            title_text = f"{self.title}"
+            if contract_description:
+                title_text += f" - {contract_description}"
+            
+            self.title_label.setText(title_text)
+            
+            # Add current price horizontal line
+            self.ax.axhline(y=current_price, color=self.border_color, 
+                          linestyle='--', linewidth=1, alpha=0.5)
+            
+            # Add current price text label on right y-axis
+            self.ax.text(1.01, current_price, f'${current_price:.2f}', 
+                        transform=self.ax.get_yaxis_transform(),
+                        color=self.border_color, fontsize=10, fontweight='bold',
+                        va='center', ha='left',
+                        bbox=dict(boxstyle='round,pad=0.3', facecolor='#0a0a0a', 
+                                 edgecolor=self.border_color, linewidth=1))
+            
+            # Preserve current zoom/pan state if we saved it, otherwise set default view
+            if saved_xlim is not None:
+                # Restore the user's view from before figure was cleared
+                self.ax.set_xlim(saved_xlim)
+                self.ax.autoscale(enable=False, axis='x')
+            else:
+                # First time drawing - set default view
+                if len(x_dates) > 100:
+                    visible_bars = min(240, len(x_dates))
+                    x_range = x_dates[-1] - x_dates[-visible_bars]
+                    padding = x_range * 0.02
+                    self.ax.set_xlim(x_dates[-visible_bars], x_dates[-1] + padding)
+                    self.ax.autoscale(enable=False, axis='x')
+                else:
+                    x_range = x_dates[-1] - x_dates[0]
+                    padding = x_range * 0.02
+                    self.ax.set_xlim(x_dates[0], x_dates[-1] + padding)
+            
+            # No need to call tight_layout - using constrained_layout in Figure constructor
+            
+            # Redraw canvas - use draw_idle() to avoid blocking UI
+            self.canvas.draw_idle()
+            
+            # Update navigation toolbar to reflect current view
+            if hasattr(self, 'nav_toolbar'):
+                self.nav_toolbar.push_current()
+            
+        except Exception as e:
+            logger.error(f"Error updating chart {self.title}: {e}", exc_info=True)
+            self.draw_empty_chart()
+
+
+class ProfessionalUnderlyingChart(QWidget):
+    """
+    Professional candlestick chart for underlying (SPX/XSP) with Z-Score subplot
+    Similar to TradeStation multi-panel charts with throttled updates for trading
+    """
+    
+    def __init__(self, title: str, border_color: str = "#FF8C00", parent=None):
+        super().__init__(parent)
+        self.title = title
+        self.border_color = border_color
+        self.chart_data = []
+        self.last_update_time = 0  # Throttle updates
+        self.update_interval = 0.25  # Minimum 250ms between updates (4 FPS)
+        self.pending_update = None  # QTimer for pending update
+        
+        # Create layout
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(2)
+        
+        # Top toolbar
+        toolbar = QWidget()
+        toolbar_layout = QHBoxLayout(toolbar)
+        toolbar_layout.setContentsMargins(5, 2, 5, 2)
+        toolbar_layout.setSpacing(10)
+        
+        # Title
+        self.title_label = QLabel(title)
+        self.title_label.setStyleSheet(f"""
+            QLabel {{
+                color: {border_color};
+                font-weight: bold;
+                font-size: 11pt;
+                border: none;
+            }}
+        """)
+        toolbar_layout.addWidget(self.title_label)
+        
+        toolbar_layout.addStretch()
+        
+        # Interval selector
+        toolbar_layout.addWidget(QLabel("Interval:"))
+        self.interval_combo = QComboBox()
+        self.interval_combo.addItems(["15 secs", "30 secs", "1 min", "5 min", "15 min", "30 min", "1 hour"])
+        self.interval_combo.setCurrentText("1 min")
+        self.interval_combo.setFixedWidth(80)
+        toolbar_layout.addWidget(self.interval_combo)
+        
+        # Days to load selector
+        toolbar_layout.addWidget(QLabel("Days:"))
+        self.days_combo = QComboBox()
+        self.days_combo.addItems(["1", "2", "3", "5"])
+        self.days_combo.setCurrentText("1")
+        self.days_combo.setFixedWidth(50)
+        toolbar_layout.addWidget(self.days_combo)
+        
+        # EMA period selector
+        toolbar_layout.addWidget(QLabel("EMA:"))
+        self.ema_input = QComboBox()
+        self.ema_input.addItems(["9", "20", "50", "200"])
+        self.ema_input.setCurrentText("9")
+        self.ema_input.setFixedWidth(50)
+        self.ema_input.setEditable(True)
+        toolbar_layout.addWidget(self.ema_input)
+        
+        layout.addWidget(toolbar)
+        
+        # Create figure with subplots - use constrained_layout instead of tight_layout
+        self.figure = Figure(figsize=(10, 7), dpi=100, facecolor='#0a0a0a', constrained_layout=True)
+        self.canvas = FigureCanvas(self.figure)
+        self.canvas.setStyleSheet(f"border: 2px solid {border_color};")
+        self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.canvas.setMinimumSize(400, 300)
+        
+        # Enable mouse wheel zoom
+        self.canvas.mpl_connect('scroll_event', self.on_scroll)
+        
+        # Add navigation toolbar for pan/zoom
+        self.nav_toolbar = NavigationToolbar(self.canvas, self)
+        self.nav_toolbar.setStyleSheet(f"""
+            QToolBar {{
+                background-color: #1a1a1a;
+                border: 1px solid {border_color};
+                spacing: 3px;
+            }}
+            QToolButton {{
+                background-color: #2a2a2a;
+                border: 1px solid {border_color};
+                color: white;
+                padding: 3px;
+            }}
+            QToolButton:hover {{
+                background-color: #3a3a3a;
+            }}
+        """)
+        layout.addWidget(self.nav_toolbar)
+        
+        # Ensure the widget itself also expands
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        
+        layout.addWidget(self.canvas)
+        
+        # Set widget size policy
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        
+        # Initialize empty chart
+        self.price_ax = None
+        self.zscore_ax = None
+        self.draw_empty_chart()
+        
+        # Apply styling
+        self.setStyleSheet(f"""
+            QWidget {{
+                background-color: #0a0a0a;
+                color: white;
+            }}
+            QLabel {{
+                color: white;
+                border: none;
+            }}
+            QComboBox {{
+                background-color: #2a2a2a;
+                border: 1px solid {border_color};
+                padding: 2px 5px;
+                color: white;
+                border-radius: 2px;
+            }}
+            QComboBox:hover {{
+                background-color: #3a3a3a;
+                border: 1px solid {border_color};
+            }}
+            QComboBox::drop-down {{
+                border: none;
+                width: 20px;
+            }}
+            QComboBox::down-arrow {{
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 4px solid white;
+                width: 0px;
+                height: 0px;
+                margin-right: 5px;
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: #2a2a2a;
+                color: white;
+                selection-background-color: {border_color};
+                border: 1px solid {border_color};
+            }}
+        """)
+    
+    def on_scroll(self, event):
+        """Handle mouse wheel scroll for zoom in/out on x-axis"""
+        if event.inaxes is None or not hasattr(self, 'price_ax') or self.price_ax is None:
+            return
+        
+        if event.xdata is None:
+            return
+            
+        # Get current x-axis limits (shared between price and zscore)
+        cur_xlim = self.price_ax.get_xlim()
+        xdata = event.xdata  # Mouse x position in data coordinates
+        
+        # Zoom factor
+        base_scale = 1.2
+        if event.button == 'up':
+            # Zoom in (show less data, bars appear wider)
+            scale_factor = 1 / base_scale
+        elif event.button == 'down':
+            # Zoom out (show more data, bars appear narrower)
+            scale_factor = base_scale
+        else:
+            return
+        
+        # Calculate new limits centered on mouse position
+        new_width = (cur_xlim[1] - cur_xlim[0]) * scale_factor
+        relx = (cur_xlim[1] - xdata) / (cur_xlim[1] - cur_xlim[0])
+        
+        new_left = xdata - new_width * (1 - relx)
+        new_right = xdata + new_width * relx
+        
+        # Apply new limits (will affect both subplots due to sharex)
+        self.price_ax.set_xlim(new_left, new_right)
+        self.canvas.draw_idle()
+    
+    def draw_empty_chart(self):
+        """Draw empty chart"""
+        self.figure.clear()
+        ax = self.figure.add_subplot(111, facecolor='#0a0a0a')
+        ax.text(0.5, 0.5, 'No Data Available',
+                ha='center', va='center',
+                color='#808080',
+                fontsize=14,
+                transform=ax.transAxes)
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.axis('off')
+        self.canvas.draw()
+    
+    def update_chart_throttled(self, price_data, ema_period=9, z_period=30, z_threshold=1.5):
+        """Throttled chart update - limits update frequency to prevent UI freezing"""
+        import time
+        current_time = time.time()
+        
+        # Check if enough time has passed since last update
+        if current_time - self.last_update_time >= self.update_interval:
+            # Update immediately
+            self.last_update_time = current_time
+            self.update_chart(price_data, ema_period, z_period, z_threshold)
+        else:
+            # Schedule update for later if not already scheduled
+            if self.pending_update is None:
+                remaining_time = self.update_interval - (current_time - self.last_update_time)
+                delay_ms = int(remaining_time * 1000)
+                self.pending_update = QTimer.singleShot(
+                    delay_ms,
+                    lambda: self._execute_pending_update(price_data, ema_period, z_period, z_threshold)
+                )
+    
+    def _execute_pending_update(self, price_data, ema_period=9, z_period=30, z_threshold=1.5):
+        """Execute the pending chart update"""
+        import time
+        self.pending_update = None
+        self.last_update_time = time.time()
+        self.update_chart(price_data, ema_period, z_period, z_threshold)
+    
+    def update_chart(self, price_data, ema_period=9, z_period=30, z_threshold=1.5):
+        """Update chart with price data, EMA, and Z-Score"""
+        if not price_data or len(price_data) < max(ema_period, z_period):
+            self.draw_empty_chart()
+            return
+        
+        try:
+            # Save current view limits BEFORE clearing figure
+            saved_xlim = None
+            if hasattr(self, 'price_ax') and self.price_ax is not None:
+                try:
+                    saved_xlim = self.price_ax.get_xlim()
+                except:
+                    pass
+            
+            # Convert to DataFrame
+            df = pd.DataFrame(price_data)
+            df['time'] = pd.to_datetime(df['time'])
+            df.set_index('time', inplace=True)
+            
+            for col in ['open', 'high', 'low', 'close']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            df = df.dropna()
+            
+            # Sort by time to ensure proper chronological order
+            df = df.sort_index()
+            
+            # Remove duplicate timestamps (keep last)
+            df = df[~df.index.duplicated(keep='last')]
+            
+            if len(df) < 2:
+                self.draw_empty_chart()
+                return
+            
+            # Calculate EMA
+            df['ema'] = df['close'].ewm(span=ema_period, adjust=False).mean()
+            
+            # Calculate Z-Score
+            df['z_score'] = (df['close'] - df['close'].rolling(z_period).mean()) / df['close'].rolling(z_period).std()
+            
+            # Clear figure and create subplots
+            self.figure.clear()
+            gs = self.figure.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.05)
+            
+            # Price chart (top) - manual candlestick rendering with proper datetime x-axis
+            self.price_ax = self.figure.add_subplot(gs[0])
+            
+            # Convert timestamps to matplotlib date numbers for proper spacing
+            from matplotlib.dates import date2num
+            x_dates = date2num(df.index)
+            
+            # Calculate bar width based on time interval (in days)
+            if len(x_dates) > 1:
+                bar_width = (x_dates[1] - x_dates[0]) * 0.6  # 60% of interval
+            else:
+                bar_width = 0.0003  # ~30 seconds for single bar
+            
+            # Plot candlesticks using datetime x-axis
+            for i, (timestamp, row) in enumerate(df.iterrows()):
+                x = x_dates[i]
+                color = '#00ff00' if row['close'] >= row['open'] else '#ff0000'
+                
+                # Draw high-low line (wick)
+                self.price_ax.plot([x, x], [row['low'], row['high']], 
+                                  color=color, linewidth=1, alpha=0.8)
+                
+                # Draw open-close box (body)
+                body_height = abs(row['close'] - row['open'])
+                body_bottom = min(row['open'], row['close'])
+                rect = Rectangle(
+                    (x - bar_width/2, body_bottom), 
+                    bar_width, 
+                    body_height if body_height > 0 else 0.01,
+                    facecolor=color, 
+                    edgecolor=color,
+                    alpha=0.9
+                )
+                self.price_ax.add_patch(rect)
+            
+            # Add EMA overlay using datetime x-axis
+            self.price_ax.plot(x_dates, df['ema'].values.tolist(), color=self.border_color, 
+                             linewidth=1.5, label=f'EMA({ema_period})', alpha=0.8)
+            
+            # Style price chart
+            self.price_ax.set_facecolor('#0a0a0a')
+            self.price_ax.grid(True, color='#1a1a1a', linestyle='-', linewidth=0.5, alpha=0.5)
+            self.price_ax.tick_params(colors='#e0e0e0', labelsize=9, labelbottom=False)
+            self.price_ax.set_ylabel('Price', color='#e0e0e0', fontsize=9)
+            self.price_ax.yaxis.tick_right()
+            self.price_ax.yaxis.set_label_position("right")
+            self.price_ax.legend(loc='upper left', facecolor='#0a0a0a', 
+                               edgecolor=self.border_color, labelcolor='#e0e0e0', 
+                               fontsize=8, framealpha=0.8)
+            
+            # Add current price horizontal line (green dotted)
+            current_price = float(df['close'].iloc[-1])
+            self.price_ax.axhline(y=current_price, color='#00ff00', 
+                                 linestyle=':', linewidth=2, alpha=0.7)
+            
+            # Add current price text label on right y-axis
+            self.price_ax.text(1.01, current_price, f'${current_price:.2f}', 
+                              transform=self.price_ax.get_yaxis_transform(),
+                              color='#00ff00', fontsize=10, fontweight='bold',
+                              va='center', ha='left',
+                              bbox=dict(boxstyle='round,pad=0.3', facecolor='#0a0a0a', 
+                                       edgecolor='#00ff00', linewidth=1))
+            
+            # Format x-axis as time
+            self.price_ax.xaxis_date()
+            
+            for spine in self.price_ax.spines.values():
+                spine.set_color(self.border_color)
+                spine.set_linewidth(1.5)
+            
+            # Z-Score chart (bottom)
+            self.zscore_ax = self.figure.add_subplot(gs[1], sharex=self.price_ax)
+            
+            # Plot Z-Score line
+            self.zscore_ax.plot(df.index, df['z_score'], color='#4a9eff', linewidth=1.5)
+            
+            # Fill between zero line (convert to numpy arrays for type compatibility)
+            z_values = df['z_score'].values
+            self.zscore_ax.fill_between(df.index, 0, df['z_score'], 
+                                       where=(z_values >= 0),  # type: ignore[arg-type]
+                                       color='#00ff00', alpha=0.2, interpolate=True)
+            self.zscore_ax.fill_between(df.index, 0, df['z_score'], 
+                                       where=(z_values < 0),  # type: ignore[arg-type]
+                                       color='#ff0000', alpha=0.2, interpolate=True)
+            
+            # Z-Score threshold lines
+            self.zscore_ax.axhline(y=0, color='#808080', linestyle='-', linewidth=1, alpha=0.5)
+            self.zscore_ax.axhline(y=z_threshold, color='#00ff00', linestyle='--', linewidth=1, alpha=0.5)
+            self.zscore_ax.axhline(y=-z_threshold, color='#ff0000', linestyle='--', linewidth=1, alpha=0.5)
+            
+            # Style Z-Score chart
+            self.zscore_ax.set_facecolor('#0a0a0a')
+            self.zscore_ax.grid(True, color='#1a1a1a', linestyle='-', linewidth=0.5, alpha=0.5)
+            self.zscore_ax.tick_params(colors='#e0e0e0', labelsize=8)
+            self.zscore_ax.set_ylabel('Z-Score', color='#e0e0e0', fontsize=9)
+            self.zscore_ax.set_ylim(-3, 3)
+            self.zscore_ax.yaxis.tick_right()
+            self.zscore_ax.yaxis.set_label_position("right")
+            self.zscore_ax.set_xlabel('Time', color='#e0e0e0', fontsize=9)
+            
+            for spine in self.zscore_ax.spines.values():
+                spine.set_color(self.border_color)
+                spine.set_linewidth(1.5)
+            
+            # Format x-axis with better time labels
+            self.zscore_ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+            self.zscore_ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+            self.zscore_ax.tick_params(axis='x', rotation=0, colors='#e0e0e0', labelsize=9)
+            
+            # Preserve current zoom/pan state if we saved it, otherwise set default view
+            if saved_xlim is not None:
+                # Restore the user's view from before figure was cleared (applies to both subplots due to sharex)
+                self.price_ax.set_xlim(saved_xlim)
+                self.price_ax.autoscale(enable=False, axis='x')
+            else:
+                # First time drawing - set default view
+                if len(x_dates) > 100:
+                    visible_bars = min(240, len(x_dates))
+                    x_range = x_dates[-1] - x_dates[-visible_bars]
+                    padding = x_range * 0.02
+                    self.price_ax.set_xlim(x_dates[-visible_bars], x_dates[-1] + padding)
+                    self.price_ax.autoscale(enable=False, axis='x')
+                else:
+                    x_range = x_dates[-1] - x_dates[0]
+                    padding = x_range * 0.02
+                    self.price_ax.set_xlim(x_dates[0], x_dates[-1] + padding)
+            
+            # Update title (price shown on chart now)
+            self.title_label.setText(self.title)
+            
+            # No need to call tight_layout - using constrained_layout in Figure constructor
+            # Use draw_idle() to avoid blocking UI thread
+            self.canvas.draw_idle()
+            
+            # Update navigation toolbar to reflect current view
+            if hasattr(self, 'nav_toolbar'):
+                self.nav_toolbar.push_current()
+            
+        except Exception as e:
+            logger.error(f"Error updating underlying chart {self.title}: {e}", exc_info=True)
+            self.draw_empty_chart()
 
 
 # ============================================================================
-# CHART WIDGET - PROFESSIONAL MATPLOTLIB/MPLFINANCE IMPLEMENTATION
+# CHART WINDOW - POPUP WINDOW FOR CHARTS
 # ============================================================================
 
-# Import the new matplotlib-based ChartWidget (see chart_widget_matplotlib.py)
-# from chart_widget_matplotlib import ChartWidget  # TODO: Implement chart widget
+class ChartWindow(QMainWindow):
+    """Popup window for displaying all four charts"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Charts - 0DTE Options Trader")
+        self.setGeometry(150, 150, 1400, 800)
+        
+        # Central widget
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(5, 5, 5, 5)
+        layout.setSpacing(0)
+        
+        # Create 2x2 grid for charts with equal spacing
+        self.charts_widget = QWidget()
+        self.charts_layout = QGridLayout(self.charts_widget)
+        self.charts_layout.setSpacing(5)
+        self.charts_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Set equal row and column stretch factors for uniform expansion
+        self.charts_layout.setRowStretch(0, 1)
+        self.charts_layout.setRowStretch(1, 1)
+        self.charts_layout.setColumnStretch(0, 1)
+        self.charts_layout.setColumnStretch(1, 1)
+        
+        layout.addWidget(self.charts_widget)
+        
+        # Apply dark theme
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #1a1a1a;
+            }
+            QWidget {
+                background-color: #1a1a1a;
+                color: white;
+            }
+        """)
+        
+        logger.info("ChartWindow initialized")
 
 
 # ============================================================================
@@ -654,6 +1548,7 @@ class MainWindow(QMainWindow):
         self.last_underlying_price = 0.0  # Last seen underlying price for offset calculation
         self.last_offset_update_time = 0  # Timestamp of last offset update
         self.offset_update_enabled = True  # True during market hours, False overnight
+        self.es_futures_was_closed = None  # Track previous ES futures market state for transition detection
         
         # Trading state
         self.positions = {}  # contract_key -> position_data
@@ -665,7 +1560,8 @@ class MainWindow(QMainWindow):
         
         # Chart data storage - separate from general historical_data for chart-specific needs
         self.chart_data = {
-            'underlying': [],  # SPX/XSP bars for confirmation and trade charts
+            'underlying': [],  # SPX/XSP bars for confirmation chart
+            'underlying_trade': [],  # SPX/XSP bars for trade chart
             'selected_call': [],  # Currently selected call option bars
             'selected_put': [],   # Currently selected put option bars
         }
@@ -678,6 +1574,9 @@ class MainWindow(QMainWindow):
         
         # Request tracking for charts
         self.request_id_map = {}  # Maps request IDs to contract keys for chart updates
+        
+        # Chart window (popup window for charts)
+        self.chart_window = None
         
         # Connection settings
         self.host = "127.0.0.1"
@@ -724,10 +1623,15 @@ class MainWindow(QMainWindow):
         self.market_close_timer.timeout.connect(self.check_market_close_refresh)
         self.market_close_timer.start(60000)  # Check every 60 seconds
         
-        # ES offset monitoring timer (check market hours every 5 minutes)
+        # ES offset monitoring timer (check market hours and ES futures state every minute)
         self.offset_monitor_timer = QTimer()
         self.offset_monitor_timer.timeout.connect(self.check_offset_monitoring)
-        self.offset_monitor_timer.start(300000)  # Check every 5 minutes
+        self.offset_monitor_timer.start(60000)  # Check every minute for responsive market state detection
+        
+        # ES offset save timer (save offset every 1 minute during market hours)
+        self.offset_save_timer = QTimer()
+        self.offset_save_timer.timeout.connect(self.save_offset_to_settings)
+        self.offset_save_timer.start(60000)  # Save every 60 seconds
         
         # Manual trading settings
         self.give_in_interval = 10.0  # Seconds between "give in" price adjustments (configurable)
@@ -777,6 +1681,12 @@ class MainWindow(QMainWindow):
         self.load_settings()
         self.load_positions()  # Load saved positions to preserve entryTime
         
+        # Log ES offset tracking status at startup
+        if self.is_market_hours():
+            logger.info("ES offset tracking: ACTIVE (market hours 8:30 AM - 3:00 PM CT)")
+        else:
+            logger.info("ES offset tracking: INACTIVE (outside market hours) - using saved offset from day session")
+        
         # Start position auto-update timer (1-second updates for time tracking and P&L)
         self.position_update_timer = QTimer()
         self.position_update_timer.timeout.connect(self.update_positions_display)
@@ -808,6 +1718,7 @@ class MainWindow(QMainWindow):
         self.signals.order_status_update.connect(self.on_order_status)
         self.signals.historical_bar.connect(self.on_historical_bar)
         self.signals.historical_complete.connect(self.on_historical_complete)
+        self.signals.historical_bar_update.connect(self.on_historical_bar_update)
     
     def setup_ui(self):
         """Setup the user interface"""
@@ -1288,6 +2199,207 @@ class MainWindow(QMainWindow):
         
         return data
     
+    def toggle_chart_window(self):
+        """Toggle the chart popup window"""
+        if self.chart_window is None or not self.chart_window.isVisible():
+            # Create or show the chart window
+            if self.chart_window is None:
+                self.chart_window = ChartWindow(self)
+                
+                # Add the four charts to the popup window
+                self.chart_window.charts_layout.addWidget(self.call_chart_widget, 0, 0)
+                self.chart_window.charts_layout.addWidget(self.put_chart_widget, 0, 1)
+                self.chart_window.charts_layout.addWidget(self.confirm_chart_widget, 1, 0)
+                self.chart_window.charts_layout.addWidget(self.trade_chart_widget, 1, 1)
+                
+                logger.info("Chart window created and populated")
+            
+            self.chart_window.show()
+            self.show_charts_btn.setText("Hide Charts")
+            logger.info("Chart window shown")
+        else:
+            # Hide the chart window
+            self.chart_window.hide()
+            self.show_charts_btn.setText("Show Charts")
+            logger.info("Chart window hidden")
+    
+    def on_underlying_settings_changed(self, chart_widget, is_trade_chart: bool):
+        """Handle interval or days combo box changes for underlying charts"""
+        if self.connection_state != ConnectionState.CONNECTED or not self.ibkr_client:
+            logger.warning("Cannot reload chart - not connected to IBKR")
+            return
+        
+        try:
+            # Get settings from chart widget
+            interval_text = chart_widget.interval_combo.currentText()
+            days_text = chart_widget.days_combo.currentText()
+            
+            # Map interval to IBAPI bar size
+            interval_map = {
+                "15 secs": "15 secs",
+                "30 secs": "30 secs",
+                "1 min": "1 min",
+                "5 min": "5 mins",
+                "15 min": "15 mins",
+                "30 min": "30 mins",
+                "1 hour": "1 hour"
+            }
+            bar_size = interval_map.get(interval_text, "1 min")
+            
+            # Calculate duration based on days
+            days = int(days_text)
+            duration = f"{days} D"
+            
+            # Create underlying contract
+            from ibapi.contract import Contract
+            contract = Contract()
+            contract.symbol = self.instrument['underlying_symbol']
+            contract.secType = "IND" if self.instrument['underlying_symbol'] == "SPX" else "STK"
+            contract.exchange = "CBOE" if self.instrument['underlying_symbol'] == "SPX" else "ARCA"
+            contract.currency = "USD"
+            
+            req_id = self.app_state['next_req_id']
+            self.app_state['next_req_id'] += 1
+            
+            # Determine contract key based on which chart
+            if is_trade_chart:
+                contract_key = f"UNDERLYING_{self.instrument['underlying_symbol']}_TRADE"
+            else:
+                contract_key = f"UNDERLYING_{self.instrument['underlying_symbol']}"
+            
+            self.request_id_map[req_id] = contract_key
+            
+            # Clear existing data for this chart (both historical and chart data)
+            if contract_key in self.historical_data:
+                self.historical_data[contract_key] = []
+            
+            # Also clear chart_data to prevent rendering stale data
+            if is_trade_chart:
+                self.chart_data['underlying_trade'] = []
+            else:
+                self.chart_data['underlying'] = []
+            
+            # Request new data with updated settings
+            self.ibkr_client.reqHistoricalData(
+                req_id,
+                contract,
+                "",  # End time (empty = now)
+                duration,
+                bar_size,
+                "TRADES",
+                1,  # Use RTH
+                1,  # Format date
+                True,  # Keep up to date
+                []
+            )
+            
+            chart_name = "Trade" if is_trade_chart else "Confirmation"
+            logger.info(f"Reloading {chart_name} chart with {interval_text} bars, {days} days")
+            self.log_message(f"Reloading {chart_name} chart: {interval_text}, {days} days", "INFO")
+            
+        except Exception as e:
+            logger.error(f"Error reloading underlying chart: {e}")
+            self.log_message(f"Error reloading chart: {e}", "ERROR")
+    
+    def on_option_settings_changed(self, chart_widget, is_call: bool):
+        """Handle interval or days combo box changes for option charts"""
+        if self.connection_state != ConnectionState.CONNECTED or not self.ibkr_client:
+            logger.warning("Cannot reload option chart - not connected to IBKR")
+            return
+        
+        # Check if we have a contract selected
+        contract_attr = 'current_call_contract' if is_call else 'current_put_contract'
+        if not hasattr(self, contract_attr):
+            self.log_message(f"No {'call' if is_call else 'put'} option selected", "WARNING")
+            return
+        
+        try:
+            # Get settings from chart widget
+            interval_text = chart_widget.interval_combo.currentText()
+            days_text = chart_widget.days_combo.currentText()
+            
+            # Map interval to IBAPI bar size
+            interval_map = {
+                "15 secs": "15 secs",
+                "30 secs": "30 secs",
+                "1 min": "1 min",
+                "5 min": "5 mins",
+                "15 min": "15 mins",
+                "30 min": "30 mins",
+                "1 hour": "1 hour"
+            }
+            bar_size = interval_map.get(interval_text, "1 min")
+            
+            # Calculate duration based on days
+            days = int(days_text)
+            duration = f"{days} D"
+            
+            # Get the contract key for the current option
+            contract_key = getattr(self, contract_attr)
+            option_type = "call" if is_call else "put"
+            
+            # Parse contract key to get details and recreate request
+            from ibapi.contract import Contract
+            parts = contract_key.split('_')
+            if len(parts) != 4:
+                logger.error(f"Invalid contract key format: {contract_key}")
+                return
+                
+            symbol, strike_str, right, expiry = parts
+            strike = float(strike_str)
+            
+            # Create option contract
+            contract = Contract()
+            contract.symbol = symbol
+            contract.secType = "OPT"
+            contract.exchange = "SMART"
+            contract.currency = "USD"
+            contract.lastTradeDateOrContractMonth = expiry
+            contract.strike = strike
+            contract.right = right
+            contract.multiplier = "100"
+            contract.tradingClass = "SPXW" if symbol == "SPX" else "XSP"
+            
+            # Get unique request ID
+            req_id = self.app_state.get('next_order_id', 1)
+            self.app_state['next_order_id'] = req_id + 1
+            
+            # Map this request to the appropriate chart data storage
+            chart_key = f"CHART_{option_type}_{contract_key}"
+            self.request_id_map[req_id] = chart_key
+            
+            # Clear existing data for this chart (both historical and chart data)
+            if chart_key in self.historical_data:
+                self.historical_data[chart_key] = []
+            
+            # Also clear chart_data to prevent rendering stale data
+            if is_call:
+                self.chart_data['selected_call'] = []
+            else:
+                self.chart_data['selected_put'] = []
+            
+            # Request historical data with new settings
+            self.ibkr_client.reqHistoricalData(
+                req_id,
+                contract,
+                "",  # End time (empty = now)
+                duration,
+                bar_size,
+                "MIDPOINT",  # Use mid price (bid+ask)/2 for option charts
+                1,  # Use RTH
+                1,  # Format date
+                True,  # Keep up to date
+                []
+            )
+            
+            chart_name = "Call" if is_call else "Put"
+            logger.info(f"Reloading {chart_name} chart with {interval_text} bars, {days} days")
+            self.log_message(f"Reloading {chart_name} chart: {interval_text}, {days} days", "INFO")
+            
+        except Exception as e:
+            logger.error(f"Error reloading option chart: {e}")
+            self.log_message(f"Error reloading option chart: {e}", "ERROR")
+    
     def request_chart_data(self):
         """Request real historical data for charts"""
         if self.connection_state != ConnectionState.CONNECTED or not self.ibkr_client:
@@ -1325,7 +2437,7 @@ class MainWindow(QMainWindow):
             contract_key = f"UNDERLYING_{self.instrument['underlying_symbol']}"
             self.request_id_map[req_id] = contract_key
             
-            # Request 1 day of 1-minute data for confirmation chart
+            # Request 1 day of 1-minute data for confirmation chart with real-time updates
             self.ibkr_client.reqHistoricalData(
                 req_id,
                 contract,
@@ -1335,7 +2447,7 @@ class MainWindow(QMainWindow):
                 "TRADES",
                 1,  # Use RTH
                 1,  # Format date
-                False,  # Keep up to date
+                True,  # Keep up to date - enables real-time bar updates via historicalDataUpdate
                 []
             )
             
@@ -1348,7 +2460,7 @@ class MainWindow(QMainWindow):
             contract_key_trade = f"UNDERLYING_{self.instrument['underlying_symbol']}_TRADE"
             self.request_id_map[req_id_trade] = contract_key_trade
             
-            # Request 4 hours of 30-second data for trade chart
+            # Request 4 hours of 30-second data for trade chart with real-time updates
             self.ibkr_client.reqHistoricalData(
                 req_id_trade,
                 contract,
@@ -1358,7 +2470,7 @@ class MainWindow(QMainWindow):
                 "TRADES",
                 1,  # Use RTH
                 1,  # Format date
-                False,  # Keep up to date
+                True,  # Keep up to date - enables real-time bar updates via historicalDataUpdate
                 []
             )
             
@@ -1418,17 +2530,17 @@ class MainWindow(QMainWindow):
             
             self.request_id_map[req_id] = f"CHART_{contract_key}"
             
-            # Request 1 day of 1-minute data for option charts
+            # Request 1 day of 1-minute data for option charts using MIDPOINT with real-time updates
             self.ibkr_client.reqHistoricalData(
                 req_id,
                 contract,
                 "",  # End time (empty = now)
                 "1 D",  # Duration  
                 "1 min",  # Bar size
-                "TRADES",
+                "MIDPOINT",  # Use mid price (bid+ask)/2 for option charts
                 1,  # Use RTH
                 1,  # Format date
-                False,  # Keep up to date
+                True,  # Keep up to date - enables real-time bar updates via historicalDataUpdate
                 []
             )
             
@@ -1474,17 +2586,17 @@ class MainWindow(QMainWindow):
             chart_key = f"CHART_{option_type}_{contract_key}"
             self.request_id_map[req_id] = chart_key
             
-            # Request historical data for charts
+            # Request historical data for charts using MIDPOINT with real-time updates
             self.ibkr_client.reqHistoricalData(
                 req_id,
                 contract,
                 "",  # End time (empty = now)
                 "1 D",  # Duration  
                 "1 min",  # Bar size
-                "TRADES",
+                "MIDPOINT",  # Use mid price (bid+ask)/2 for option charts
                 1,  # Use RTH
                 1,  # Format date
-                False,  # Keep up to date
+                True,  # Keep up to date - enables real-time bar updates via historicalDataUpdate
                 []
             )
             
@@ -1498,6 +2610,35 @@ class MainWindow(QMainWindow):
         """Create the main trading dashboard tab"""
         tab = QWidget()
         main_layout = QVBoxLayout(tab)  # This is the main layout for the tab
+        
+        # Top button row - Show Charts button
+        top_button_row = QFrame()
+        top_button_layout = QHBoxLayout(top_button_row)
+        top_button_layout.setContentsMargins(0, 0, 0, 5)
+        
+        self.show_charts_btn = QPushButton("Show Charts")
+        self.show_charts_btn.clicked.connect(self.toggle_chart_window)
+        self.show_charts_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                font-weight: bold;
+                font-size: 12pt;
+                padding: 8px 20px;
+                border: none;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+            QPushButton:pressed {
+                background-color: #3d8b40;
+            }
+        """)
+        top_button_layout.addWidget(self.show_charts_btn)
+        top_button_layout.addStretch()
+        
+        main_layout.addWidget(top_button_row)
         
         # Header with underlying price and expiration selector
         header = QFrame()
@@ -1559,7 +2700,7 @@ class MainWindow(QMainWindow):
         self.option_table = QTableWidget()
         self.option_table.setColumnCount(21)
         headers = [
-            "Imp Vol", "Delta", "Theta", "Vega", "Gamma", "Volume", "CHANGE %", "Last", "Ask", "Bid",
+            "Imp Vol", "Delta", "Theta", "Vega", "Gamma", "Volume", "CHANGE %", "Last", "Bid", "Ask",
             "● STRIKE ●",
             "Bid", "Ask", "Last", "CHANGE %", "Volume", "Gamma", "Vega", "Theta", "Delta", "Imp Vol"
         ]
@@ -1581,30 +2722,42 @@ class MainWindow(QMainWindow):
         """)
         trading_layout.addWidget(self.option_table)
 
-        # Charts panel - Four Chart System
-        # 2x2 grid: Call Chart (top-left), Put Chart (top-right), 
-        # Confirmation Chart (bottom-left), Trade Chart (bottom-right)
-        charts_widget = QWidget()
-        charts_layout = QGridLayout(charts_widget)
-        charts_layout.setSpacing(5)
+        # Charts are now in popup window - create professional chart widgets
+        # Call Chart (Top Left) - Light blue for calls
+        self.call_chart_widget = ProfessionalChart("Call Chart", "#4EC9FF")
+        self.call_chart_widget.interval_combo.currentTextChanged.connect(
+            lambda: self.on_option_settings_changed(self.call_chart_widget, is_call=True)
+        )
+        self.call_chart_widget.days_combo.currentTextChanged.connect(
+            lambda: self.on_option_settings_changed(self.call_chart_widget, is_call=True)
+        )
         
-        # Call Chart (Top Left)
-        self.call_chart_widget = self.create_option_chart("Call Chart", "#FF6B6B")
-        charts_layout.addWidget(self.call_chart_widget, 0, 0)
+        # Put Chart (Top Right) - Pink for puts
+        self.put_chart_widget = ProfessionalChart("Put Chart", "#FF69B4")
+        self.put_chart_widget.interval_combo.currentTextChanged.connect(
+            lambda: self.on_option_settings_changed(self.put_chart_widget, is_call=False)
+        )
+        self.put_chart_widget.days_combo.currentTextChanged.connect(
+            lambda: self.on_option_settings_changed(self.put_chart_widget, is_call=False)
+        )
         
-        # Put Chart (Top Right)  
-        self.put_chart_widget = self.create_option_chart("Put Chart", "#4ECDC4")
-        charts_layout.addWidget(self.put_chart_widget, 0, 1)
+        # Confirmation Chart (Bottom Left) - Professional underlying with Z-Score
+        self.confirm_chart_widget = ProfessionalUnderlyingChart("Confirmation Chart", "#FFA726")
+        self.confirm_chart_widget.interval_combo.currentTextChanged.connect(
+            lambda: self.on_underlying_settings_changed(self.confirm_chart_widget, is_trade_chart=False)
+        )
+        self.confirm_chart_widget.days_combo.currentTextChanged.connect(
+            lambda: self.on_underlying_settings_changed(self.confirm_chart_widget, is_trade_chart=False)
+        )
         
-        # Confirmation Chart (Bottom Left)
-        self.confirm_chart_widget = self.create_spx_chart("Confirmation Chart", "#FFA726", True)
-        charts_layout.addWidget(self.confirm_chart_widget, 1, 0)
-        
-        # Trade Chart (Bottom Right)
-        self.trade_chart_widget = self.create_spx_chart("Trade Chart", "#66BB6A", False)
-        charts_layout.addWidget(self.trade_chart_widget, 1, 1)
-        
-        trading_layout.addWidget(charts_widget)
+        # Trade Chart (Bottom Right) - Professional underlying with Z-Score
+        self.trade_chart_widget = ProfessionalUnderlyingChart("Trade Chart", "#66BB6A")
+        self.trade_chart_widget.interval_combo.currentTextChanged.connect(
+            lambda: self.on_underlying_settings_changed(self.trade_chart_widget, is_trade_chart=True)
+        )
+        self.trade_chart_widget.days_combo.currentTextChanged.connect(
+            lambda: self.on_underlying_settings_changed(self.trade_chart_widget, is_trade_chart=True)
+        )
 
         # Positions and Orders panel
         pos_order_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -1619,8 +2772,10 @@ class MainWindow(QMainWindow):
             "Contract", "Qty", "Entry", "Current", "P&L", "P&L %", "EntryTime", "TimeSpan", "Action"
         ])
         self.positions_table.verticalHeader().setVisible(False)  # type: ignore[union-attr]
-        self.positions_table.setMaximumHeight(113)  # Reduced by 25% (was 150)
+        self.positions_table.setMaximumHeight(339)  # Increased by 3x (was 113)
         self.positions_table.cellClicked.connect(self.on_position_cell_clicked)
+        # Set Contract column width (increased by 20px for full contract_key visibility)
+        self.positions_table.setColumnWidth(0, 170)  # Contract column
         # Reduce row height by 25%
         self.positions_table.setStyleSheet("""
             QTableWidget::item { 
@@ -1642,8 +2797,10 @@ class MainWindow(QMainWindow):
             "Order ID", "Contract", "Action", "Qty", "Price", "Status", "Action"
         ])
         self.orders_table.verticalHeader().setVisible(False)  # type: ignore[union-attr]
-        self.orders_table.setMaximumHeight(113)  # Reduced by 25% (was 150)
+        self.orders_table.setMaximumHeight(339)  # Increased by 3x (was 113)
         self.orders_table.cellClicked.connect(self.on_order_cell_clicked)
+        # Set Contract column width (increased by 20px for full contract_key visibility)
+        self.orders_table.setColumnWidth(1, 170)  # Contract column
         # Reduce row height by 25%
         self.orders_table.setStyleSheet("""
             QTableWidget::item { 
@@ -1695,244 +2852,178 @@ class MainWindow(QMainWindow):
         panels_container = QWidget()
         panels_layout = QHBoxLayout(panels_container)
         panels_layout.setContentsMargins(0, 0, 0, 0)
-        panels_layout.setSpacing(5)        # --- PANEL 1: Master Settings (Strategy Control) - EXPANDED ---
+        panels_layout.setSpacing(5)        # --- PANEL 1: Master Settings (Strategy Control) ---
         self.master_group = QGroupBox("Master Settings")
-        self.master_group.setFixedWidth(280)  # Expanded from 220 to 280
-        master_layout = QGridLayout(self.master_group)
-        master_layout.setVerticalSpacing(3)  # Reduce vertical spacing
-        master_layout.setHorizontalSpacing(8)  # Increase horizontal spacing for better organization
+        self.master_group.setFixedWidth(280)
+        master_layout = QFormLayout(self.master_group)
+        master_layout.setVerticalSpacing(8)
+        master_layout.setHorizontalSpacing(10)
         
-        # Row 0: Strategy ON/OFF buttons (span full width)
-        master_layout.addWidget(QLabel("<b>Auto:</b>"), 0, 0)
-        
+        # Strategy ON/OFF buttons
         button_frame = QWidget()
         button_layout = QHBoxLayout(button_frame)
         button_layout.setContentsMargins(0, 0, 0, 0)
-        button_layout.setSpacing(3)
+        button_layout.setSpacing(5)
         
         self.strategy_on_btn = QPushButton("ON")
         self.strategy_on_btn.setProperty("success", True)
-        self.strategy_on_btn.setFixedWidth(60)  # Increased from 50 to 60
         self.strategy_on_btn.clicked.connect(lambda: self.set_strategy_enabled(True))
         button_layout.addWidget(self.strategy_on_btn)
         
         self.strategy_off_btn = QPushButton("OFF")
         self.strategy_off_btn.setProperty("danger", True)
-        self.strategy_off_btn.setFixedWidth(60)  # Increased from 50 to 60
         self.strategy_off_btn.clicked.connect(lambda: self.set_strategy_enabled(False))
         button_layout.addWidget(self.strategy_off_btn)
         
         self.strategy_status_label = QLabel("OFF")
-        self.strategy_status_label.setStyleSheet("font-weight: bold; color: #808080; font-size: 8pt;")
+        self.strategy_status_label.setStyleSheet("font-weight: bold; color: #808080;")
         button_layout.addWidget(self.strategy_status_label)
-        button_layout.addStretch()  # Push everything left
+        button_layout.addStretch()
         
-        master_layout.addWidget(button_frame, 0, 1, 1, 3)
+        master_layout.addRow("<b>Auto Strategy:</b>", button_frame)
         
-        # Row 1: VIX, Delta, Max Risk (3 columns)
-        master_layout.addWidget(QLabel("VIX:"), 1, 0)
+        # VIX Threshold
         self.vix_threshold_spin = QDoubleSpinBox()
         self.vix_threshold_spin.setRange(0, 100)
         self.vix_threshold_spin.setValue(self.vix_threshold)
         self.vix_threshold_spin.setDecimals(1)
-        self.vix_threshold_spin.setFixedWidth(60)  # Increased from 50 to 60
         self.vix_threshold_spin.valueChanged.connect(self.on_master_settings_changed)
-        master_layout.addWidget(self.vix_threshold_spin, 1, 1)
+        master_layout.addRow("VIX Threshold:", self.vix_threshold_spin)
         
-        master_layout.addWidget(QLabel("Δ:"), 1, 2)
+        # Target Delta
         self.target_delta_spin = QSpinBox()
         self.target_delta_spin.setRange(10, 50)
         self.target_delta_spin.setSingleStep(10)
         self.target_delta_spin.setValue(self.target_delta)
-        self.target_delta_spin.setFixedWidth(55)  # Increased from 45 to 55
         self.target_delta_spin.valueChanged.connect(self.on_master_settings_changed)
-        master_layout.addWidget(self.target_delta_spin, 1, 3)
+        master_layout.addRow("Target Delta:", self.target_delta_spin)
         
-        # Row 2: Max Risk, Trade Qty (2 columns)
-        master_layout.addWidget(QLabel("Risk $:"), 2, 0)
+        # Max Risk
         self.max_risk_spin = QSpinBox()
         self.max_risk_spin.setRange(100, 10000)
         self.max_risk_spin.setSingleStep(50)
         self.max_risk_spin.setValue(self.max_risk)
-        self.max_risk_spin.setFixedWidth(80)  # Increased from 60 to 80
         self.max_risk_spin.valueChanged.connect(self.on_master_settings_changed)
-        master_layout.addWidget(self.max_risk_spin, 2, 1)
+        master_layout.addRow("Max Risk ($):", self.max_risk_spin)
         
-        master_layout.addWidget(QLabel("Qty:"), 2, 2)
+        # Trade Quantity
         self.trade_qty_spin = QSpinBox()
         self.trade_qty_spin.setRange(1, 100)
         self.trade_qty_spin.setValue(self.trade_qty)
-        self.trade_qty_spin.setFixedWidth(55)  # Increased from 45 to 55
         self.trade_qty_spin.valueChanged.connect(self.on_master_settings_changed)
-        master_layout.addWidget(self.trade_qty_spin, 2, 3)
+        master_layout.addRow("Trade Quantity:", self.trade_qty_spin)
         
-        # Row 3: Position Size Mode (compact horizontal layout)
-        master_layout.addWidget(QLabel("Size:"), 3, 0)
-        
+        # Position Size Mode
         radio_frame = QWidget()
         radio_layout = QHBoxLayout(radio_frame)
         radio_layout.setContentsMargins(0, 0, 0, 0)
-        radio_layout.setSpacing(8)
+        radio_layout.setSpacing(10)
         
-        self.fixed_radio = QRadioButton("Fixed")
+        self.fixed_radio = QRadioButton("Fixed Qty")
         self.fixed_radio.setChecked(self.position_size_mode == "fixed")
         self.fixed_radio.toggled.connect(self.on_position_mode_changed)
         radio_layout.addWidget(self.fixed_radio)
         
-        self.by_risk_radio = QRadioButton("Risk")
+        self.by_risk_radio = QRadioButton("By Risk")
         self.by_risk_radio.setChecked(self.position_size_mode == "calculated")
         self.by_risk_radio.toggled.connect(self.on_position_mode_changed)
         radio_layout.addWidget(self.by_risk_radio)
         radio_layout.addStretch()
         
-        master_layout.addWidget(radio_frame, 3, 1, 1, 3)
+        master_layout.addRow("Position Sizing:", radio_frame)
         
-        # Row 4: Separator (reduced height)
-        separator = QLabel()
-        separator.setFrameStyle(QLabel.Shape.HLine | QLabel.Shadow.Sunken)
-        separator.setMaximumHeight(1)
-        master_layout.addWidget(separator, 4, 0, 1, 4)
-        
-        # Row 5: Chain Settings (compact layout)
-        master_layout.addWidget(QLabel("±Strikes:"), 5, 0)
-        self.strikes_above_spin = QSpinBox()
-        self.strikes_above_spin.setRange(5, 50)
-        self.strikes_above_spin.setValue(self.strikes_above)
-        self.strikes_above_spin.setToolTip("Strikes above ATM")
-        self.strikes_above_spin.setFixedWidth(50)  # Increased from 40 to 50
-        self.strikes_above_spin.valueChanged.connect(self.on_chain_settings_changed)
-        master_layout.addWidget(self.strikes_above_spin, 5, 1)
-        
-        self.strikes_below_spin = QSpinBox()
-        self.strikes_below_spin.setRange(5, 50)
-        self.strikes_below_spin.setValue(self.strikes_below)
-        self.strikes_below_spin.setToolTip("Strikes below ATM")
-        self.strikes_below_spin.setFixedWidth(50)  # Increased from 40 to 50
-        self.strikes_below_spin.valueChanged.connect(self.on_chain_settings_changed)
-        master_layout.addWidget(self.strikes_below_spin, 5, 2)
-        
-        # Time Stop in same row
-        master_layout.addWidget(QLabel("Stop:"), 5, 3)
+        # Time Stop
         self.time_stop_spin = QSpinBox()
         self.time_stop_spin.setRange(1, 300)
         self.time_stop_spin.setSingleStep(5)
         self.time_stop_spin.setValue(self.time_stop)
-        self.time_stop_spin.setToolTip("Time stop (min)")
-        self.time_stop_spin.setFixedWidth(55)  # Increased from 45 to 55
+        self.time_stop_spin.setToolTip("Time stop in minutes")
         self.time_stop_spin.valueChanged.connect(self.on_master_settings_changed)
-        master_layout.addWidget(self.time_stop_spin, 5, 4)
-        
-        # Row 6: Chain Refresh and Drift (compact)
-        master_layout.addWidget(QLabel("Refresh:"), 6, 0)
-        self.chain_refresh_spin = QSpinBox()
-        self.chain_refresh_spin.setRange(0, 7200)
-        self.chain_refresh_spin.setSingleStep(60)
-        self.chain_refresh_spin.setValue(self.chain_refresh_interval)
-        self.chain_refresh_spin.setToolTip("Auto-refresh (sec)")
-        self.chain_refresh_spin.setFixedWidth(60)  # Increased from 50 to 60
-        self.chain_refresh_spin.valueChanged.connect(self.on_chain_settings_changed)
-        master_layout.addWidget(self.chain_refresh_spin, 6, 1)
-        
-        master_layout.addWidget(QLabel("Drift:"), 6, 2)
-        self.chain_drift_spin = QSpinBox()
-        self.chain_drift_spin.setRange(1, 20)
-        self.chain_drift_spin.setSingleStep(1)
-        self.chain_drift_spin.setValue(self.chain_drift_threshold)
-        self.chain_drift_spin.setToolTip("Drift threshold (strikes)")
-        self.chain_drift_spin.setFixedWidth(50)  # Increased from 40 to 50
-        self.chain_drift_spin.valueChanged.connect(self.on_chain_settings_changed)
-        master_layout.addWidget(self.chain_drift_spin, 6, 3)
+        master_layout.addRow("Time Stop (min):", self.time_stop_spin)
         
         panels_layout.addWidget(self.master_group)
         
-        # --- PANEL 2: Confirmation Settings ---
-        confirm_group = QGroupBox("Confirmation Settings")
-        confirm_group.setFixedWidth(280)  # Expanded from 220 to 280
-        confirm_layout = QGridLayout(confirm_group)
+        # --- PANEL 2: Confirmation Chart Settings ---
+        confirm_group = QGroupBox("Confirmation Chart")
+        confirm_group.setFixedWidth(280)
+        confirm_layout = QFormLayout(confirm_group)
+        confirm_layout.setVerticalSpacing(8)
         
-        confirm_layout.addWidget(QLabel("EMA Len:"), 0, 0)
         self.confirm_ema_spin = QSpinBox()
         self.confirm_ema_spin.setRange(1, 100)
         self.confirm_ema_spin.setValue(self.confirm_ema_length)
         self.confirm_ema_spin.valueChanged.connect(self.on_chart_settings_changed)
-        confirm_layout.addWidget(self.confirm_ema_spin, 0, 1)
+        confirm_layout.addRow("EMA Length:", self.confirm_ema_spin)
         
-        confirm_layout.addWidget(QLabel("Z Period:"), 1, 0)
         self.confirm_z_period_spin = QSpinBox()
         self.confirm_z_period_spin.setRange(1, 100)
         self.confirm_z_period_spin.setValue(self.confirm_z_period)
         self.confirm_z_period_spin.valueChanged.connect(self.on_chart_settings_changed)
-        confirm_layout.addWidget(self.confirm_z_period_spin, 1, 1)
+        confirm_layout.addRow("Z-Score Period:", self.confirm_z_period_spin)
         
-        confirm_layout.addWidget(QLabel("Z ±:"), 2, 0)
         self.confirm_z_threshold_spin = QDoubleSpinBox()
         self.confirm_z_threshold_spin.setRange(0.1, 5.0)
         self.confirm_z_threshold_spin.setSingleStep(0.1)
         self.confirm_z_threshold_spin.setValue(self.confirm_z_threshold)
         self.confirm_z_threshold_spin.valueChanged.connect(self.on_chart_settings_changed)
-        confirm_layout.addWidget(self.confirm_z_threshold_spin, 2, 1)
+        confirm_layout.addRow("Z-Score Threshold:", self.confirm_z_threshold_spin)
         
-        self.confirm_refresh_btn = QPushButton("Refresh")
+        self.confirm_refresh_btn = QPushButton("Refresh Chart")
         self.confirm_refresh_btn.clicked.connect(self.refresh_confirm_chart)
-        confirm_layout.addWidget(self.confirm_refresh_btn, 3, 0, 1, 2)
+        confirm_layout.addRow("", self.confirm_refresh_btn)
         
         panels_layout.addWidget(confirm_group)
         
         # --- PANEL 3: Trade Chart Settings ---
-        trade_chart_group = QGroupBox("Trade Chart Settings")
-        trade_chart_group.setFixedWidth(280)  # Expanded from 220 to 280
-        trade_layout = QGridLayout(trade_chart_group)
+        trade_chart_group = QGroupBox("Trade Chart")
+        trade_chart_group.setFixedWidth(280)
+        trade_layout = QFormLayout(trade_chart_group)
+        trade_layout.setVerticalSpacing(8)
         
-        trade_layout.addWidget(QLabel("EMA Len:"), 0, 0)
         self.trade_ema_spin = QSpinBox()
         self.trade_ema_spin.setRange(1, 100)
         self.trade_ema_spin.setValue(self.trade_ema_length)
         self.trade_ema_spin.valueChanged.connect(self.on_chart_settings_changed)
-        trade_layout.addWidget(self.trade_ema_spin, 0, 1)
+        trade_layout.addRow("EMA Length:", self.trade_ema_spin)
         
-        trade_layout.addWidget(QLabel("Z Period:"), 1, 0)
         self.trade_z_period_spin = QSpinBox()
         self.trade_z_period_spin.setRange(1, 100)
         self.trade_z_period_spin.setValue(self.trade_z_period)
         self.trade_z_period_spin.valueChanged.connect(self.on_chart_settings_changed)
-        trade_layout.addWidget(self.trade_z_period_spin, 1, 1)
+        trade_layout.addRow("Z-Score Period:", self.trade_z_period_spin)
         
-        trade_layout.addWidget(QLabel("Z ±:"), 2, 0)
         self.trade_z_threshold_spin = QDoubleSpinBox()
         self.trade_z_threshold_spin.setRange(0.1, 5.0)
         self.trade_z_threshold_spin.setSingleStep(0.1)
         self.trade_z_threshold_spin.setValue(self.trade_z_threshold)
         self.trade_z_threshold_spin.valueChanged.connect(self.on_chart_settings_changed)
-        trade_layout.addWidget(self.trade_z_threshold_spin, 2, 1)
+        trade_layout.addRow("Z-Score Threshold:", self.trade_z_threshold_spin)
         
-        self.trade_refresh_btn = QPushButton("Refresh")
+        self.trade_refresh_btn = QPushButton("Refresh Chart")
         self.trade_refresh_btn.clicked.connect(self.refresh_trade_chart)
-        trade_layout.addWidget(self.trade_refresh_btn, 3, 0, 1, 2)
+        trade_layout.addRow("", self.trade_refresh_btn)
         
         panels_layout.addWidget(trade_chart_group)
         
         # --- PANEL 4: Auto Entry (Straddle) ---
-        straddle_group = QGroupBox("Auto Entry")
-        straddle_group.setFixedWidth(280)  # Expanded from 220 to 280
-        straddle_layout = QGridLayout(straddle_group)
+        straddle_group = QGroupBox("Auto Entry (Straddle)")
+        straddle_group.setFixedWidth(280)
+        straddle_layout = QFormLayout(straddle_group)
+        straddle_layout.setVerticalSpacing(8)
         
-        # Row 0: Straddle ON/OFF
-        straddle_layout.addWidget(QLabel("<b>Straddle:</b>"), 0, 0)
-        
+        # Straddle ON/OFF buttons
         straddle_btn_frame = QWidget()
         straddle_btn_layout = QHBoxLayout(straddle_btn_frame)
         straddle_btn_layout.setContentsMargins(0, 0, 0, 0)
-        straddle_btn_layout.setSpacing(3)
+        straddle_btn_layout.setSpacing(5)
         
         self.straddle_on_btn = QPushButton("ON")
         self.straddle_on_btn.setProperty("success", True)
-        self.straddle_on_btn.setFixedWidth(60)  # Increased from 50 to 60
         self.straddle_on_btn.clicked.connect(lambda: self.set_straddle_enabled(True))
         straddle_btn_layout.addWidget(self.straddle_on_btn)
         
         self.straddle_off_btn = QPushButton("OFF")
         self.straddle_off_btn.setProperty("danger", True)
-        self.straddle_off_btn.setFixedWidth(60)  # Increased from 50 to 60
         self.straddle_off_btn.clicked.connect(lambda: self.set_straddle_enabled(False))
         straddle_btn_layout.addWidget(self.straddle_off_btn)
         
@@ -1941,31 +3032,33 @@ class MainWindow(QMainWindow):
         straddle_btn_layout.addWidget(self.straddle_status_label)
         straddle_btn_layout.addStretch()
         
-        straddle_layout.addWidget(straddle_btn_frame, 0, 1)
+        straddle_layout.addRow("<b>Status:</b>", straddle_btn_frame)
         
-        # Row 1: Frequency
-        straddle_layout.addWidget(QLabel("Frequency:"), 1, 0)
+        # Frequency
         freq_frame = QWidget()
         freq_layout = QHBoxLayout(freq_frame)
         freq_layout.setContentsMargins(0, 0, 0, 0)
+        freq_layout.setSpacing(5)
+        
         self.straddle_frequency_spin = QSpinBox()
         self.straddle_frequency_spin.setRange(1, 300)
         self.straddle_frequency_spin.setValue(self.straddle_frequency)
         self.straddle_frequency_spin.valueChanged.connect(self.on_straddle_settings_changed)
         freq_layout.addWidget(self.straddle_frequency_spin)
-        freq_layout.addWidget(QLabel("min"))
-        straddle_layout.addWidget(freq_frame, 1, 1)
+        freq_layout.addWidget(QLabel("minutes"))
+        freq_layout.addStretch()
         
-        # Row 2: Info label
-        info_label = QLabel("Uses Master Settings\nfor Delta & Position Size")
-        info_label.setStyleSheet("color: #888888; font-size: 8pt;")
-        info_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
-        straddle_layout.addWidget(info_label, 2, 0, 1, 2)
+        straddle_layout.addRow("Frequency:", freq_frame)
         
-        # Row 3: Next entry countdown
+        # Info label
+        info_label = QLabel("Uses Master Settings for\nDelta & Position Size")
+        info_label.setStyleSheet("color: #888888; font-size: 9pt;")
+        straddle_layout.addRow("", info_label)
+        
+        # Next entry countdown
         self.straddle_next_label = QLabel("Next: --:--")
-        self.straddle_next_label.setStyleSheet("color: #00BFFF; font-size: 8pt;")
-        straddle_layout.addWidget(self.straddle_next_label, 3, 0, 1, 2)
+        self.straddle_next_label.setStyleSheet("color: #00BFFF;")
+        straddle_layout.addRow("Next Entry:", self.straddle_next_label)
         
         panels_layout.addWidget(straddle_group)
         
@@ -1984,37 +3077,37 @@ class MainWindow(QMainWindow):
         self.buy_put_btn.clicked.connect(self.manual_buy_put)
         manual_layout.addWidget(self.buy_put_btn)
         
-        manual_info = QLabel("Settings in Master panel →")
-        manual_info.setStyleSheet("color: #888888; font-size: 8pt;")
-        manual_info.setAlignment(Qt.AlignmentFlag.AlignLeft)
-        manual_layout.addWidget(manual_info)
+        # Quick trade instructions
+        quick_trade_info = QLabel(
+            "💡 Quick Trade:\n"
+            "• Ctrl + Click BID = BUY\n"
+            "• Ctrl + Click ASK = SELL\n"
+            "(Uses chase give-in)"
+        )
+        quick_trade_info.setStyleSheet("color: #00aaff; font-size: 8pt; padding: 5px;")
+        quick_trade_info.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        manual_layout.addWidget(quick_trade_info)
         manual_layout.addStretch()
         
         panels_layout.addWidget(manual_group)
         
-        # --- PANEL 6: Chain Settings ---
-        chain_settings_group = QGroupBox("Chain Settings")
-        chain_settings_group.setFixedWidth(280)  # Expanded from 220 to 280
-        chain_settings_layout = QGridLayout(chain_settings_group)
+        # --- PANEL 6: Reserved for Future Use ---
+        future_group = QGroupBox("Reserved for Future Use")
+        future_group.setFixedWidth(280)
+        future_layout = QVBoxLayout(future_group)
         
-        # Strikes to show
-        chain_settings_layout.addWidget(QLabel("Strikes:"), 0, 0)
-        self.strikes_display_spin = QSpinBox()
-        self.strikes_display_spin.setRange(5, 50)
-        self.strikes_display_spin.setValue(20)
-        self.strikes_display_spin.setFixedWidth(50)
-        chain_settings_layout.addWidget(self.strikes_display_spin, 0, 1)
+        placeholder_label = QLabel(
+            "This panel is reserved\n"
+            "for future features.\n\n"
+            "Chain settings have been\n"
+            "moved to the Settings tab."
+        )
+        placeholder_label.setStyleSheet("color: #888888; font-size: 9pt;")
+        placeholder_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        future_layout.addWidget(placeholder_label)
+        future_layout.addStretch()
         
-        # Refresh frequency
-        chain_settings_layout.addWidget(QLabel("Refresh:"), 1, 0)
-        self.refresh_freq_spin = QSpinBox()
-        self.refresh_freq_spin.setRange(1, 30)
-        self.refresh_freq_spin.setValue(2)
-        self.refresh_freq_spin.setFixedWidth(50)
-        chain_settings_layout.addWidget(self.refresh_freq_spin, 1, 1)
-        chain_settings_layout.addWidget(QLabel("s"), 1, 2)
-        
-        panels_layout.addWidget(chain_settings_group)
+        panels_layout.addWidget(future_group)
         
         # Complete the scroll area setup
         panels_scroll.setWidget(panels_container)
@@ -2055,17 +3148,36 @@ class MainWindow(QMainWindow):
         
         layout.addWidget(conn_group)
         
-        # Strategy settings
-        strategy_group = QGroupBox("Strategy Parameters")
-        strategy_layout = QFormLayout(strategy_group)
+        # Chain settings (moved from trading tab)
+        chain_group = QGroupBox("Option Chain Settings")
+        chain_layout = QFormLayout(chain_group)
         
-        self.strikes_above_edit = QLineEdit(str(self.strikes_above))
-        strategy_layout.addRow("Strikes Above SPX:", self.strikes_above_edit)
+        self.strikes_above_settings_spin = QSpinBox()
+        self.strikes_above_settings_spin.setRange(5, 50)
+        self.strikes_above_settings_spin.setValue(self.strikes_above)
+        self.strikes_above_settings_spin.setToolTip("Number of strikes to display above ATM")
+        chain_layout.addRow("Strikes Above ATM:", self.strikes_above_settings_spin)
         
-        self.strikes_below_edit = QLineEdit(str(self.strikes_below))
-        strategy_layout.addRow("Strikes Below SPX:", self.strikes_below_edit)
+        self.strikes_below_settings_spin = QSpinBox()
+        self.strikes_below_settings_spin.setRange(5, 50)
+        self.strikes_below_settings_spin.setValue(self.strikes_below)
+        self.strikes_below_settings_spin.setToolTip("Number of strikes to display below ATM")
+        chain_layout.addRow("Strikes Below ATM:", self.strikes_below_settings_spin)
         
-        layout.addWidget(strategy_group)
+        self.chain_refresh_settings_spin = QSpinBox()
+        self.chain_refresh_settings_spin.setRange(0, 7200)
+        self.chain_refresh_settings_spin.setSingleStep(60)
+        self.chain_refresh_settings_spin.setValue(self.chain_refresh_interval)
+        self.chain_refresh_settings_spin.setToolTip("Automatic chain refresh interval in seconds (0 = disabled)")
+        chain_layout.addRow("Auto Refresh (seconds):", self.chain_refresh_settings_spin)
+        
+        self.chain_drift_settings_spin = QSpinBox()
+        self.chain_drift_settings_spin.setRange(1, 20)
+        self.chain_drift_settings_spin.setValue(self.chain_drift_threshold)
+        self.chain_drift_settings_spin.setToolTip("How many strikes ATM can drift before auto-recentering")
+        chain_layout.addRow("Drift Threshold (strikes):", self.chain_drift_settings_spin)
+        
+        layout.addWidget(chain_group)
         
         # Save button
         save_btn = QPushButton("Save Settings")
@@ -2325,22 +3437,51 @@ class MainWindow(QMainWindow):
         self.update_charts_with_live_data()
     
     def is_market_hours(self):
-        """Check if it's during regular market hours (9:30 AM - 4:00 PM ET)"""
+        """Check if it's during regular market hours (8:30 AM - 3:00 PM Central Time)"""
         import pytz
-        et_tz = pytz.timezone('US/Eastern')
-        now_et = datetime.now(et_tz)
+        ct_tz = pytz.timezone('US/Central')
+        now_ct = datetime.now(ct_tz)
         
-        # Market is open Monday-Friday, 9:30 AM - 4:00 PM ET
-        if now_et.weekday() >= 5:  # Weekend
+        # Market is open Monday-Friday, 8:30 AM - 3:00 PM CT (9:30 AM - 4:00 PM ET)
+        if now_ct.weekday() >= 5:  # Weekend
             return False
         
-        market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
-        market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+        market_open = now_ct.replace(hour=8, minute=30, second=0, microsecond=0)
+        market_close = now_ct.replace(hour=15, minute=0, second=0, microsecond=0)
         
-        return market_open <= now_et <= market_close
+        return market_open <= now_ct <= market_close
+    
+    def is_futures_market_closed(self):
+        """
+        Check if ES futures market is closed (needs snapshot instead of streaming).
+        ES futures are closed during: 4:00-5:00 PM CT (5:00-6:00 PM ET) weekdays and all weekend.
+        Weekend starts Friday at 4:00 PM CT (5:00 PM ET) and ends Sunday at 5:00 PM CT (6:00 PM ET).
+        """
+        import pytz
+        ct_tz = pytz.timezone('US/Central')
+        now_ct = datetime.now(ct_tz)
+        
+        # Saturday or Sunday - definitely closed
+        if now_ct.weekday() >= 5:  # Saturday or Sunday
+            return True
+        
+        # Friday after 4:00 PM CT - weekend starts (market closed until Sunday 5pm)
+        if now_ct.weekday() == 4:  # Friday
+            friday_close = now_ct.replace(hour=16, minute=0, second=0, microsecond=0)
+            if now_ct >= friday_close:
+                return True
+        
+        # Weekdays (Mon-Fri): Check if in 4:00-5:00 PM CT window (ES futures settlement/closed period)
+        settlement_start = now_ct.replace(hour=16, minute=0, second=0, microsecond=0)
+        settlement_end = now_ct.replace(hour=17, minute=0, second=0, microsecond=0)
+        
+        return settlement_start <= now_ct < settlement_end
     
     def update_es_to_cash_offset(self, underlying_price=None, es_price=None):
-        """Calculate and update ES-to-cash offset during market hours"""
+        """
+        Calculate and update ES-to-cash offset during market hours (8:30 AM - 3:00 PM CT).
+        Offset is saved to settings every minute for use during after-hours trading.
+        """
         # Use current prices if not provided
         if underlying_price is None:
             underlying_price = self.app_state['underlying_price']
@@ -2351,7 +3492,7 @@ class MainWindow(QMainWindow):
         if underlying_price <= 0 or es_price <= 0:
             return
         
-        # Only update offset during market hours when both prices are moving
+        # Only update offset during market hours (8:30 AM - 3:00 PM Central Time)
         if not self.is_market_hours():
             self.offset_update_enabled = False
             return
@@ -2378,7 +3519,7 @@ class MainWindow(QMainWindow):
         # Log significant offset changes (more than 1 point)
         if abs(offset - old_offset) > 1.0:
             symbol = self.instrument['underlying_symbol']
-            logger.info(f"ES-to-{symbol} offset updated: {offset:.2f} points (was {old_offset:.2f})")
+            logger.info(f"ES-to-{symbol} offset updated: {offset:.2f} points (was {old_offset:.2f}) [Market Hours Tracking]")
     
     def update_offset_display(self):
         """Update the ES offset display label"""
@@ -2386,16 +3527,21 @@ class MainWindow(QMainWindow):
         if self.es_to_cash_offset == 0.0:
             self.es_offset_label.setText(f"ES to {symbol} offset: N/A")
         else:
-            status = "(live)" if self.offset_update_enabled else "(frozen)"
+            # Show different status based on whether we're in market hours
+            if self.offset_update_enabled:
+                status = "(live - tracking)"
+            else:
+                status = "(saved - from day session)"
+            
             self.es_offset_label.setText(f"ES to {symbol} offset: {self.es_to_cash_offset:+.2f} {status}")
             
-            # Color coding: green for premium, red for discount, yellow for frozen
+            # Color coding: green for premium, red for discount, yellow for saved/frozen
             if not self.offset_update_enabled:
-                color = "#FFD700"  # Gold for frozen
+                color = "#FFD700"  # Gold for saved offset (after-hours)
             elif self.es_to_cash_offset > 0:
-                color = "#90EE90"  # Light green for premium
+                color = "#90EE90"  # Light green for premium (live)
             else:
-                color = "#FFA07A"  # Light salmon for discount
+                color = "#FFA07A"  # Light salmon for discount (live)
             
             self.es_offset_label.setStyleSheet(f"font-size: 12pt; color: {color};")
     
@@ -2491,9 +3637,14 @@ class MainWindow(QMainWindow):
         # ES futures trade almost 24/7, delayed data works after hours
         self.ibkr_client.reqMarketDataType(3)
         
+        # Use snapshot mode during futures market closed hours (4-5pm CT weekdays, weekends)
+        # to get last known price instead of waiting for streaming data
+        use_snapshot = self.is_futures_market_closed()
+        
         # Subscribe to market data
-        self.ibkr_client.reqMktData(req_id, es_contract, "", False, False, [])
-        self.log_message(f"Subscribed to ES futures {es_contract.lastTradeDateOrContractMonth} (23/6 trading)", "INFO")
+        self.ibkr_client.reqMktData(req_id, es_contract, "", use_snapshot, False, [])
+        mode_str = "snapshot mode" if use_snapshot else "streaming mode"
+        self.log_message(f"Subscribed to ES futures {es_contract.lastTradeDateOrContractMonth} ({mode_str})", "INFO")
     
     @pyqtSlot(float)
     def update_es_display(self, price: float):
@@ -2721,8 +3872,38 @@ class MainWindow(QMainWindow):
                 elif '_P_' in contract_key:
                     logger.info(f"PUT historical data ready: {len(bars)} bars")
     
+    @pyqtSlot(str, dict)
+    def on_historical_bar_update(self, contract_key: str, bar_data: dict):
+        """Handle real-time bar updates from IBAPI's historicalDataUpdate callback"""
+        try:
+            # Add or update the bar in historical_data
+            if contract_key not in self.historical_data:
+                self.historical_data[contract_key] = []
+            
+            # Check if this is an update to the last bar or a new bar
+            bars = self.historical_data[contract_key]
+            bar_time = str(bar_data['date']).strip()
+            
+            if bars and str(bars[-1]['date']).strip() == bar_time:
+                # Update existing bar (price changed within same time period)
+                bars[-1] = bar_data
+            else:
+                # New bar
+                bars.append(bar_data)
+            
+            # Update charts immediately - draw_idle() in chart code handles event coalescing
+            # This provides real-time updates for trading while Qt event loop prevents blocking
+            if contract_key.startswith("UNDERLYING_"):
+                self.update_underlying_charts_complete(contract_key)
+            elif contract_key.startswith("CHART_"):
+                self.update_option_charts_complete(contract_key)
+                
+        except Exception as e:
+            self.log_message(f"Error updating bar for {contract_key}: {e}", "ERROR")
+            logger.exception(f"Error in on_historical_bar_update for {contract_key}")
+    
     def update_underlying_chart_data(self, contract_key: str, bar_data: dict):
-        """Update underlying chart data storage"""
+        """Update underlying chart data storage and trigger real-time chart updates"""
         try:
             # Convert bar data to chart format
             # Fix date format - IBKR sometimes has extra spaces
@@ -2755,7 +3936,7 @@ class MainWindow(QMainWindow):
             logger.error(f"Error updating underlying chart data: {e}")
     
     def update_option_chart_data(self, contract_key: str, bar_data: dict):
-        """Update option chart data storage"""
+        """Update option chart data storage and trigger real-time chart updates"""
         try:
             # Handle new format: CHART_call_XSP_680_C_20251029 or CHART_put_XSP_680_P_20251029
             if contract_key.startswith("CHART_call_") or contract_key.startswith("CHART_put_"):
@@ -2776,7 +3957,7 @@ class MainWindow(QMainWindow):
                     'volume': bar_data['volume']
                 }
                 
-                # Update the appropriate chart data and trigger chart refresh
+                # Update the appropriate chart data and trigger real-time chart refresh
                 if option_type == "call":
                     self.chart_data['selected_call'].append(chart_bar)
                     # Keep only last 200 bars
@@ -2792,8 +3973,6 @@ class MainWindow(QMainWindow):
                         self.chart_data['selected_put'] = self.chart_data['selected_put'][-200:]
                     # Update current put contract tracking
                     self.current_put_contract = actual_contract_key
-                
-                logger.info(f"Updated {option_type} chart data: {len(self.chart_data[f'selected_{option_type}'])} bars")
                 
             else:
                 # Legacy format handling
@@ -2827,16 +4006,27 @@ class MainWindow(QMainWindow):
     def update_underlying_charts_complete(self, contract_key: str):
         """Update underlying charts when historical data is complete"""
         try:
-            if "TRADE" in contract_key:
-                # Update trade chart
-                if 'underlying_trade' in self.chart_data and self.chart_data['underlying_trade']:
-                    self.update_spx_chart(self.trade_chart_widget, self.chart_data['underlying_trade'])
-                    logger.info(f"Updated trade chart with {len(self.chart_data['underlying_trade'])} bars")
-            else:
-                # Update confirmation chart
-                if self.chart_data['underlying']:
-                    self.update_spx_chart(self.confirm_chart_widget, self.chart_data['underlying'])
-                    logger.info(f"Updated confirmation chart with {len(self.chart_data['underlying'])} bars")
+            # Use ALL historical data, not the truncated chart_data
+            if contract_key in self.historical_data and self.historical_data[contract_key]:
+                # Convert historical_data format to chart format
+                chart_bars = []
+                for bar in self.historical_data[contract_key]:
+                    date_str = str(bar['date']).strip().replace('  ', ' ')
+                    chart_bars.append({
+                        'time': date_str,
+                        'open': bar['open'],
+                        'high': bar['high'],
+                        'low': bar['low'],
+                        'close': bar['close'],
+                        'volume': bar['volume']
+                    })
+                
+                if "TRADE" in contract_key:
+                    # Update trade chart with ALL data - throttled for performance
+                    self.trade_chart_widget.update_chart_throttled(chart_bars)
+                else:
+                    # Update confirmation chart with ALL data - throttled for performance
+                    self.confirm_chart_widget.update_chart_throttled(chart_bars)
                     
         except Exception as e:
             logger.error(f"Error updating underlying charts: {e}")
@@ -2844,42 +4034,49 @@ class MainWindow(QMainWindow):
     def update_option_charts_complete(self, contract_key: str):
         """Update option charts when historical data is complete"""
         try:
-            # Handle new format: CHART_call_XSP_680_C_20251029 or CHART_put_XSP_680_P_20251029
-            if contract_key.startswith("CHART_call_") or contract_key.startswith("CHART_put_"):
-                # Parse the new format
-                parts = contract_key.split("_", 2)  # Split into ["CHART", "call/put", "remaining"]
-                option_type = parts[1]  # "call" or "put"
-                actual_contract_key = parts[2]  # "XSP_680_C_20251029"
+            # Use ALL historical data, not the truncated chart_data
+            if contract_key in self.historical_data and self.historical_data[contract_key]:
+                # Convert historical_data format to chart format
+                chart_bars = []
+                for bar in self.historical_data[contract_key]:
+                    date_str = str(bar['date']).strip().replace('  ', ' ')
+                    chart_bars.append({
+                        'time': date_str,
+                        'open': bar['open'],
+                        'high': bar['high'],
+                        'low': bar['low'],
+                        'close': bar['close'],
+                        'volume': bar['volume']
+                    })
                 
-                if option_type == "call" and self.chart_data['selected_call']:
-                    # Update call chart with data
-                    description = self.get_option_description(actual_contract_key)
-                    self.update_option_chart(self.call_chart_widget, self.chart_data['selected_call'], description)
-                    logger.info(f"Updated call chart with {len(self.chart_data['selected_call'])} bars")
-                    self.log_message(f"Call chart updated: {description}", "SUCCESS")
+                # Handle new format: CHART_call_XSP_680_C_20251029 or CHART_put_XSP_680_P_20251029
+                if contract_key.startswith("CHART_call_") or contract_key.startswith("CHART_put_"):
+                    # Parse the new format
+                    parts = contract_key.split("_", 2)  # Split into ["CHART", "call/put", "remaining"]
+                    option_type = parts[1]  # "call" or "put"
+                    actual_contract_key = parts[2]  # "XSP_680_C_20251029"
                     
-                elif option_type == "put" and self.chart_data['selected_put']:
-                    # Update put chart with data
-                    description = self.get_option_description(actual_contract_key)
-                    self.update_option_chart(self.put_chart_widget, self.chart_data['selected_put'], description)
-                    logger.info(f"Updated put chart with {len(self.chart_data['selected_put'])} bars")
-                    self.log_message(f"Put chart updated: {description}", "SUCCESS")
-                    
-            else:
-                # Legacy format handling
-                actual_contract_key = contract_key.replace("CHART_", "")
-                
-                if hasattr(self, 'current_call_contract') and actual_contract_key == self.current_call_contract:
-                    if self.chart_data['selected_call']:
+                    if option_type == "call":
+                        # Update call chart with ALL data - throttled for performance
                         description = self.get_option_description(actual_contract_key)
-                        self.update_option_chart(self.call_chart_widget, self.chart_data['selected_call'], description)
-                        logger.info(f"Updated call chart with {len(self.chart_data['selected_call'])} bars")
+                        self.call_chart_widget.update_chart_throttled(chart_bars, description)
                         
-                elif hasattr(self, 'current_put_contract') and actual_contract_key == self.current_put_contract:
-                    if self.chart_data['selected_put']:
+                    elif option_type == "put":
+                        # Update put chart with ALL data - throttled for performance
                         description = self.get_option_description(actual_contract_key)
-                        self.update_option_chart(self.put_chart_widget, self.chart_data['selected_put'], description)
-                        logger.info(f"Updated put chart with {len(self.chart_data['selected_put'])} bars")
+                        self.put_chart_widget.update_chart_throttled(chart_bars, description)
+                        
+                else:
+                    # Legacy format handling
+                    actual_contract_key = contract_key.replace("CHART_", "")
+                    
+                    if hasattr(self, 'current_call_contract') and actual_contract_key == self.current_call_contract:
+                        description = self.get_option_description(actual_contract_key)
+                        self.call_chart_widget.update_chart_throttled(chart_bars, description)
+                            
+                    elif hasattr(self, 'current_put_contract') and actual_contract_key == self.current_put_contract:
+                        description = self.get_option_description(actual_contract_key)
+                        self.put_chart_widget.update_chart_throttled(chart_bars, description)
                     
         except Exception as e:
             logger.error(f"Error updating option charts: {e}")
@@ -3270,8 +4467,8 @@ class MainWindow(QMainWindow):
                         
                         price_items = [
                             (7, f"{last:.2f}"),
-                            (8, f"{data.get('ask', 0):.2f}"),
-                            (9, f"{data.get('bid', 0):.2f}")
+                            (8, f"{data.get('bid', 0):.2f}"),
+                            (9, f"{data.get('ask', 0):.2f}")
                         ]
                         for col, text in price_items:
                             item = QTableWidgetItem(text)
@@ -3326,7 +4523,7 @@ class MainWindow(QMainWindow):
             logger.debug(f"Error updating option chain cell for {contract_key}: {e}")
     
     def on_option_cell_clicked(self, row: int, col: int):
-        """Handle option chain cell click"""
+        """Handle option chain cell click - with Ctrl+click for quick trading"""
         try:
             logger.info(f"Cell clicked: row={row}, col={col}")
             
@@ -3339,19 +4536,73 @@ class MainWindow(QMainWindow):
             strike = float(strike_item.text())
             logger.info(f"Strike: {strike}")
             
-            # Determine if call or put was clicked and request chart data
+            # Check if Ctrl key is held down for quick trading
+            modifiers = QApplication.keyboardModifiers()
+            ctrl_held = modifiers & Qt.KeyboardModifier.ControlModifier
+            
+            # Determine if call or put was clicked
             if col < 10:  # Call side
                 contract_key = f"{self.instrument['options_symbol']}_{strike}_C_{self.current_expiry}"
-                self.log_message(f"Selected CALL: Strike {strike}", "INFO")
-                # Request chart data for the selected call
-                self.request_option_chart_data(contract_key, "call")
+                
+                # Quick trade with Ctrl+Click
+                if ctrl_held:
+                    if col == 8:  # Bid column - BUY at bid
+                        self.log_message(f"🚀 QUICK BUY CALL (Ctrl+Click): {contract_key} @ bid", "SUCCESS")
+                        bid_price = self.market_data.get(contract_key, {}).get('bid', 0)
+                        if bid_price > 0:
+                            quantity = self.trade_qty_spin.value()
+                            self.place_order(contract_key, "BUY", quantity, bid_price, enable_chasing=True)
+                        else:
+                            self.log_message("Cannot trade - no bid price", "WARNING")
+                    elif col == 9:  # Ask column - SELL at ask
+                        self.log_message(f"🚀 QUICK SELL CALL (Ctrl+Click): {contract_key} @ ask", "SUCCESS")
+                        ask_price = self.market_data.get(contract_key, {}).get('ask', 0)
+                        if ask_price > 0:
+                            quantity = self.trade_qty_spin.value()
+                            self.place_order(contract_key, "SELL", quantity, ask_price, enable_chasing=True)
+                        else:
+                            self.log_message("Cannot trade - no ask price", "WARNING")
+                    else:
+                        # Regular chart request for other columns
+                        self.log_message(f"Selected CALL: Strike {strike}", "INFO")
+                        self.request_option_chart_data(contract_key, "call")
+                else:
+                    # Regular chart request without Ctrl
+                    self.log_message(f"Selected CALL: Strike {strike}", "INFO")
+                    self.request_option_chart_data(contract_key, "call")
+                    
             elif col > 10:  # Put side
                 contract_key = f"{self.instrument['options_symbol']}_{strike}_P_{self.current_expiry}"
-                self.log_message(f"Selected PUT: Strike {strike}", "INFO")
-                # Request chart data for the selected put
-                self.request_option_chart_data(contract_key, "put")
+                
+                # Quick trade with Ctrl+Click
+                if ctrl_held:
+                    if col == 11:  # Bid column - BUY at bid
+                        self.log_message(f"🚀 QUICK BUY PUT (Ctrl+Click): {contract_key} @ bid", "SUCCESS")
+                        bid_price = self.market_data.get(contract_key, {}).get('bid', 0)
+                        if bid_price > 0:
+                            quantity = self.trade_qty_spin.value()
+                            self.place_order(contract_key, "BUY", quantity, bid_price, enable_chasing=True)
+                        else:
+                            self.log_message("Cannot trade - no bid price", "WARNING")
+                    elif col == 12:  # Ask column - SELL at ask
+                        self.log_message(f"🚀 QUICK SELL PUT (Ctrl+Click): {contract_key} @ ask", "SUCCESS")
+                        ask_price = self.market_data.get(contract_key, {}).get('ask', 0)
+                        if ask_price > 0:
+                            quantity = self.trade_qty_spin.value()
+                            self.place_order(contract_key, "SELL", quantity, ask_price, enable_chasing=True)
+                        else:
+                            self.log_message("Cannot trade - no ask price", "WARNING")
+                    else:
+                        # Regular chart request for other columns
+                        self.log_message(f"Selected PUT: Strike {strike}", "INFO")
+                        self.request_option_chart_data(contract_key, "put")
+                else:
+                    # Regular chart request without Ctrl
+                    self.log_message(f"Selected PUT: Strike {strike}", "INFO")
+                    self.request_option_chart_data(contract_key, "put")
             else:
                 logger.info(f"Clicked on strike column (col 10), ignoring")
+                
         except Exception as e:
             logger.error(f"Error in on_option_cell_clicked: {e}", exc_info=True)
             self.log_message(f"Error handling cell click: {e}", "ERROR")
@@ -3942,7 +5193,7 @@ class MainWindow(QMainWindow):
                 "TRADES",  # What to show
                 1,  # Use RTH (regular trading hours)
                 1,  # Format date
-                False,  # Keep up to date
+                True,  # Keep up to date - enables real-time bar updates via historicalDataUpdate
                 []
             )
             
@@ -4036,12 +5287,10 @@ class MainWindow(QMainWindow):
             # Check connection
             if self.connection_state != ConnectionState.CONNECTED:
                 self.log_message("❌ Cannot place order: Not connected to IBKR", "ERROR")
-                QMessageBox.critical(self, "Not Connected", "Please connect to IBKR before trading")
                 return
             
             if not self.app_state.get('data_server_ok', False):
                 self.log_message("❌ Cannot place order: Data server not ready", "ERROR")
-                QMessageBox.critical(self, "Not Ready", "Data server not ready. Please wait for confirmation.")
                 return
             
             # Get settings from Master Settings panel
@@ -4054,12 +5303,7 @@ class MainWindow(QMainWindow):
             # Find call option by delta
             result = self.find_option_by_delta("C", target_delta)
             if not result:
-                self.log_message("No suitable call options found", "WARNING")
-                QMessageBox.warning(
-                    self, 
-                    "No Options Found",
-                    f"No call options found near {target_delta} delta"
-                )
+                self.log_message(f"No suitable call options found near {target_delta} delta", "WARNING")
                 return
             
             contract_key, ask_price, actual_delta = result
@@ -4080,45 +5324,36 @@ class MainWindow(QMainWindow):
                 quantity = max(1, int(max_risk / option_cost))
                 size_description = f"{quantity} contract(s) (By Risk: ${max_risk:.0f} ÷ ${option_cost:.0f})"
             
-            # Confirm with user
-            msg = QMessageBox()
-            msg.setWindowTitle("Confirm BUY CALL")
-            msg.setText(
-                f"Buy {quantity} contract(s) of {contract_key}\n"
+            # Log order details
+            self.log_message(
+                f"Placing BUY CALL: {quantity} × {contract_key}\n"
                 f"Delta: {actual_delta:.1f} (Target: {target_delta})\n"
                 f"Mid Price: ${mid_price:.2f} (~${mid_price * 100:.0f} per contract)\n"
-                f"Ask Price: ${ask_price:.2f}\n"
                 f"Position Size: {size_description}\n"
-                f"Total Cost: ~${mid_price * 100 * quantity:.0f}\n\n"
-                f"Order will chase mid-price if market moves."
+                f"Total Cost: ~${mid_price * 100 * quantity:.0f}",
+                "INFO"
             )
-            msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            msg.setDefaultButton(QMessageBox.StandardButton.No)
             
-            if msg.exec() == QMessageBox.StandardButton.Yes:
-                # Place order with mid-price chasing enabled
-                order_id = self.place_order(
-                    contract_key=contract_key,
-                    action="BUY",
-                    quantity=quantity,
-                    limit_price=mid_price,
-                    enable_chasing=True  # Enable mid-price chasing for manual orders
+            # Place order with mid-price chasing enabled (no confirmation for speed)
+            order_id = self.place_order(
+                contract_key=contract_key,
+                action="BUY",
+                quantity=quantity,
+                limit_price=mid_price,
+                enable_chasing=True  # Enable mid-price chasing for manual orders
+            )
+            
+            if order_id:
+                self.log_message(
+                    f"✓ Manual CALL order #{order_id} submitted: {quantity} × ${mid_price:.2f} with mid-price chasing",
+                    "SUCCESS"
                 )
-                
-                if order_id:
-                    self.log_message(
-                        f"✓ Manual CALL order #{order_id} submitted: {quantity} × ${mid_price:.2f} with mid-price chasing",
-                        "SUCCESS"
-                    )
-            else:
-                self.log_message("Manual BUY CALL cancelled by user", "INFO")
             
             self.log_message("=" * 60, "INFO")
             
         except Exception as e:
             self.log_message(f"Error in manual_buy_call: {e}", "ERROR")
             logger.error(f"Manual buy call error: {e}", exc_info=True)
-            QMessageBox.critical(self, "Error", f"Failed to place call order: {e}")
     
     def manual_buy_put(self):
         """Manual buy put option - uses Master Settings for delta/quantity and places order with mid-price chasing"""
@@ -4130,12 +5365,10 @@ class MainWindow(QMainWindow):
             # Check connection
             if self.connection_state != ConnectionState.CONNECTED:
                 self.log_message("❌ Cannot place order: Not connected to IBKR", "ERROR")
-                QMessageBox.critical(self, "Not Connected", "Please connect to IBKR before trading")
                 return
             
             if not self.app_state.get('data_server_ok', False):
                 self.log_message("❌ Cannot place order: Data server not ready", "ERROR")
-                QMessageBox.critical(self, "Not Ready", "Data server not ready. Please wait for confirmation.")
                 return
             
             # Get settings from Master Settings panel
@@ -4148,12 +5381,7 @@ class MainWindow(QMainWindow):
             # Find put option by delta
             result = self.find_option_by_delta("P", target_delta)
             if not result:
-                self.log_message("No suitable put options found", "WARNING")
-                QMessageBox.warning(
-                    self,
-                    "No Options Found",
-                    f"No put options found near {target_delta} delta"
-                )
+                self.log_message(f"No suitable put options found near {target_delta} delta", "WARNING")
                 return
             
             contract_key, ask_price, actual_delta = result
@@ -4174,45 +5402,36 @@ class MainWindow(QMainWindow):
                 quantity = max(1, int(max_risk / option_cost))
                 size_description = f"{quantity} contract(s) (By Risk: ${max_risk:.0f} ÷ ${option_cost:.0f})"
             
-            # Confirm with user
-            msg = QMessageBox()
-            msg.setWindowTitle("Confirm BUY PUT")
-            msg.setText(
-                f"Buy {quantity} contract(s) of {contract_key}\n"
+            # Log order details
+            self.log_message(
+                f"Placing BUY PUT: {quantity} × {contract_key}\n"
                 f"Delta: {actual_delta:.1f} (Target: {target_delta})\n"
                 f"Mid Price: ${mid_price:.2f} (~${mid_price * 100:.0f} per contract)\n"
-                f"Ask Price: ${ask_price:.2f}\n"
                 f"Position Size: {size_description}\n"
-                f"Total Cost: ~${mid_price * 100 * quantity:.0f}\n\n"
-                f"Order will chase mid-price if market moves."
+                f"Total Cost: ~${mid_price * 100 * quantity:.0f}",
+                "INFO"
             )
-            msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            msg.setDefaultButton(QMessageBox.StandardButton.No)
             
-            if msg.exec() == QMessageBox.StandardButton.Yes:
-                # Place order with mid-price chasing enabled
-                order_id = self.place_order(
-                    contract_key=contract_key,
-                    action="BUY",
-                    quantity=quantity,
-                    limit_price=mid_price,
-                    enable_chasing=True  # Enable mid-price chasing for manual orders
+            # Place order with mid-price chasing enabled (no confirmation for speed)
+            order_id = self.place_order(
+                contract_key=contract_key,
+                action="BUY",
+                quantity=quantity,
+                limit_price=mid_price,
+                enable_chasing=True  # Enable mid-price chasing for manual orders
+            )
+            
+            if order_id:
+                self.log_message(
+                    f"✓ Manual PUT order #{order_id} submitted: {quantity} × ${mid_price:.2f} with mid-price chasing",
+                    "SUCCESS"
                 )
-                
-                if order_id:
-                    self.log_message(
-                        f"✓ Manual PUT order #{order_id} submitted: {quantity} × ${mid_price:.2f} with mid-price chasing",
-                        "SUCCESS"
-                    )
-            else:
-                self.log_message("Manual BUY PUT cancelled by user", "INFO")
             
             self.log_message("=" * 60, "INFO")
             
         except Exception as e:
             self.log_message(f"Error in manual_buy_put: {e}", "ERROR")
             logger.error(f"Manual buy put error: {e}", exc_info=True)
-            QMessageBox.critical(self, "Error", f"Failed to put order: {e}")
     
     def manual_buy_call_automated(self):
         """
@@ -4466,12 +5685,6 @@ class MainWindow(QMainWindow):
         # PROTECTION: Check if position is zero (nothing to close)
         if position_size == 0:
             self.log_message(f"⚠️ WARNING: Position for {contract_key} is zero - nothing to close!", "WARNING")
-            msg = QMessageBox()
-            msg.setWindowTitle("Invalid Position")
-            msg.setIcon(QMessageBox.Icon.Warning)
-            msg.setText("Position quantity is zero.\nThere is no position to close!\n\n"
-                       "This may indicate the position was already closed or there's a tracking issue.")
-            msg.exec()
             return
         
         # PROTECTION: Check for pending exit orders for this contract
@@ -4487,36 +5700,16 @@ class MainWindow(QMainWindow):
         if pending_exit_orders:
             action_type = "SELL" if position_size > 0 else "BUY"
             self.log_message(f"⚠️ WARNING: Already have {len(pending_exit_orders)} pending {action_type} order(s) for {contract_key}!", "WARNING")
-            msg = QMessageBox()
-            msg.setWindowTitle("Pending Exit Order")
-            msg.setIcon(QMessageBox.Icon.Warning)
-            msg.setText(f"There are already {len(pending_exit_orders)} pending {action_type} order(s) for this position!\n\n"
-                       f"Order IDs: {', '.join(map(str, pending_exit_orders))}\n\n"
-                       "Please wait for the existing order to fill or cancel it first.")
-            msg.exec()
-            return
+            self.log_message(f"Order IDs: {', '.join(map(str, pending_exit_orders))} - allowing duplicate for speed", "WARNING")
+            # Continue anyway for maximum speed (user takes responsibility)
         
-        # Get current P&L for confirmation dialog
+        # Get current P&L for logging
         current_pnl = pos.get('pnl', 0)
         
-        # Confirm close
-        msg = QMessageBox()
-        msg.setWindowTitle("Close Position")
-        msg.setIcon(QMessageBox.Icon.Question)
-        msg.setText(f"Close position: {contract_key}\n"
-                   f"Quantity: {position_size:.0f}\n"
-                   f"Current P&L: ${current_pnl:.2f}\n\n"
-                   f"Place exit order at mid-price?")
-        msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        msg.setDefaultButton(QMessageBox.StandardButton.No)
-        
-        if msg.exec() != QMessageBox.StandardButton.Yes:
-            self.log_message("Position close cancelled by user", "INFO")
-            return
-        
-        # User confirmed - proceed with exit order
+        # Log close details (no confirmation for speed)
         self.log_message("=" * 60, "INFO")
         self.log_message(f"MANUAL CLOSE POSITION: {contract_key}", "SUCCESS")
+        self.log_message(f"Quantity: {position_size:.0f}, Current P&L: ${current_pnl:.2f}", "INFO")
         
         # Determine action based on position direction
         if position_size > 0:
@@ -4561,23 +5754,16 @@ class MainWindow(QMainWindow):
             
             order_info = self.pending_orders[order_id]
             
-            # Confirm cancel
-            msg = QMessageBox()
-            msg.setWindowTitle("Confirm Cancel Order")
-            msg.setText(f"Cancel order #{order_id}?\n{order_info['action']} {order_info['quantity']} {order_info['contract_key']}")
-            msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            msg.setDefaultButton(QMessageBox.StandardButton.No)
+            # Log cancel details (no confirmation for speed)
+            self.log_message(f"Cancelling order #{order_id}: {order_info['action']} {order_info['quantity']} {order_info['contract_key']}", "INFO")
             
-            if msg.exec() == QMessageBox.StandardButton.Yes:
-                # Cancel order via IBKR API
-                self.ibkr_client.cancelOrder(order_id)
-                self.log_message(f"Cancelling order #{order_id}", "SUCCESS")
-                
-                # Update order status
-                self.pending_orders[order_id]['status'] = 'Cancelled'
-                self.update_orders_display()
-            else:
-                self.log_message("Order cancel cancelled by user", "INFO")
+            # Cancel order via IBKR API
+            self.ibkr_client.cancelOrder(order_id)
+            self.log_message(f"Order #{order_id} cancellation sent", "SUCCESS")
+            
+            # Update order status
+            self.pending_orders[order_id]['status'] = 'Cancelled'
+            self.update_orders_display()
     
     # ========================================================================
     # LOGGING
@@ -4652,30 +5838,7 @@ class MainWindow(QMainWindow):
         self.log_message(f"Position Size Mode: {mode_text}", "INFO")
         self.save_settings()
     
-    def on_chain_settings_changed(self):
-        """Called when strikes above/below or refresh interval settings change"""
-        old_above = self.strikes_above
-        old_below = self.strikes_below
-        old_interval = self.chain_refresh_interval
-        old_drift = self.chain_drift_threshold
-        
-        self.strikes_above = self.strikes_above_spin.value()
-        self.strikes_below = self.strikes_below_spin.value()
-        self.chain_refresh_interval = self.chain_refresh_spin.value()
-        self.chain_drift_threshold = self.chain_drift_spin.value()
-        
-        self.log_message(
-            f"Chain Settings: Strikes +{self.strikes_above}/-{self.strikes_below}, "
-            f"Refresh: {self.chain_refresh_interval}s, Drift: {self.chain_drift_threshold} strikes "
-            f"(was +{old_above}/-{old_below}, {old_interval}s, {old_drift} strikes)",
-            "INFO"
-        )
-        self.save_settings()
-        
-        # Auto-refresh chain if connected (so user sees new range immediately)
-        if self.connection_state == ConnectionState.CONNECTED and (old_above != self.strikes_above or old_below != self.strikes_below):
-            self.log_message("Auto-refreshing chain with new strike range...", "INFO")
-            self.request_option_chain()
+    # Note: on_chain_settings_changed removed - chain settings moved to Settings tab
     
     # ========================================================================
     # STRADDLE STRATEGY CALLBACKS
@@ -4907,16 +6070,82 @@ class MainWindow(QMainWindow):
     def check_offset_monitoring(self):
         """
         Check market hours and update ES offset monitoring status.
-        Called every 5 minutes to determine if offset updates should be enabled.
+        Also monitor ES futures market state transitions (closed -> open).
+        Called every minute to determine if offset updates should be enabled
+        and if ES subscription needs to switch from snapshot to streaming mode.
+        Market hours: 8:30 AM - 3:00 PM Central Time (Monday-Friday)
+        ES futures market: 23/6 except 4:00-5:00 PM CT daily, all day Sat/Sun
         """
         old_status = self.offset_update_enabled
         self.offset_update_enabled = self.is_market_hours()
         
-        # Update display if status changed
+        # Update display and log if status changed
         if old_status != self.offset_update_enabled:
-            status_text = "enabled" if self.offset_update_enabled else "disabled"
-            logger.info(f"ES offset monitoring {status_text} (market hours: {self.offset_update_enabled})")
+            import pytz
+            ct_tz = pytz.timezone('US/Central')
+            now_ct = datetime.now(ct_tz).strftime('%I:%M %p CT')
+            
+            if self.offset_update_enabled:
+                status_text = "STARTED"
+                detail = f"Now tracking ES-to-cash offset during market hours (8:30 AM - 3:00 PM CT). Current time: {now_ct}"
+            else:
+                status_text = "STOPPED"
+                detail = f"Offset tracking stopped (outside market hours). Using saved offset: {self.es_to_cash_offset:+.2f}. Current time: {now_ct}"
+            
+            logger.info(f"ES offset monitoring {status_text} - {detail}")
+            self.log_message(f"ES offset tracking {status_text.lower()}", "INFO")
             self.update_offset_display()
+        
+        # Check for ES futures market state transitions
+        es_closed_now = self.is_futures_market_closed()
+        
+        # Initialize on first check
+        if self.es_futures_was_closed is None:
+            self.es_futures_was_closed = es_closed_now
+            return
+        
+        # Detect transition from closed to open (5:00 PM CT market reopening)
+        if self.es_futures_was_closed and not es_closed_now:
+            import pytz
+            ct_tz = pytz.timezone('US/Central')
+            now_ct = datetime.now(ct_tz).strftime('%I:%M %p CT')
+            
+            logger.info(f"ES futures market reopened at {now_ct} - switching to streaming mode")
+            self.log_message("ES futures market reopened - switching to streaming mode", "INFO")
+            
+            # Cancel old subscription and re-subscribe with streaming mode
+            if self.app_state.get('es_req_id') is not None:
+                try:
+                    self.ibkr_client.cancelMktData(self.app_state['es_req_id'])
+                    logger.info("Cancelled previous ES futures snapshot subscription")
+                except Exception as e:
+                    logger.error(f"Error cancelling ES subscription: {e}")
+            
+            # Re-subscribe with streaming mode (snapshot=False)
+            self.subscribe_es_price()
+        
+        # Update state for next check
+        self.es_futures_was_closed = es_closed_now
+    
+    def save_offset_to_settings(self):
+        """
+        Save ES-to-cash offset to settings file every minute during market hours.
+        This preserves the offset determined during day session for use at night.
+        """
+        # Only save during market hours when offset is being actively tracked
+        if not self.is_market_hours():
+            return
+        
+        # Only save if we have a valid offset
+        if self.es_to_cash_offset == 0.0:
+            return
+        
+        try:
+            # Update the offset in settings and save
+            self.save_settings()
+            logger.debug(f"ES offset saved: {self.es_to_cash_offset:+.2f} (market hours tracking)")
+        except Exception as e:
+            logger.error(f"Error saving ES offset: {e}", exc_info=True)
     
     def recenter_option_chain(self):
         """
@@ -4981,13 +6210,11 @@ class MainWindow(QMainWindow):
     def save_settings(self):
         """Save settings to JSON file"""
         try:
-            # Sync strikes values from spin boxes to text edit fields (for Settings tab)
-            self.strikes_above = self.strikes_above_spin.value()
-            self.strikes_below = self.strikes_below_spin.value()
-            self.chain_refresh_interval = self.chain_refresh_spin.value()
-            self.chain_drift_threshold = self.chain_drift_spin.value()
-            self.strikes_above_edit.setText(str(self.strikes_above))
-            self.strikes_below_edit.setText(str(self.strikes_below))
+            # Sync chain settings from Settings tab spinners
+            self.strikes_above = self.strikes_above_settings_spin.value()
+            self.strikes_below = self.strikes_below_settings_spin.value()
+            self.chain_refresh_interval = self.chain_refresh_settings_spin.value()
+            self.chain_drift_threshold = self.chain_drift_settings_spin.value()
             
             settings = {
                 # Connection settings
@@ -5027,6 +6254,16 @@ class MainWindow(QMainWindow):
                 'trade_ema_length': self.trade_ema_length,
                 'trade_z_period': self.trade_z_period,
                 'trade_z_threshold': self.trade_z_threshold,
+                
+                # Chart Interval/Days Settings
+                'call_chart_interval': self.call_chart_widget.interval_combo.currentText(),
+                'call_chart_days': self.call_chart_widget.days_combo.currentText(),
+                'put_chart_interval': self.put_chart_widget.interval_combo.currentText(),
+                'put_chart_days': self.put_chart_widget.days_combo.currentText(),
+                'confirm_chart_interval': self.confirm_chart_widget.interval_combo.currentText(),
+                'confirm_chart_days': self.confirm_chart_widget.days_combo.currentText(),
+                'trade_chart_interval': self.trade_chart_widget.interval_combo.currentText(),
+                'trade_chart_days': self.trade_chart_widget.days_combo.currentText(),
             }
             
             Path('settings.json').write_text(json.dumps(settings, indent=2))
@@ -5050,9 +6287,15 @@ class MainWindow(QMainWindow):
                 self.chain_refresh_interval = settings.get('chain_refresh_interval', 3600)
                 self.chain_drift_threshold = settings.get('chain_drift_threshold', 5)
                 
-                # ES Offset Settings (restore persistent offset)
+                # ES Offset Settings (restore persistent offset from day session)
                 self.es_to_cash_offset = settings.get('es_to_cash_offset', 0.0)
                 self.last_offset_update_time = settings.get('last_offset_update_time', 0)
+                
+                # Log loaded offset
+                if self.es_to_cash_offset != 0.0:
+                    from datetime import datetime
+                    last_update = datetime.fromtimestamp(self.last_offset_update_time).strftime('%Y-%m-%d %H:%M:%S') if self.last_offset_update_time > 0 else "unknown"
+                    logger.info(f"Loaded ES offset from settings: {self.es_to_cash_offset:+.2f} (last updated: {last_update})")
                 
                 # Update offset display after loading
                 self.update_offset_display()
@@ -5084,8 +6327,12 @@ class MainWindow(QMainWindow):
                 self.host_edit.setText(self.host)
                 self.port_edit.setText(str(self.port))
                 self.client_id_edit.setText(str(self.client_id))
-                self.strikes_above_edit.setText(str(self.strikes_above))
-                self.strikes_below_edit.setText(str(self.strikes_below))
+                
+                # Update Settings tab chain settings
+                self.strikes_above_settings_spin.setValue(self.strikes_above)
+                self.strikes_below_settings_spin.setValue(self.strikes_below)
+                self.chain_refresh_settings_spin.setValue(self.chain_refresh_interval)
+                self.chain_drift_settings_spin.setValue(self.chain_drift_threshold)
                 
                 # Update Master Settings UI
                 self.vix_threshold_spin.setValue(self.vix_threshold)
@@ -5093,10 +6340,6 @@ class MainWindow(QMainWindow):
                 self.target_delta_spin.setValue(self.target_delta)
                 self.max_risk_spin.setValue(self.max_risk)
                 self.trade_qty_spin.setValue(self.trade_qty)
-                self.strikes_above_spin.setValue(self.strikes_above)  # Chain settings
-                self.strikes_below_spin.setValue(self.strikes_below)  # Chain settings
-                self.chain_refresh_spin.setValue(self.chain_refresh_interval)  # Chain refresh
-                self.chain_drift_spin.setValue(self.chain_drift_threshold)  # Chain drift threshold
                 
                 if self.position_size_mode == "fixed":
                     self.fixed_radio.setChecked(True)
@@ -5113,6 +6356,26 @@ class MainWindow(QMainWindow):
                 self.trade_ema_spin.setValue(self.trade_ema_length)
                 self.trade_z_period_spin.setValue(self.trade_z_period)
                 self.trade_z_threshold_spin.setValue(self.trade_z_threshold)
+                
+                # Restore Chart Interval/Days Settings
+                call_interval = settings.get('call_chart_interval', '15 secs')
+                call_days = settings.get('call_chart_days', '1')
+                put_interval = settings.get('put_chart_interval', '15 secs')
+                put_days = settings.get('put_chart_days', '1')
+                confirm_interval = settings.get('confirm_chart_interval', '15 secs')
+                confirm_days = settings.get('confirm_chart_days', '1')
+                trade_interval = settings.get('trade_chart_interval', '15 secs')
+                trade_days = settings.get('trade_chart_days', '1')
+                
+                # Set combo box values (this will trigger chart reload via signals)
+                self.call_chart_widget.interval_combo.setCurrentText(call_interval)
+                self.call_chart_widget.days_combo.setCurrentText(call_days)
+                self.put_chart_widget.interval_combo.setCurrentText(put_interval)
+                self.put_chart_widget.days_combo.setCurrentText(put_days)
+                self.confirm_chart_widget.interval_combo.setCurrentText(confirm_interval)
+                self.confirm_chart_widget.days_combo.setCurrentText(confirm_days)
+                self.trade_chart_widget.interval_combo.setCurrentText(trade_interval)
+                self.trade_chart_widget.days_combo.setCurrentText(trade_days)
                 
                 # Update button states
                 self.update_strategy_button_states()
