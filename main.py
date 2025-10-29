@@ -187,15 +187,7 @@ INSTRUMENT_CONFIG = {
         'multiplier': '100',
         'strike_increment': 5.0,             # $5 increments
         'tick_size_above_3': 0.10,           # >= $3.00: $0.10 tick
-        'tick_size_below_3': 0.05,           # < $3.00: $0.05 tick18:01:13 | INFO     | ES futures price tick: type=4, price=6913.75
-18:01:14 | INFO     | ES futures price tick: type=4, price=6913.5
-18:01:14 | INFO     | ES futures price tick: type=4, price=6913.75
-18:01:15 | INFO     | ES futures price tick: type=4, price=6914.0
-18:01:15 | INFO     | ES futures price tick: type=4, price=6914.25
-18:01:16 | INFO     | ES futures price tick: type=4, price=6914.0
-18:01:17 | INFO     | ES futures price tick: type=4, price=6913.75
-18:01:21 | INFO     | ES futures price tick: type=4, price=6913.5
-18:01:21 | INFO     | ES futures price tick: type=4, price=6913.25
+        'tick_size_below_3': 0.05,           # < $3.00: $0.05 tick
         'description': 'S&P 500 Index Options (Full size, $100 multiplier)'
     },
     'XSP': {
