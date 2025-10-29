@@ -187,7 +187,15 @@ INSTRUMENT_CONFIG = {
         'multiplier': '100',
         'strike_increment': 5.0,             # $5 increments
         'tick_size_above_3': 0.10,           # >= $3.00: $0.10 tick
-        'tick_size_below_3': 0.05,           # < $3.00: $0.05 tick
+        'tick_size_below_3': 0.05,           # < $3.00: $0.05 tick18:01:13 | INFO     | ES futures price tick: type=4, price=6913.75
+18:01:14 | INFO     | ES futures price tick: type=4, price=6913.5
+18:01:14 | INFO     | ES futures price tick: type=4, price=6913.75
+18:01:15 | INFO     | ES futures price tick: type=4, price=6914.0
+18:01:15 | INFO     | ES futures price tick: type=4, price=6914.25
+18:01:16 | INFO     | ES futures price tick: type=4, price=6914.0
+18:01:17 | INFO     | ES futures price tick: type=4, price=6913.75
+18:01:21 | INFO     | ES futures price tick: type=4, price=6913.5
+18:01:21 | INFO     | ES futures price tick: type=4, price=6913.25
         'description': 'S&P 500 Index Options (Full size, $100 multiplier)'
     },
     'XSP': {
@@ -424,7 +432,7 @@ class IBKRWrapper(EWrapper):
         if reqId == self.app.get('underlying_req_id'):
             # Accept LAST (4), CLOSE (9), DELAYED_LAST (68) for snapshot/delayed data
             if tickType in [4, 9, 68]:
-                logger.info(f"Underlying price tick: type={tickType}, price={price}")
+                logger.debug(f"Underlying price tick: type={tickType}, price={price}")  # Suppressed - too verbose
                 self.app['underlying_price'] = price
                 self.signals.underlying_price_updated.emit(price)
             return
@@ -433,7 +441,7 @@ class IBKRWrapper(EWrapper):
         if reqId == self.app.get('es_req_id'):
             # Accept LAST (4), CLOSE (9), DELAYED_LAST (68) for snapshot/delayed data
             if tickType in [4, 9, 68]:
-                logger.info(f"ES futures price tick: type={tickType}, price={price}")
+                logger.debug(f"ES futures price tick: type={tickType}, price={price}")  # Suppressed - too verbose
                 self.app['es_price'] = price
                 self.signals.es_price_updated.emit(price)
             else:
@@ -3416,12 +3424,12 @@ class MainWindow(QMainWindow):
         req_id = 1
         self.app_state['underlying_req_id'] = req_id
         
-        # Request delayed market data type (3 = delayed frozen for after-hours)
-        self.ibkr_client.reqMarketDataType(3)
+        # Request LIVE market data (type 1 = live, never use delayed data)
+        self.ibkr_client.reqMarketDataType(1)
         
-        # Subscribe to market data (snapshot=True for delayed data when market closed)
-        self.ibkr_client.reqMktData(req_id, underlying_contract, "", True, False, [])
-        self.log_message(f"Subscribed to {self.instrument['underlying_symbol']} underlying price (with delayed data support)", "INFO")
+        # Subscribe to market data (snapshot=False for streaming live data)
+        self.ibkr_client.reqMktData(req_id, underlying_contract, "", False, False, [])
+        self.log_message(f"Subscribed to {self.instrument['underlying_symbol']} underlying price (LIVE data)", "INFO")
     
     @pyqtSlot(float)
     def update_underlying_display(self, price: float):
@@ -3634,8 +3642,8 @@ class MainWindow(QMainWindow):
         req_id = 2
         self.app_state['es_req_id'] = req_id
         
-        # ES futures trade almost 24/7, delayed data works after hours
-        self.ibkr_client.reqMarketDataType(3)
+        # Request LIVE market data (type 1 = live, never use delayed data)
+        self.ibkr_client.reqMarketDataType(1)
         
         # Use snapshot mode during futures market closed hours (4-5pm CT weekdays, weekends)
         # to get last known price instead of waiting for streaming data
@@ -3644,7 +3652,7 @@ class MainWindow(QMainWindow):
         # Subscribe to market data
         self.ibkr_client.reqMktData(req_id, es_contract, "", use_snapshot, False, [])
         mode_str = "snapshot mode" if use_snapshot else "streaming mode"
-        self.log_message(f"Subscribed to ES futures {es_contract.lastTradeDateOrContractMonth} ({mode_str})", "INFO")
+        self.log_message(f"Subscribed to ES futures {es_contract.lastTradeDateOrContractMonth} ({mode_str}, LIVE data)", "INFO")
     
     @pyqtSlot(float)
     def update_es_display(self, price: float):
@@ -4349,6 +4357,11 @@ class MainWindow(QMainWindow):
             current_strike += strike_increment
         
         self.log_message(f"Creating option chain: {len(strikes)} strikes from {min(strikes)} to {max(strikes)}", "INFO")
+        
+        # Request live market data for options (type 1 = live, type 2 = frozen, type 3 = delayed, type 4 = delayed frozen)
+        # SPX options require live data subscription
+        self.ibkr_client.reqMarketDataType(1)
+        logger.info("Set market data type to LIVE (1) for option chain")
         
         # Clear table
         self.option_table.setRowCount(0)
