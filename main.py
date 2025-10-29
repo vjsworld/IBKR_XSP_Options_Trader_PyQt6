@@ -114,6 +114,17 @@ try:
     from PyQt6.QtGui import QColor, QFont, QPalette, QPainter  # type: ignore[import-untyped]
     logger.info("PyQt6 loaded successfully")
     PYQT6_AVAILABLE = True
+
+    # Matplotlib imports for charting
+    logger.info("Loading matplotlib modules...")
+    import matplotlib
+    matplotlib.use('Qt5Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.backends.backend_qt import NavigationToolbar2QT as NavigationToolbar
+    from matplotlib.figure import Figure
+    import matplotlib.dates as mdates
+    logger.info("Matplotlib loaded successfully")
 except ImportError as e:
     PYQT6_AVAILABLE = False
     logger.critical(f"PyQt6 import failed: {e}", exc_info=True)
@@ -300,10 +311,13 @@ class IBKRWrapper(EWrapper):
                 self.signals.connection_message.emit("Client ID already in use but no main window reference", "ERROR")
                 return
                 
+            logger.info(f"ERROR 326: Current client_id={self._main_window.client_id}, iterator={self._main_window.client_id_iterator}, max={self._main_window.max_client_id}")
             self.signals.connection_message.emit(f"Client ID {self._main_window.client_id} already in use", "WARNING")
+            
             if self._main_window.client_id_iterator < self._main_window.max_client_id:
                 self._main_window.client_id_iterator += 1
                 self._main_window.client_id = self._main_window.client_id_iterator
+                logger.info(f"ERROR 326: Incremented to client_id={self._main_window.client_id}, iterator={self._main_window.client_id_iterator}")
                 self.signals.connection_message.emit(f"Retrying with Client ID {self._main_window.client_id}...", "INFO")
                 # Mark that we're handling this error specially
                 self._main_window.handling_client_id_error = True
@@ -540,8 +554,14 @@ class IBKRWrapper(EWrapper):
     
     def historicalData(self, reqId: int, bar):
         """Receives historical bar data"""
+        # Check both old and new request mapping systems
+        contract_key = None
         if reqId in self.app.get('historical_data_requests', {}):
             contract_key = self.app['historical_data_requests'][reqId]
+        elif self._main_window and hasattr(self._main_window, 'request_id_map') and reqId in self._main_window.request_id_map:
+            contract_key = self._main_window.request_id_map[reqId]
+            
+        if contract_key:
             bar_data = {
                 'date': bar.date,
                 'open': bar.open,
@@ -554,8 +574,14 @@ class IBKRWrapper(EWrapper):
     
     def historicalDataEnd(self, reqId: int, start: str, end: str):
         """Called when historical data request is complete"""
+        # Check both old and new request mapping systems  
+        contract_key = None
         if reqId in self.app.get('historical_data_requests', {}):
             contract_key = self.app['historical_data_requests'][reqId]
+        elif self._main_window and hasattr(self._main_window, 'request_id_map') and reqId in self._main_window.request_id_map:
+            contract_key = self._main_window.request_id_map[reqId]
+            
+        if contract_key:
             self.signals.historical_complete.emit(contract_key)
 
 
@@ -636,6 +662,22 @@ class MainWindow(QMainWindow):
         self.pending_orders = {}  # order_id -> (contract_key, action, quantity)
         self.chasing_orders = {}  # order_id -> chasing_order_info (for all orders with mid-price chasing enabled)
         self.historical_data = {}  # contract_key -> bars
+        
+        # Chart data storage - separate from general historical_data for chart-specific needs
+        self.chart_data = {
+            'underlying': [],  # SPX/XSP bars for confirmation and trade charts
+            'selected_call': [],  # Currently selected call option bars
+            'selected_put': [],   # Currently selected put option bars
+        }
+        
+        # Chart update tracking
+        self.last_chart_update = 0
+        self.chart_update_interval = 5000  # Update charts every 5 seconds max
+        self.current_call_contract = None  # Currently displayed call contract
+        self.current_put_contract = None   # Currently displayed put contract
+        
+        # Request tracking for charts
+        self.request_id_map = {}  # Maps request IDs to contract keys for chart updates
         
         # Connection settings
         self.host = "127.0.0.1"
@@ -747,6 +789,9 @@ class MainWindow(QMainWindow):
         
         # Auto-connect after 2 seconds
         QTimer.singleShot(2000, self.connect_to_ibkr)
+        
+        # Initialize real chart data after connection
+        QTimer.singleShot(5000, self.request_chart_data)
     
     def connect_signals(self):
         """Connect IBKR signals to GUI slots"""
@@ -798,6 +843,656 @@ class MainWindow(QMainWindow):
         self.pnl_label = QLabel("Total P&L: $0.00")
         self.pnl_label.setStyleSheet("font-weight: bold;")
         self.status_bar.addPermanentWidget(self.pnl_label)
+    
+    def create_option_chart(self, title: str, border_color: str):
+        """Create a single option chart widget"""
+        chart_widget = QWidget()
+        chart_layout = QVBoxLayout(chart_widget)
+        chart_layout.setContentsMargins(2, 2, 2, 2)
+        
+        # Chart controls
+        controls_frame = QFrame()
+        controls_layout = QHBoxLayout(controls_frame)
+        controls_layout.setContentsMargins(5, 2, 5, 2)
+        
+        # Title
+        title_label = QLabel(title)
+        title_label.setStyleSheet(f"font-weight: bold; color: {border_color}; font-size: 11pt;")
+        controls_layout.addWidget(title_label)
+        
+        controls_layout.addStretch()
+        
+        # Timeframe selector
+        timeframe_combo = QComboBox()
+        timeframe_combo.addItems(["1 min", "5 min", "15 min", "30 min", "1 hour"])
+        timeframe_combo.setCurrentText("1 min")
+        timeframe_combo.setFixedWidth(80)
+        controls_layout.addWidget(QLabel("Interval:"))
+        controls_layout.addWidget(timeframe_combo)
+        
+        # Days selector
+        days_combo = QComboBox()
+        days_combo.addItems(["1", "2", "5", "10", "20"])
+        days_combo.setCurrentText("1")
+        days_combo.setFixedWidth(50)
+        controls_layout.addWidget(QLabel("Days:"))
+        controls_layout.addWidget(days_combo)
+        
+        chart_layout.addWidget(controls_frame)
+        
+        # Chart area
+        figure = Figure(figsize=(6, 4), dpi=80, facecolor='#1a1a1a')
+        figure.subplots_adjust(left=0.08, right=0.95, top=0.95, bottom=0.1)
+        
+        canvas = FigureCanvas(figure)
+        chart_layout.addWidget(canvas)
+        
+        # Chart styling
+        chart_widget.setStyleSheet(f"""
+            QWidget {{
+                background-color: #1a1a1a;
+                border: 2px solid {border_color};
+                border-radius: 5px;
+            }}
+            QComboBox {{
+                background-color: #2a2a2a;
+                border: 1px solid {border_color};
+                padding: 2px;
+                color: white;
+            }}
+            QLabel {{
+                color: white;
+                border: none;
+            }}
+        """)
+        
+        # Initialize empty chart
+        ax = figure.add_subplot(111, facecolor='#202020')
+        ax.set_title(f"{title} - No Data", color='white', fontsize=10)
+        ax.tick_params(colors='white', labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_color(border_color)
+        ax.grid(True, color='#3a3a3a', alpha=0.3)
+        canvas.draw()
+        
+        # Store references for updates using setattr to avoid type checker warnings
+        setattr(chart_widget, 'figure', figure)
+        setattr(chart_widget, 'canvas', canvas)
+        setattr(chart_widget, 'ax', ax)
+        setattr(chart_widget, 'timeframe_combo', timeframe_combo)
+        setattr(chart_widget, 'days_combo', days_combo)
+        
+        return chart_widget
+    
+    def create_spx_chart(self, title: str, border_color: str, is_confirmation: bool):
+        """Create an SPX chart with price and Z-Score subplots"""
+        chart_widget = QWidget()
+        chart_layout = QVBoxLayout(chart_widget)
+        chart_layout.setContentsMargins(2, 2, 2, 2)
+        
+        # Chart controls
+        controls_frame = QFrame()
+        controls_layout = QHBoxLayout(controls_frame)
+        controls_layout.setContentsMargins(5, 2, 5, 2)
+        
+        # Title
+        title_label = QLabel(title)
+        title_label.setStyleSheet(f"font-weight: bold; color: {border_color}; font-size: 11pt;")
+        controls_layout.addWidget(title_label)
+        
+        controls_layout.addStretch()
+        
+        # Interval selector
+        interval_combo = QComboBox()
+        if is_confirmation:
+            interval_combo.addItems(["1 min", "5 min", "15 min", "30 min", "1 hour"])
+            interval_combo.setCurrentText("1 min")
+        else:
+            interval_combo.addItems(["1 secs", "5 secs", "10 secs", "15 secs", "30 secs", "1 min"])
+            interval_combo.setCurrentText("15 secs")
+        interval_combo.setFixedWidth(80)
+        controls_layout.addWidget(QLabel("Interval:"))
+        controls_layout.addWidget(interval_combo)
+        
+        # Period selector
+        period_combo = QComboBox()
+        period_combo.addItems(["1 D", "2 D", "5 D"])
+        period_combo.setCurrentText("1 D")
+        period_combo.setFixedWidth(50)
+        controls_layout.addWidget(QLabel("Period:"))
+        controls_layout.addWidget(period_combo)
+        
+        # Chart settings
+        controls_layout.addWidget(QLabel("EMA:"))
+        ema_spinbox = QSpinBox()
+        ema_spinbox.setRange(1, 200)
+        ema_spinbox.setValue(20 if is_confirmation else 9)
+        ema_spinbox.setFixedWidth(50)
+        controls_layout.addWidget(ema_spinbox)
+        
+        controls_layout.addWidget(QLabel("Z Period:"))
+        z_period_spinbox = QSpinBox()
+        z_period_spinbox.setRange(5, 100)
+        z_period_spinbox.setValue(30)
+        z_period_spinbox.setFixedWidth(50)
+        controls_layout.addWidget(z_period_spinbox)
+        
+        controls_layout.addWidget(QLabel("Z Threshold:"))
+        z_threshold_spinbox = QDoubleSpinBox()
+        z_threshold_spinbox.setRange(0.5, 5.0)
+        z_threshold_spinbox.setValue(1.5)
+        z_threshold_spinbox.setSingleStep(0.1)
+        z_threshold_spinbox.setFixedWidth(60)
+        controls_layout.addWidget(z_threshold_spinbox)
+        
+        chart_layout.addWidget(controls_frame)
+        
+        # Chart area with two subplots
+        figure = Figure(figsize=(8, 5), dpi=80, facecolor='#1a1a1a')
+        figure.subplots_adjust(left=0.05, right=0.95, top=0.95, bottom=0.08, hspace=0.05)
+        
+        canvas = FigureCanvas(figure)
+        chart_layout.addWidget(canvas)
+        
+        # Navigation toolbar
+        toolbar = NavigationToolbar(canvas, chart_widget)
+        toolbar.setStyleSheet(f"""
+            QWidget {{
+                background-color: #2a2a2a;
+                border: 1px solid {border_color};
+                color: white;
+            }}
+        """)
+        chart_layout.addWidget(toolbar)
+        
+        # Chart styling
+        chart_widget.setStyleSheet(f"""
+            QWidget {{
+                background-color: #1a1a1a;
+                border: 2px solid {border_color};
+                border-radius: 5px;
+            }}
+            QComboBox, QSpinBox, QDoubleSpinBox {{
+                background-color: #2a2a2a;
+                border: 1px solid {border_color};
+                padding: 2px;
+                color: white;
+            }}
+            QLabel {{
+                color: white;
+                border: none;
+            }}
+        """)
+        
+        # Create subplots
+        gs = figure.add_gridspec(2, 1, height_ratios=[7, 3], hspace=0.05)
+        price_ax = figure.add_subplot(gs[0])
+        zscore_ax = figure.add_subplot(gs[1], sharex=price_ax)
+        
+        # Style price chart
+        price_ax.set_facecolor('#000000')
+        price_ax.tick_params(colors='white', labelsize=8, labelbottom=False)
+        for spine in price_ax.spines.values():
+            spine.set_color(border_color)
+        price_ax.grid(True, color='#3a3a3a', alpha=0.3)
+        price_ax.set_title(f"{title} - {self.instrument['underlying_symbol']} Price", color='white', fontsize=10)
+        
+        # Style Z-Score chart
+        zscore_ax.set_facecolor('#000000')
+        zscore_ax.tick_params(colors='white', labelsize=8)
+        for spine in zscore_ax.spines.values():
+            spine.set_color(border_color)
+        zscore_ax.grid(True, color='#3a3a3a', alpha=0.3)
+        zscore_ax.set_ylabel('Z-Score', color='white', fontsize=9)
+        zscore_ax.axhline(y=0, color='#808080', linestyle='-', linewidth=1, alpha=0.5)
+        zscore_ax.axhline(y=1.5, color='#44ff44', linestyle='--', linewidth=1, alpha=0.7)
+        zscore_ax.axhline(y=-1.5, color='#ff4444', linestyle='--', linewidth=1, alpha=0.7)
+        zscore_ax.set_ylim(-3, 3)
+        
+        canvas.draw()
+        
+        # Store references for updates using setattr to avoid type checker warnings
+        setattr(chart_widget, 'figure', figure)
+        setattr(chart_widget, 'canvas', canvas)
+        setattr(chart_widget, 'price_ax', price_ax)
+        setattr(chart_widget, 'zscore_ax', zscore_ax)
+        setattr(chart_widget, 'interval_combo', interval_combo)
+        setattr(chart_widget, 'period_combo', period_combo)
+        setattr(chart_widget, 'ema_spinbox', ema_spinbox)
+        setattr(chart_widget, 'z_period_spinbox', z_period_spinbox)
+        setattr(chart_widget, 'z_threshold_spinbox', z_threshold_spinbox)
+        setattr(chart_widget, 'is_confirmation', is_confirmation)
+        
+        return chart_widget
+    
+    def update_option_chart(self, chart_widget, price_data: List[Dict], contract_description: str = ""):
+        """Update option chart with new price data"""
+        if not price_data:
+            return
+            
+        try:
+            # Clear previous plot
+            chart_widget.ax.clear()
+            
+            # Extract data
+            times = [datetime.fromisoformat(bar['time']) for bar in price_data]
+            highs = [bar['high'] for bar in price_data]
+            lows = [bar['low'] for bar in price_data]
+            opens = [bar['open'] for bar in price_data]
+            closes = [bar['close'] for bar in price_data]
+            volumes = [bar['volume'] for bar in price_data]
+            
+            # Create candlestick chart manually
+            for i, (time, open_price, high, low, close) in enumerate(zip(times, opens, highs, lows, closes)):
+                color = '#00FF00' if close >= open_price else '#FF0000'
+                
+                # Draw wick (high-low line)
+                chart_widget.ax.plot([i, i], [low, high], color='white', linewidth=1)
+                
+                # Draw candle body
+                body_height = abs(close - open_price)
+                body_bottom = min(open_price, close)
+                chart_widget.ax.bar(i, body_height, bottom=body_bottom, color=color, alpha=0.8, width=0.8)
+            
+            # Chart styling
+            chart_widget.ax.set_facecolor('#202020')
+            chart_widget.ax.tick_params(colors='white', labelsize=8)
+            for spine in chart_widget.ax.spines.values():
+                spine.set_color('#FF8C00')
+            chart_widget.ax.grid(True, color='#3a3a3a', alpha=0.3)
+            
+            # Set title and labels
+            last_price = closes[-1] if closes else 0
+            title = f"Option Price: ${last_price:.2f}"
+            if contract_description:
+                title += f" - {contract_description}"
+            chart_widget.ax.set_title(title, color='white', fontsize=10)
+            
+            # Set x-axis labels (show every 10th timestamp to avoid crowding)
+            if len(times) > 1:
+                step = max(1, len(times) // 10)
+                x_ticks = range(0, len(times), step)
+                x_labels = [times[i].strftime('%H:%M') for i in x_ticks]
+                chart_widget.ax.set_xticks(x_ticks)
+                chart_widget.ax.set_xticklabels(x_labels)
+            
+            chart_widget.canvas.draw()
+            
+        except Exception as e:
+            logger.error(f"Error updating option chart: {e}")
+    
+    def update_spx_chart(self, chart_widget, price_data: List[Dict], trade_markers: Optional[List[Dict]] = None):
+        """Update SPX chart with price data, EMA, Z-Score, and trade markers"""
+        if not price_data:
+            return
+            
+        try:
+            # Convert to DataFrame for easier processing
+            df = pd.DataFrame(price_data)
+            df['time'] = pd.to_datetime(df['time'])
+            df = df.sort_values('time')
+            
+            # Calculate EMA
+            ema_length = chart_widget.ema_spinbox.value()
+            df['ema'] = df['close'].ewm(span=ema_length, adjust=False).mean()
+            
+            # Calculate Z-Score
+            z_period = chart_widget.z_period_spinbox.value()
+            df['sma'] = df['close'].rolling(window=z_period).mean()
+            df['std'] = df['close'].rolling(window=z_period).std()
+            df['z_score'] = (df['close'] - df['sma']) / df['std']
+            
+            # Clear previous plots
+            chart_widget.price_ax.clear()
+            chart_widget.zscore_ax.clear()
+            
+            # Plot candlesticks manually
+            for i, (idx, row) in enumerate(df.iterrows()):
+                color = '#00FF00' if row['close'] >= row['open'] else '#FF0000'
+                
+                # Draw wick
+                chart_widget.price_ax.plot([i, i], [row['low'], row['high']], 
+                                         color='white', linewidth=1)
+                
+                # Draw candle body
+                body_height = abs(row['close'] - row['open'])
+                body_bottom = min(row['open'], row['close'])
+                chart_widget.price_ax.bar(i, body_height, bottom=body_bottom, 
+                                        color=color, alpha=0.8, width=0.8)
+            
+            # Plot EMA
+            chart_widget.price_ax.plot(range(len(df)), df['ema'], 
+                                     color='#FFA500', linewidth=2, label=f'EMA({ema_length})')
+            
+            # Add current price line
+            if not df.empty:
+                current_price = df['close'].iloc[-1]
+                chart_widget.price_ax.axhline(y=current_price, color='#00FF00', 
+                                            linestyle='--', linewidth=1, alpha=0.7)
+                chart_widget.price_ax.text(len(df), current_price, 
+                                         f' ${current_price:.2f}', 
+                                         color='#00FF00', fontsize=9, 
+                                         verticalalignment='center')
+            
+            # Plot trade markers if provided
+            if trade_markers and chart_widget.is_confirmation == False:  # Only on trade chart
+                for trade in trade_markers:
+                    try:
+                        trade_time = pd.to_datetime(trade['time'])
+                        # Find closest data point
+                        time_diffs = (df['time'] - trade_time).abs()
+                        closest_idx = time_diffs.idxmin()
+                        chart_idx = df.index.get_loc(closest_idx)
+                        
+                        entry_price = trade.get('entry_price', 0)
+                        if entry_price > 0:
+                            chart_widget.price_ax.scatter(chart_idx, entry_price, 
+                                                        marker='v', s=100, 
+                                                        color='#2196F3', zorder=5)
+                            chart_widget.price_ax.text(chart_idx, entry_price, 
+                                                      f" Entry ${entry_price:.2f}", 
+                                                      color='#2196F3', fontsize=8)
+                    except:
+                        continue
+            
+            # Style price chart
+            chart_widget.price_ax.set_facecolor('#000000')
+            chart_widget.price_ax.tick_params(colors='white', labelsize=8, labelbottom=False)
+            for spine in chart_widget.price_ax.spines.values():
+                spine.set_color('#FF8C00' if chart_widget.is_confirmation else '#66BB6A')
+            chart_widget.price_ax.grid(True, color='#3a3a3a', alpha=0.3)
+            chart_widget.price_ax.set_title(
+                f"{'Confirmation' if chart_widget.is_confirmation else 'Trade'} Chart - {self.instrument['underlying_symbol']} Price", 
+                color='white', fontsize=10)
+            
+            # Plot Z-Score
+            z_score_values = df['z_score'].fillna(0)
+            chart_widget.zscore_ax.plot(range(len(df)), z_score_values, 
+                                      color='#00BFFF', linewidth=2, label='Z-Score')
+            
+            # Fill Z-Score areas
+            chart_widget.zscore_ax.fill_between(range(len(df)), 0, z_score_values, 
+                                              where=(z_score_values > 0), 
+                                              color='#44ff44', alpha=0.2)
+            chart_widget.zscore_ax.fill_between(range(len(df)), 0, z_score_values, 
+                                              where=(z_score_values < 0), 
+                                              color='#ff4444', alpha=0.2)
+            
+            # Z-Score threshold lines
+            z_threshold = chart_widget.z_threshold_spinbox.value()
+            chart_widget.zscore_ax.axhline(y=0, color='#808080', linestyle='-', linewidth=1, alpha=0.5)
+            chart_widget.zscore_ax.axhline(y=z_threshold, color='#44ff44', linestyle='--', 
+                                         linewidth=1.5, alpha=0.8, label=f'Buy Signal (+{z_threshold})')
+            chart_widget.zscore_ax.axhline(y=-z_threshold, color='#ff4444', linestyle='--', 
+                                         linewidth=1.5, alpha=0.8, label=f'Sell Signal (-{z_threshold})')
+            
+            # Current Z-Score label
+            if not df.empty and not pd.isna(z_score_values.iloc[-1]):
+                current_zscore = z_score_values.iloc[-1]
+                zscore_color = '#44ff44' if current_zscore > 0 else '#ff4444' if current_zscore < 0 else '#808080'
+                chart_widget.zscore_ax.text(len(df), current_zscore, 
+                                          f' {current_zscore:.2f}', 
+                                          color=zscore_color, fontsize=9, 
+                                          verticalalignment='center')
+            
+            # Style Z-Score chart
+            chart_widget.zscore_ax.set_facecolor('#000000')
+            chart_widget.zscore_ax.tick_params(colors='white', labelsize=8)
+            for spine in chart_widget.zscore_ax.spines.values():
+                spine.set_color('#FF8C00' if chart_widget.is_confirmation else '#66BB6A')
+            chart_widget.zscore_ax.grid(True, color='#3a3a3a', alpha=0.3)
+            chart_widget.zscore_ax.set_ylabel('Z-Score', color='white', fontsize=9)
+            chart_widget.zscore_ax.set_ylim(-3, 3)
+            
+            # Set x-axis labels
+            if len(df) > 1:
+                step = max(1, len(df) // 10)
+                x_ticks = range(0, len(df), step)
+                x_labels = [df.iloc[i]['time'].strftime('%H:%M') for i in x_ticks]
+                chart_widget.zscore_ax.set_xticks(x_ticks)
+                chart_widget.zscore_ax.set_xticklabels(x_labels)
+            
+            chart_widget.canvas.draw()
+            
+        except Exception as e:
+            logger.error(f"Error updating SPX chart: {e}")
+    
+    def generate_sample_data(self, base_price: float = 580.0, num_points: int = 50) -> List[Dict]:
+        """Generate sample price data for testing charts"""
+        data = []
+        current_time = datetime.now()
+        current_price = base_price
+        
+        for i in range(num_points):
+            # Generate realistic price movement
+            change = np.random.normal(0, 0.5)  # Small random changes
+            current_price += change
+            
+            # Create OHLC data
+            open_price = current_price
+            high = current_price + abs(np.random.normal(0, 0.3))
+            low = current_price - abs(np.random.normal(0, 0.3))
+            close = open_price + np.random.normal(0, 0.2)
+            volume = int(np.random.normal(1000, 300))
+            
+            data.append({
+                'time': (current_time - timedelta(minutes=num_points-i-1)).isoformat(),
+                'open': round(open_price, 2),
+                'high': round(high, 2),
+                'low': round(low, 2),
+                'close': round(close, 2),
+                'volume': max(volume, 100)
+            })
+            
+            current_price = close
+        
+        return data
+    
+    def request_chart_data(self):
+        """Request real historical data for charts"""
+        if self.connection_state != ConnectionState.CONNECTED or not self.ibkr_client:
+            logger.warning("Cannot request chart data - not connected to IBKR")
+            return
+            
+        try:
+            # Request underlying data for SPX/XSP charts
+            self.request_underlying_historical_data()
+            
+            # Request data for currently selected options (if any)
+            self.request_selected_option_data()
+            
+            logger.info("Chart data requests initiated")
+            
+        except Exception as e:
+            logger.error(f"Error requesting chart data: {e}")
+    
+    def request_underlying_historical_data(self):
+        """Request historical data for the underlying instrument (SPX/XSP)"""
+        try:
+            from ibapi.contract import Contract
+            
+            # Create underlying contract
+            contract = Contract()
+            contract.symbol = self.instrument['underlying_symbol']
+            contract.secType = "IND" if self.instrument['underlying_symbol'] == "SPX" else "STK"
+            contract.exchange = "CBOE" if self.instrument['underlying_symbol'] == "SPX" else "ARCA"
+            contract.currency = "USD"
+            
+            req_id = self.app_state['next_req_id']
+            self.app_state['next_req_id'] += 1
+            
+            # Store request mapping for chart updates
+            contract_key = f"UNDERLYING_{self.instrument['underlying_symbol']}"
+            self.request_id_map[req_id] = contract_key
+            
+            # Request 1 day of 1-minute data for confirmation chart
+            self.ibkr_client.reqHistoricalData(
+                req_id,
+                contract,
+                "",  # End time (empty = now)
+                "1 D",  # Duration
+                "1 min",  # Bar size
+                "TRADES",
+                1,  # Use RTH
+                1,  # Format date
+                False,  # Keep up to date
+                []
+            )
+            
+            logger.info(f"Requested underlying historical data for {contract_key}")
+            
+            # Request second dataset for trade chart (shorter timeframe)
+            req_id_trade = self.app_state['next_req_id']
+            self.app_state['next_req_id'] += 1
+            
+            contract_key_trade = f"UNDERLYING_{self.instrument['underlying_symbol']}_TRADE"
+            self.request_id_map[req_id_trade] = contract_key_trade
+            
+            # Request 4 hours of 30-second data for trade chart
+            self.ibkr_client.reqHistoricalData(
+                req_id_trade,
+                contract,
+                "",  # End time (empty = now)
+                "14400 S",  # 4 hours in seconds
+                "30 secs",  # Bar size
+                "TRADES",
+                1,  # Use RTH
+                1,  # Format date
+                False,  # Keep up to date
+                []
+            )
+            
+            logger.info(f"Requested trade chart historical data for {contract_key_trade}")
+            
+        except Exception as e:
+            logger.error(f"Error requesting underlying historical data: {e}")
+    
+    def request_selected_option_data(self):
+        """Request historical data for currently selected options"""
+        # For now, we'll select ATM call and put options automatically
+        # In the future, this could be based on user selection in the option chain
+        
+        if not self.underlying_price or self.underlying_price <= 0:
+            logger.warning("Cannot select options - no underlying price available")
+            return
+            
+        try:
+            # Find ATM options
+            atm_strike = self.round_to_strike(self.underlying_price)
+            
+            # Create call contract
+            call_contract_key = f"{self.instrument['symbol']}_{atm_strike}_C_{self.current_expiry}"
+            put_contract_key = f"{self.instrument['symbol']}_{atm_strike}_P_{self.current_expiry}"
+            
+            # Request call option data
+            if call_contract_key not in self.chart_data:
+                self.request_option_historical_data(call_contract_key, 'C', atm_strike)
+                self.current_call_contract = call_contract_key
+            
+            # Request put option data  
+            if put_contract_key not in self.chart_data:
+                self.request_option_historical_data(put_contract_key, 'P', atm_strike)
+                self.current_put_contract = put_contract_key
+                
+        except Exception as e:
+            logger.error(f"Error requesting selected option data: {e}")
+    
+    def request_option_historical_data(self, contract_key: str, right: str, strike: float):
+        """Request historical data for a specific option"""
+        try:
+            from ibapi.contract import Contract
+            
+            contract = Contract()
+            contract.symbol = self.instrument['symbol']
+            contract.secType = "OPT"
+            contract.exchange = self.instrument['exchange']
+            contract.currency = "USD"
+            contract.lastTradeDateOrContractMonth = self.current_expiry
+            contract.strike = strike
+            contract.right = right
+            contract.multiplier = str(self.instrument['multiplier'])
+            contract.tradingClass = self.instrument['trading_class']
+            
+            req_id = self.app_state['next_req_id']
+            self.app_state['next_req_id'] += 1
+            
+            self.request_id_map[req_id] = f"CHART_{contract_key}"
+            
+            # Request 1 day of 1-minute data for option charts
+            self.ibkr_client.reqHistoricalData(
+                req_id,
+                contract,
+                "",  # End time (empty = now)
+                "1 D",  # Duration  
+                "1 min",  # Bar size
+                "TRADES",
+                1,  # Use RTH
+                1,  # Format date
+                False,  # Keep up to date
+                []
+            )
+            
+            logger.info(f"Requested option historical data for {contract_key}")
+            
+        except Exception as e:
+            logger.error(f"Error requesting option historical data for {contract_key}: {e}")
+    
+    def request_option_chart_data(self, contract_key: str, option_type: str):
+        """Request historical data for option charts when user clicks on option chain"""
+        try:
+            if self.connection_state != ConnectionState.CONNECTED or not self.ibkr_client:
+                logger.warning("Cannot request option chart data - not connected to IBKR")
+                return
+            
+            # Parse contract key to get details
+            parts = contract_key.split('_')
+            if len(parts) != 4:
+                logger.error(f"Invalid contract key format: {contract_key}")
+                return
+                
+            symbol, strike_str, right, expiry = parts
+            strike = float(strike_str)
+            
+            # Create option contract
+            from ibapi.contract import Contract
+            contract = Contract()
+            contract.symbol = symbol
+            contract.secType = "OPT"
+            contract.exchange = "SMART"
+            contract.currency = "USD"
+            contract.lastTradeDateOrContractMonth = expiry
+            contract.strike = strike
+            contract.right = right
+            contract.multiplier = "100"
+            contract.tradingClass = "SPXW" if symbol == "SPX" else "XSP"
+            
+            # Get unique request ID
+            req_id = self.app_state.get('next_order_id', 1)
+            self.app_state['next_order_id'] = req_id + 1
+            
+            # Map this request to the appropriate chart data storage
+            chart_key = f"CHART_{option_type}_{contract_key}"
+            self.request_id_map[req_id] = chart_key
+            
+            # Request historical data for charts
+            self.ibkr_client.reqHistoricalData(
+                req_id,
+                contract,
+                "",  # End time (empty = now)
+                "1 D",  # Duration  
+                "1 min",  # Bar size
+                "TRADES",
+                1,  # Use RTH
+                1,  # Format date
+                False,  # Keep up to date
+                []
+            )
+            
+            logger.info(f"Requested chart data for {option_type} option: {contract_key}")
+            self.log_message(f"Requesting chart data for {contract_key}...", "INFO")
+            
+        except Exception as e:
+            logger.error(f"Error requesting option chart data for {contract_key}: {e}")
     
     def create_trading_tab(self):
         """Create the main trading dashboard tab"""
@@ -886,23 +1581,30 @@ class MainWindow(QMainWindow):
         """)
         trading_layout.addWidget(self.option_table)
 
-        # Charts panel (TODO: Implement ChartWidget)
-        charts_splitter = QSplitter(Qt.Orientation.Horizontal)
+        # Charts panel - Four Chart System
+        # 2x2 grid: Call Chart (top-left), Put Chart (top-right), 
+        # Confirmation Chart (bottom-left), Trade Chart (bottom-right)
+        charts_widget = QWidget()
+        charts_layout = QGridLayout(charts_widget)
+        charts_layout.setSpacing(5)
         
-        # Placeholder for charts until ChartWidget is implemented
-        call_chart_placeholder = QLabel("Call Chart\n(Coming Soon)")
-        call_chart_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        call_chart_placeholder.setStyleSheet("font-size: 14pt; color: #888888;")
+        # Call Chart (Top Left)
+        self.call_chart_widget = self.create_option_chart("Call Chart", "#FF6B6B")
+        charts_layout.addWidget(self.call_chart_widget, 0, 0)
         
-        put_chart_placeholder = QLabel("Put Chart\n(Coming Soon)")
-        put_chart_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        put_chart_placeholder.setStyleSheet("font-size: 14pt; color: #888888;")
+        # Put Chart (Top Right)  
+        self.put_chart_widget = self.create_option_chart("Put Chart", "#4ECDC4")
+        charts_layout.addWidget(self.put_chart_widget, 0, 1)
         
-        charts_splitter.addWidget(call_chart_placeholder)
-        charts_splitter.addWidget(put_chart_placeholder)
-        charts_splitter.setSizes([400, 400])
+        # Confirmation Chart (Bottom Left)
+        self.confirm_chart_widget = self.create_spx_chart("Confirmation Chart", "#FFA726", True)
+        charts_layout.addWidget(self.confirm_chart_widget, 1, 0)
         
-        trading_layout.addWidget(charts_splitter)
+        # Trade Chart (Bottom Right)
+        self.trade_chart_widget = self.create_spx_chart("Trade Chart", "#66BB6A", False)
+        charts_layout.addWidget(self.trade_chart_widget, 1, 1)
+        
+        trading_layout.addWidget(charts_widget)
 
         # Positions and Orders panel
         pos_order_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -1541,12 +2243,12 @@ class MainWindow(QMainWindow):
         Retry connection with new client ID after error 326.
         Called via QTimer.singleShot after incrementing client_id_iterator.
         """
+        logger.info(f"RETRY: Starting retry with client_id={self.client_id}, iterator={self.client_id_iterator}")
         self.handling_client_id_error = False
         logger.info(f"Retrying connection with client ID {self.client_id}")
         # Update the client ID in the UI
         self.client_id_edit.setText(str(self.client_id))
-        # Reset client_id_iterator to use the new client_id
-        self.client_id_iterator = self.client_id
+        # Don't reset client_id_iterator - it should keep the incremented value
         # Attempt reconnection
         self.connect_to_ibkr()
     
@@ -1613,10 +2315,14 @@ class MainWindow(QMainWindow):
     def update_underlying_display(self, price: float):
         """Update underlying price display (SPX or XSP based on SELECTED_INSTRUMENT)"""
         self.app_state['underlying_price'] = price
+        self.underlying_price = price  # Store for chart updates
         self.underlying_price_label.setText(f"{self.instrument['underlying_symbol']}: {price:.2f}")
         
         # Update ES-to-cash offset if conditions are met
         self.update_es_to_cash_offset(price, None)
+        
+        # Update charts with live data
+        self.update_charts_with_live_data()
     
     def is_market_hours(self):
         """Check if it's during regular market hours (9:30 AM - 4:00 PM ET)"""
@@ -1989,6 +2695,12 @@ class MainWindow(QMainWindow):
             self.historical_data[contract_key] = []
         
         self.historical_data[contract_key].append(bar_data)
+        
+        # Update charts based on contract type
+        if contract_key.startswith("UNDERLYING_"):
+            self.update_underlying_chart_data(contract_key, bar_data)
+        elif contract_key.startswith("CHART_"):
+            self.update_option_chart_data(contract_key, bar_data)
     
     @pyqtSlot(str)
     def on_historical_complete(self, contract_key: str):
@@ -1997,20 +2709,273 @@ class MainWindow(QMainWindow):
             bars = self.historical_data[contract_key]
             self.log_message(f"Historical data complete for {contract_key}: {len(bars)} bars", "SUCCESS")
             
-            # Determine if call or put and update appropriate chart
-            # TODO: Implement chart widget integration
-            if '_C_' in contract_key:
-                # Update call chart (TODO: Implement ChartWidget)
-                logger.info(f"CALL historical data ready: {len(bars)} bars")
-                # if hasattr(self, 'call_chart'):
-                #     self.call_chart.update_data(bars)
-                #     self.log_message(f"Updated CALL chart with {len(bars)} bars", "INFO")
-            elif '_P_' in contract_key:
-                # Update put chart (TODO: Implement ChartWidget)
-                logger.info(f"PUT historical data ready: {len(bars)} bars")
-                # if hasattr(self, 'put_chart'):
-                #     self.put_chart.update_data(bars)
-                #     self.log_message(f"Updated PUT chart with {len(bars)} bars", "INFO")
+            # Update appropriate charts with complete data
+            if contract_key.startswith("UNDERLYING_"):
+                self.update_underlying_charts_complete(contract_key)
+            elif contract_key.startswith("CHART_"):
+                self.update_option_charts_complete(contract_key)
+            else:
+                # Legacy handling for direct contract keys
+                if '_C_' in contract_key:
+                    logger.info(f"CALL historical data ready: {len(bars)} bars")
+                elif '_P_' in contract_key:
+                    logger.info(f"PUT historical data ready: {len(bars)} bars")
+    
+    def update_underlying_chart_data(self, contract_key: str, bar_data: dict):
+        """Update underlying chart data storage"""
+        try:
+            # Convert bar data to chart format
+            # Fix date format - IBKR sometimes has extra spaces
+            date_str = str(bar_data['date']).strip().replace('  ', ' ')
+            chart_bar = {
+                'time': date_str,  # IBKR provides 'date' field
+                'open': bar_data['open'],
+                'high': bar_data['high'], 
+                'low': bar_data['low'],
+                'close': bar_data['close'],
+                'volume': bar_data['volume']
+            }
+            
+            if "TRADE" in contract_key:
+                # This is for the trade chart - store separately or limit size
+                if 'underlying_trade' not in self.chart_data:
+                    self.chart_data['underlying_trade'] = []
+                self.chart_data['underlying_trade'].append(chart_bar)
+                # Keep only last 200 bars for trade chart
+                if len(self.chart_data['underlying_trade']) > 200:
+                    self.chart_data['underlying_trade'] = self.chart_data['underlying_trade'][-200:]
+            else:
+                # This is for the confirmation chart
+                self.chart_data['underlying'].append(chart_bar)
+                # Keep only last 400 bars for confirmation chart
+                if len(self.chart_data['underlying']) > 400:
+                    self.chart_data['underlying'] = self.chart_data['underlying'][-400:]
+                    
+        except Exception as e:
+            logger.error(f"Error updating underlying chart data: {e}")
+    
+    def update_option_chart_data(self, contract_key: str, bar_data: dict):
+        """Update option chart data storage"""
+        try:
+            # Handle new format: CHART_call_XSP_680_C_20251029 or CHART_put_XSP_680_P_20251029
+            if contract_key.startswith("CHART_call_") or contract_key.startswith("CHART_put_"):
+                # Parse the new format
+                parts = contract_key.split("_", 2)  # Split into ["CHART", "call/put", "remaining"]
+                option_type = parts[1]  # "call" or "put"
+                actual_contract_key = parts[2]  # "XSP_680_C_20251029"
+                
+                # Convert bar data to chart format
+                # Fix date format - IBKR sometimes has extra spaces
+                date_str = str(bar_data['date']).strip().replace('  ', ' ')
+                chart_bar = {
+                    'time': date_str,
+                    'open': bar_data['open'],
+                    'high': bar_data['high'],
+                    'low': bar_data['low'], 
+                    'close': bar_data['close'],
+                    'volume': bar_data['volume']
+                }
+                
+                # Update the appropriate chart data and trigger chart refresh
+                if option_type == "call":
+                    self.chart_data['selected_call'].append(chart_bar)
+                    # Keep only last 200 bars
+                    if len(self.chart_data['selected_call']) > 200:
+                        self.chart_data['selected_call'] = self.chart_data['selected_call'][-200:]
+                    # Update current call contract tracking
+                    self.current_call_contract = actual_contract_key
+                    
+                elif option_type == "put":
+                    self.chart_data['selected_put'].append(chart_bar)
+                    # Keep only last 200 bars
+                    if len(self.chart_data['selected_put']) > 200:
+                        self.chart_data['selected_put'] = self.chart_data['selected_put'][-200:]
+                    # Update current put contract tracking
+                    self.current_put_contract = actual_contract_key
+                
+                logger.info(f"Updated {option_type} chart data: {len(self.chart_data[f'selected_{option_type}'])} bars")
+                
+            else:
+                # Legacy format handling
+                actual_contract_key = contract_key.replace("CHART_", "")
+                
+                # Convert bar data to chart format
+                # Fix date format - IBKR sometimes has extra spaces
+                date_str = str(bar_data['date']).strip().replace('  ', ' ')
+                chart_bar = {
+                    'time': date_str,
+                    'open': bar_data['open'],
+                    'high': bar_data['high'],
+                    'low': bar_data['low'], 
+                    'close': bar_data['close'],
+                    'volume': bar_data['volume']
+                }
+                
+                if hasattr(self, 'current_call_contract') and actual_contract_key == self.current_call_contract:
+                    self.chart_data['selected_call'].append(chart_bar)
+                    if len(self.chart_data['selected_call']) > 200:
+                        self.chart_data['selected_call'] = self.chart_data['selected_call'][-200:]
+                        
+                elif hasattr(self, 'current_put_contract') and actual_contract_key == self.current_put_contract:
+                    self.chart_data['selected_put'].append(chart_bar)
+                    if len(self.chart_data['selected_put']) > 200:
+                        self.chart_data['selected_put'] = self.chart_data['selected_put'][-200:]
+                    
+        except Exception as e:
+            logger.error(f"Error updating option chart data: {e}")
+    
+    def update_underlying_charts_complete(self, contract_key: str):
+        """Update underlying charts when historical data is complete"""
+        try:
+            if "TRADE" in contract_key:
+                # Update trade chart
+                if 'underlying_trade' in self.chart_data and self.chart_data['underlying_trade']:
+                    self.update_spx_chart(self.trade_chart_widget, self.chart_data['underlying_trade'])
+                    logger.info(f"Updated trade chart with {len(self.chart_data['underlying_trade'])} bars")
+            else:
+                # Update confirmation chart
+                if self.chart_data['underlying']:
+                    self.update_spx_chart(self.confirm_chart_widget, self.chart_data['underlying'])
+                    logger.info(f"Updated confirmation chart with {len(self.chart_data['underlying'])} bars")
+                    
+        except Exception as e:
+            logger.error(f"Error updating underlying charts: {e}")
+    
+    def update_option_charts_complete(self, contract_key: str):
+        """Update option charts when historical data is complete"""
+        try:
+            # Handle new format: CHART_call_XSP_680_C_20251029 or CHART_put_XSP_680_P_20251029
+            if contract_key.startswith("CHART_call_") or contract_key.startswith("CHART_put_"):
+                # Parse the new format
+                parts = contract_key.split("_", 2)  # Split into ["CHART", "call/put", "remaining"]
+                option_type = parts[1]  # "call" or "put"
+                actual_contract_key = parts[2]  # "XSP_680_C_20251029"
+                
+                if option_type == "call" and self.chart_data['selected_call']:
+                    # Update call chart with data
+                    description = self.get_option_description(actual_contract_key)
+                    self.update_option_chart(self.call_chart_widget, self.chart_data['selected_call'], description)
+                    logger.info(f"Updated call chart with {len(self.chart_data['selected_call'])} bars")
+                    self.log_message(f"Call chart updated: {description}", "SUCCESS")
+                    
+                elif option_type == "put" and self.chart_data['selected_put']:
+                    # Update put chart with data
+                    description = self.get_option_description(actual_contract_key)
+                    self.update_option_chart(self.put_chart_widget, self.chart_data['selected_put'], description)
+                    logger.info(f"Updated put chart with {len(self.chart_data['selected_put'])} bars")
+                    self.log_message(f"Put chart updated: {description}", "SUCCESS")
+                    
+            else:
+                # Legacy format handling
+                actual_contract_key = contract_key.replace("CHART_", "")
+                
+                if hasattr(self, 'current_call_contract') and actual_contract_key == self.current_call_contract:
+                    if self.chart_data['selected_call']:
+                        description = self.get_option_description(actual_contract_key)
+                        self.update_option_chart(self.call_chart_widget, self.chart_data['selected_call'], description)
+                        logger.info(f"Updated call chart with {len(self.chart_data['selected_call'])} bars")
+                        
+                elif hasattr(self, 'current_put_contract') and actual_contract_key == self.current_put_contract:
+                    if self.chart_data['selected_put']:
+                        description = self.get_option_description(actual_contract_key)
+                        self.update_option_chart(self.put_chart_widget, self.chart_data['selected_put'], description)
+                        logger.info(f"Updated put chart with {len(self.chart_data['selected_put'])} bars")
+                    
+        except Exception as e:
+            logger.error(f"Error updating option charts: {e}")
+    
+    def get_option_description(self, contract_key: str) -> str:
+        """Generate a description for an option contract"""
+        try:
+            # Parse contract key: XSP_680.0_C_20251029
+            parts = contract_key.split('_')
+            if len(parts) >= 4:
+                symbol = parts[0]
+                strike = parts[1]
+                right = parts[2]
+                expiry = parts[3]
+                
+                # Format expiry date
+                if len(expiry) == 8:  # YYYYMMDD
+                    formatted_date = f"{expiry[4:6]}/{expiry[6:8]}/{expiry[0:4]}"
+                else:
+                    formatted_date = expiry
+                
+                return f"{symbol} {strike} {right} Exp: {formatted_date}"
+            else:
+                return contract_key
+                
+        except Exception as e:
+            logger.error(f"Error generating option description: {e}")
+            return contract_key
+    
+    def round_to_strike(self, price: float) -> float:
+        """Round price to the nearest valid strike price"""
+        try:
+            # XSP strikes are in $1 increments, SPX in $5 or $25 increments
+            if self.instrument['symbol'] == 'XSP':
+                return round(price)  # Round to nearest dollar
+            else:  # SPX
+                if price < 2000:
+                    return round(price / 5) * 5  # $5 increments below 2000
+                else:
+                    return round(price / 25) * 25  # $25 increments above 2000
+        except Exception as e:
+            logger.error(f"Error rounding to strike: {e}")
+            return round(price)
+    
+    def update_charts_with_live_data(self):
+        """Update charts with latest live data periodically"""
+        try:
+            current_time = time.time() * 1000  # Convert to milliseconds
+            
+            # Throttle updates to avoid excessive CPU usage
+            if current_time - self.last_chart_update < self.chart_update_interval:
+                return
+                
+            self.last_chart_update = current_time
+            
+            # Update charts if we have new data
+            if self.underlying_price > 0:
+                # Create current price bar for real-time updates
+                current_bar = {
+                    'time': datetime.now().isoformat(),
+                    'open': self.underlying_price,
+                    'high': self.underlying_price,
+                    'low': self.underlying_price,
+                    'close': self.underlying_price,
+                    'volume': 0
+                }
+                
+                # Add to underlying data if we have historical data
+                if self.chart_data['underlying']:
+                    # Replace the last bar if it's from the same minute, otherwise append
+                    last_bar_time = datetime.fromisoformat(self.chart_data['underlying'][-1]['time'])
+                    current_time_dt = datetime.now()
+                    
+                    if (last_bar_time.hour == current_time_dt.hour and 
+                        last_bar_time.minute == current_time_dt.minute):
+                        # Update the last bar's close price
+                        self.chart_data['underlying'][-1]['close'] = self.underlying_price
+                        self.chart_data['underlying'][-1]['high'] = max(
+                            self.chart_data['underlying'][-1]['high'], self.underlying_price
+                        )
+                        self.chart_data['underlying'][-1]['low'] = min(
+                            self.chart_data['underlying'][-1]['low'], self.underlying_price
+                        )
+                    else:
+                        # Add new bar
+                        self.chart_data['underlying'].append(current_bar)
+                        
+                    # Update both SPX charts
+                    self.update_spx_chart(self.confirm_chart_widget, self.chart_data['underlying'])
+                    
+                    # Update trade chart if we have separate data
+                    if 'underlying_trade' in self.chart_data and self.chart_data['underlying_trade']:
+                        self.update_spx_chart(self.trade_chart_widget, self.chart_data['underlying_trade'])
+                    
+        except Exception as e:
+            logger.error(f"Error updating charts with live data: {e}")
     
     # ========================================================================
     # OPTION CHAIN MANAGEMENT
@@ -2374,15 +3339,17 @@ class MainWindow(QMainWindow):
             strike = float(strike_item.text())
             logger.info(f"Strike: {strike}")
             
-            # Determine if call or put was clicked
+            # Determine if call or put was clicked and request chart data
             if col < 10:  # Call side
                 contract_key = f"{self.instrument['options_symbol']}_{strike}_C_{self.current_expiry}"
                 self.log_message(f"Selected CALL: Strike {strike}", "INFO")
-                self.request_historical_data(contract_key)
+                # Request chart data for the selected call
+                self.request_option_chart_data(contract_key, "call")
             elif col > 10:  # Put side
                 contract_key = f"{self.instrument['options_symbol']}_{strike}_P_{self.current_expiry}"
                 self.log_message(f"Selected PUT: Strike {strike}", "INFO")
-                self.request_historical_data(contract_key)
+                # Request chart data for the selected put
+                self.request_option_chart_data(contract_key, "put")
             else:
                 logger.info(f"Clicked on strike column (col 10), ignoring")
         except Exception as e:
