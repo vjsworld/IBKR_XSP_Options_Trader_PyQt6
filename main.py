@@ -2852,8 +2852,8 @@ class MainWindow(QMainWindow):
         panels_container = QWidget()
         panels_layout = QHBoxLayout(panels_container)
         panels_layout.setContentsMargins(0, 0, 0, 0)
-        panels_layout.setSpacing(5)        # --- PANEL 1: Master Settings (Strategy Control) ---
-        self.master_group = QGroupBox("Master Settings")
+        panels_layout.setSpacing(5)        # --- PANEL 1: Strategy Settings ---
+        self.master_group = QGroupBox("Strategy Settings")
         self.master_group.setFixedWidth(280)
         master_layout = QFormLayout(self.master_group)
         master_layout.setVerticalSpacing(8)
@@ -2889,6 +2889,15 @@ class MainWindow(QMainWindow):
         self.vix_threshold_spin.setDecimals(1)
         self.vix_threshold_spin.valueChanged.connect(self.on_master_settings_changed)
         master_layout.addRow("VIX Threshold:", self.vix_threshold_spin)
+        
+        # Time Stop
+        self.time_stop_spin = QSpinBox()
+        self.time_stop_spin.setRange(1, 300)
+        self.time_stop_spin.setSingleStep(5)
+        self.time_stop_spin.setValue(self.time_stop)
+        self.time_stop_spin.setToolTip("Time stop in minutes")
+        self.time_stop_spin.valueChanged.connect(self.on_master_settings_changed)
+        master_layout.addRow("Time Stop (min):", self.time_stop_spin)
         
         panels_layout.addWidget(self.master_group)
         
@@ -3087,15 +3096,6 @@ class MainWindow(QMainWindow):
         radio_layout.addStretch()
         
         entry_layout.addRow("Position Sizing:", radio_frame)
-        
-        # Time Stop
-        self.time_stop_spin = QSpinBox()
-        self.time_stop_spin.setRange(1, 300)
-        self.time_stop_spin.setSingleStep(5)
-        self.time_stop_spin.setValue(self.time_stop)
-        self.time_stop_spin.setToolTip("Time stop in minutes")
-        self.time_stop_spin.valueChanged.connect(self.on_master_settings_changed)
-        entry_layout.addRow("Time Stop (min):", self.time_stop_spin)
         
         panels_layout.addWidget(entry_group)
         
