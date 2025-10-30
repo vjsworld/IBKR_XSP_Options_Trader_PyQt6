@@ -2890,57 +2890,6 @@ class MainWindow(QMainWindow):
         self.vix_threshold_spin.valueChanged.connect(self.on_master_settings_changed)
         master_layout.addRow("VIX Threshold:", self.vix_threshold_spin)
         
-        # Target Delta
-        self.target_delta_spin = QSpinBox()
-        self.target_delta_spin.setRange(10, 50)
-        self.target_delta_spin.setSingleStep(10)
-        self.target_delta_spin.setValue(self.target_delta)
-        self.target_delta_spin.valueChanged.connect(self.on_master_settings_changed)
-        master_layout.addRow("Target Delta:", self.target_delta_spin)
-        
-        # Max Risk
-        self.max_risk_spin = QSpinBox()
-        self.max_risk_spin.setRange(100, 10000)
-        self.max_risk_spin.setSingleStep(50)
-        self.max_risk_spin.setValue(self.max_risk)
-        self.max_risk_spin.valueChanged.connect(self.on_master_settings_changed)
-        master_layout.addRow("Max Risk ($):", self.max_risk_spin)
-        
-        # Trade Quantity
-        self.trade_qty_spin = QSpinBox()
-        self.trade_qty_spin.setRange(1, 100)
-        self.trade_qty_spin.setValue(self.trade_qty)
-        self.trade_qty_spin.valueChanged.connect(self.on_master_settings_changed)
-        master_layout.addRow("Trade Quantity:", self.trade_qty_spin)
-        
-        # Position Size Mode
-        radio_frame = QWidget()
-        radio_layout = QHBoxLayout(radio_frame)
-        radio_layout.setContentsMargins(0, 0, 0, 0)
-        radio_layout.setSpacing(10)
-        
-        self.fixed_radio = QRadioButton("Fixed Qty")
-        self.fixed_radio.setChecked(self.position_size_mode == "fixed")
-        self.fixed_radio.toggled.connect(self.on_position_mode_changed)
-        radio_layout.addWidget(self.fixed_radio)
-        
-        self.by_risk_radio = QRadioButton("By Risk")
-        self.by_risk_radio.setChecked(self.position_size_mode == "calculated")
-        self.by_risk_radio.toggled.connect(self.on_position_mode_changed)
-        radio_layout.addWidget(self.by_risk_radio)
-        radio_layout.addStretch()
-        
-        master_layout.addRow("Position Sizing:", radio_frame)
-        
-        # Time Stop
-        self.time_stop_spin = QSpinBox()
-        self.time_stop_spin.setRange(1, 300)
-        self.time_stop_spin.setSingleStep(5)
-        self.time_stop_spin.setValue(self.time_stop)
-        self.time_stop_spin.setToolTip("Time stop in minutes")
-        self.time_stop_spin.valueChanged.connect(self.on_master_settings_changed)
-        master_layout.addRow("Time Stop (min):", self.time_stop_spin)
-        
         panels_layout.addWidget(self.master_group)
         
         # --- PANEL 2: Confirmation Chart Settings ---
@@ -3091,23 +3040,64 @@ class MainWindow(QMainWindow):
         
         panels_layout.addWidget(manual_group)
         
-        # --- PANEL 6: Reserved for Future Use ---
-        future_group = QGroupBox("Reserved for Future Use")
-        future_group.setFixedWidth(280)
-        future_layout = QVBoxLayout(future_group)
+        # --- PANEL 6: Entry Settings ---
+        entry_group = QGroupBox("Entry Settings")
+        entry_group.setFixedWidth(280)
+        entry_layout = QFormLayout(entry_group)
+        entry_layout.setVerticalSpacing(8)
         
-        placeholder_label = QLabel(
-            "This panel is reserved\n"
-            "for future features.\n\n"
-            "Chain settings have been\n"
-            "moved to the Settings tab."
-        )
-        placeholder_label.setStyleSheet("color: #888888; font-size: 9pt;")
-        placeholder_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        future_layout.addWidget(placeholder_label)
-        future_layout.addStretch()
+        # Target Delta
+        self.target_delta_spin = QSpinBox()
+        self.target_delta_spin.setRange(10, 50)
+        self.target_delta_spin.setSingleStep(10)
+        self.target_delta_spin.setValue(self.target_delta)
+        self.target_delta_spin.valueChanged.connect(self.on_master_settings_changed)
+        entry_layout.addRow("Target Delta:", self.target_delta_spin)
         
-        panels_layout.addWidget(future_group)
+        # Max Risk
+        self.max_risk_spin = QSpinBox()
+        self.max_risk_spin.setRange(100, 10000)
+        self.max_risk_spin.setSingleStep(50)
+        self.max_risk_spin.setValue(self.max_risk)
+        self.max_risk_spin.valueChanged.connect(self.on_master_settings_changed)
+        entry_layout.addRow("Max Risk ($):", self.max_risk_spin)
+        
+        # Trade Quantity
+        self.trade_qty_spin = QSpinBox()
+        self.trade_qty_spin.setRange(1, 100)
+        self.trade_qty_spin.setValue(self.trade_qty)
+        self.trade_qty_spin.valueChanged.connect(self.on_master_settings_changed)
+        entry_layout.addRow("Trade Quantity:", self.trade_qty_spin)
+        
+        # Position Size Mode
+        radio_frame = QWidget()
+        radio_layout = QHBoxLayout(radio_frame)
+        radio_layout.setContentsMargins(0, 0, 0, 0)
+        radio_layout.setSpacing(10)
+        
+        self.fixed_radio = QRadioButton("Fixed Qty")
+        self.fixed_radio.setChecked(self.position_size_mode == "fixed")
+        self.fixed_radio.toggled.connect(self.on_position_mode_changed)
+        radio_layout.addWidget(self.fixed_radio)
+        
+        self.by_risk_radio = QRadioButton("By Risk")
+        self.by_risk_radio.setChecked(self.position_size_mode == "calculated")
+        self.by_risk_radio.toggled.connect(self.on_position_mode_changed)
+        radio_layout.addWidget(self.by_risk_radio)
+        radio_layout.addStretch()
+        
+        entry_layout.addRow("Position Sizing:", radio_frame)
+        
+        # Time Stop
+        self.time_stop_spin = QSpinBox()
+        self.time_stop_spin.setRange(1, 300)
+        self.time_stop_spin.setSingleStep(5)
+        self.time_stop_spin.setValue(self.time_stop)
+        self.time_stop_spin.setToolTip("Time stop in minutes")
+        self.time_stop_spin.valueChanged.connect(self.on_master_settings_changed)
+        entry_layout.addRow("Time Stop (min):", self.time_stop_spin)
+        
+        panels_layout.addWidget(entry_group)
         
         # Complete the scroll area setup
         panels_scroll.setWidget(panels_container)
