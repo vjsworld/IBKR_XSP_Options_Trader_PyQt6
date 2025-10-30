@@ -582,12 +582,18 @@ class IBKRWrapper(EWrapper):
     
     def historicalData(self, reqId: int, bar):
         """Receives historical bar data"""
+        # Check for historical close offset calculation requests
+        if reqId == self.app.get('historical_close_spx_req_id'):
+            contract_key = 'HISTORICAL_CLOSE_SPX'
+        elif reqId == self.app.get('historical_close_es_req_id'):
+            contract_key = 'HISTORICAL_CLOSE_ES'
         # Check both old and new request mapping systems
-        contract_key = None
-        if reqId in self.app.get('historical_data_requests', {}):
+        elif reqId in self.app.get('historical_data_requests', {}):
             contract_key = self.app['historical_data_requests'][reqId]
         elif self._main_window and hasattr(self._main_window, 'request_id_map') and reqId in self._main_window.request_id_map:
             contract_key = self._main_window.request_id_map[reqId]
+        else:
+            contract_key = None
             
         if contract_key:
             bar_data = {
@@ -602,12 +608,18 @@ class IBKRWrapper(EWrapper):
     
     def historicalDataEnd(self, reqId: int, start: str, end: str):
         """Called when historical data request is complete"""
-        # Check both old and new request mapping systems  
-        contract_key = None
-        if reqId in self.app.get('historical_data_requests', {}):
+        # Check for historical close offset calculation requests
+        if reqId == self.app.get('historical_close_spx_req_id'):
+            contract_key = 'HISTORICAL_CLOSE_SPX'
+        elif reqId == self.app.get('historical_close_es_req_id'):
+            contract_key = 'HISTORICAL_CLOSE_ES'
+        # Check both old and new request mapping systems
+        elif reqId in self.app.get('historical_data_requests', {}):
             contract_key = self.app['historical_data_requests'][reqId]
         elif self._main_window and hasattr(self._main_window, 'request_id_map') and reqId in self._main_window.request_id_map:
             contract_key = self._main_window.request_id_map[reqId]
+        else:
+            contract_key = None
             
         if contract_key:
             self.signals.historical_complete.emit(contract_key)
@@ -748,7 +760,7 @@ class ProfessionalChart(QWidget):
         toolbar_layout.addWidget(QLabel("Days:"))
         self.days_combo = QComboBox()
         self.days_combo.addItems(["1", "2", "3", "5"])
-        self.days_combo.setCurrentText("1")
+        self.days_combo.setCurrentText("2")
         self.days_combo.setFixedWidth(50)
         self.days_combo.setStyleSheet(self.interval_combo.styleSheet())
         toolbar_layout.addWidget(self.days_combo)
@@ -1028,17 +1040,18 @@ class ProfessionalChart(QWidget):
                 self.ax.set_xlim(saved_xlim)
                 self.ax.autoscale(enable=False, axis='x')
             else:
-                # First time drawing - set default view
-                if len(x_dates) > 100:
-                    visible_bars = min(240, len(x_dates))
+                # First time drawing - set default view to show last 12 hours (720 bars at 1-min intervals)
+                visible_bars = min(720, len(x_dates))  # 12 hours = 720 minutes
+                if len(x_dates) > visible_bars:
                     x_range = x_dates[-1] - x_dates[-visible_bars]
                     padding = x_range * 0.02
                     self.ax.set_xlim(x_dates[-visible_bars], x_dates[-1] + padding)
-                    self.ax.autoscale(enable=False, axis='x')
                 else:
+                    # Show all data if less than 12 hours available
                     x_range = x_dates[-1] - x_dates[0]
                     padding = x_range * 0.02
                     self.ax.set_xlim(x_dates[0], x_dates[-1] + padding)
+                self.ax.autoscale(enable=False, axis='x')
             
             # No need to call tight_layout - using constrained_layout in Figure constructor
             
@@ -1060,7 +1073,7 @@ class ProfessionalUnderlyingChart(QWidget):
     Similar to TradeStation multi-panel charts with throttled updates for trading
     """
     
-    def __init__(self, title: str, border_color: str = "#FF8C00", parent=None):
+    def __init__(self, title: str, border_color: str = "#FF8C00", parent=None, main_window=None):
         super().__init__(parent)
         self.title = title
         self.border_color = border_color
@@ -1068,6 +1081,7 @@ class ProfessionalUnderlyingChart(QWidget):
         self.last_update_time = 0  # Throttle updates
         self.update_interval = 0.25  # Minimum 250ms between updates (4 FPS)
         self.pending_update = None  # QTimer for pending update
+        self.main_window = main_window  # Reference to main window for offset access
         
         # Create layout
         layout = QVBoxLayout(self)
@@ -1106,7 +1120,7 @@ class ProfessionalUnderlyingChart(QWidget):
         toolbar_layout.addWidget(QLabel("Days:"))
         self.days_combo = QComboBox()
         self.days_combo.addItems(["1", "2", "3", "5"])
-        self.days_combo.setCurrentText("1")
+        self.days_combo.setCurrentText("2")
         self.days_combo.setFixedWidth(50)
         toolbar_layout.addWidget(self.days_combo)
         
@@ -1254,7 +1268,7 @@ class ProfessionalUnderlyingChart(QWidget):
         ax.axis('off')
         self.canvas.draw()
     
-    def update_chart_throttled(self, price_data, ema_period=9, z_period=30, z_threshold=1.5):
+    def update_chart_throttled(self, price_data, ema_period=9, z_period=30, z_threshold=1.5, is_es_futures=False):
         """Throttled chart update - limits update frequency to prevent UI freezing"""
         import time
         current_time = time.time()
@@ -1263,7 +1277,7 @@ class ProfessionalUnderlyingChart(QWidget):
         if current_time - self.last_update_time >= self.update_interval:
             # Update immediately
             self.last_update_time = current_time
-            self.update_chart(price_data, ema_period, z_period, z_threshold)
+            self.update_chart(price_data, ema_period, z_period, z_threshold, is_es_futures)
         else:
             # Schedule update for later if not already scheduled
             if self.pending_update is None:
@@ -1271,18 +1285,18 @@ class ProfessionalUnderlyingChart(QWidget):
                 delay_ms = int(remaining_time * 1000)
                 self.pending_update = QTimer.singleShot(
                     delay_ms,
-                    lambda: self._execute_pending_update(price_data, ema_period, z_period, z_threshold)
+                    lambda: self._execute_pending_update(price_data, ema_period, z_period, z_threshold, is_es_futures)
                 )
     
-    def _execute_pending_update(self, price_data, ema_period=9, z_period=30, z_threshold=1.5):
+    def _execute_pending_update(self, price_data, ema_period=9, z_period=30, z_threshold=1.5, is_es_futures=False):
         """Execute the pending chart update"""
         import time
         self.pending_update = None
         self.last_update_time = time.time()
-        self.update_chart(price_data, ema_period, z_period, z_threshold)
+        self.update_chart(price_data, ema_period, z_period, z_threshold, is_es_futures)
     
-    def update_chart(self, price_data, ema_period=9, z_period=30, z_threshold=1.5):
-        """Update chart with price data, EMA, and Z-Score"""
+    def update_chart(self, price_data, ema_period=9, z_period=30, z_threshold=1.5, is_es_futures=False):
+        """Update chart with price data, EMA, and Z-Score. If is_es_futures=True, also plot offset-adjusted line."""
         if not price_data or len(price_data) < max(ema_period, z_period):
             self.draw_empty_chart()
             return
@@ -1318,6 +1332,15 @@ class ProfessionalUnderlyingChart(QWidget):
             
             # Calculate EMA
             df['ema'] = df['close'].ewm(span=ema_period, adjust=False).mean()
+            
+            # Calculate offset-adjusted price if this is ES futures data
+            if is_es_futures and self.main_window is not None:
+                offset = self.main_window.es_to_cash_offset
+                # For XSP: (ES/10) - offset, For SPX: ES - offset
+                if self.main_window.instrument['underlying_symbol'] == 'XSP':
+                    df['offset_adjusted'] = (df['close'] / 10.0) - offset
+                else:
+                    df['offset_adjusted'] = df['close'] - offset
             
             # Calculate Z-Score
             df['z_score'] = (df['close'] - df['close'].rolling(z_period).mean()) / df['close'].rolling(z_period).std()
@@ -1364,6 +1387,11 @@ class ProfessionalUnderlyingChart(QWidget):
             # Add EMA overlay using datetime x-axis
             self.price_ax.plot(x_dates, df['ema'].values.tolist(), color=self.border_color, 
                              linewidth=1.5, label=f'EMA({ema_period})', alpha=0.8)
+            
+            # Add offset-adjusted line if ES futures data
+            if is_es_futures and 'offset_adjusted' in df.columns:
+                self.price_ax.plot(x_dates, df['offset_adjusted'].values.tolist(), color='#FFFF00', 
+                                 linewidth=1.5, label='Offset', alpha=0.8)
             
             # Style price chart
             self.price_ax.set_facecolor('#0a0a0a')
@@ -1441,17 +1469,18 @@ class ProfessionalUnderlyingChart(QWidget):
                 self.price_ax.set_xlim(saved_xlim)
                 self.price_ax.autoscale(enable=False, axis='x')
             else:
-                # First time drawing - set default view
-                if len(x_dates) > 100:
-                    visible_bars = min(240, len(x_dates))
+                # First time drawing - set default view to show last 12 hours (720 bars at 1-min intervals)
+                visible_bars = min(720, len(x_dates))  # 12 hours = 720 minutes
+                if len(x_dates) > visible_bars:
                     x_range = x_dates[-1] - x_dates[-visible_bars]
                     padding = x_range * 0.02
                     self.price_ax.set_xlim(x_dates[-visible_bars], x_dates[-1] + padding)
-                    self.price_ax.autoscale(enable=False, axis='x')
                 else:
+                    # Show all data if less than 12 hours available
                     x_range = x_dates[-1] - x_dates[0]
                     padding = x_range * 0.02
                     self.price_ax.set_xlim(x_dates[0], x_dates[-1] + padding)
+                self.price_ax.autoscale(enable=False, axis='x')
             
             # Update title (price shown on chart now)
             self.title_label.setText(self.title)
@@ -1617,6 +1646,8 @@ class MainWindow(QMainWindow):
         self.chain_refresh_interval = 3600  # Auto-refresh chain every hour (in seconds)
         self.last_chain_center_strike = 0  # Track last center strike for drift detection
         self.chain_drift_threshold = 5  # Number of strikes to drift before auto-recentering (default: 5)
+        self.is_recentering_chain = False  # Flag to prevent recentering loops
+        self.last_recenter_time = 0  # Timestamp of last recenter to throttle rapid recenters
         
         # Auto-refresh timer for 4:00 PM ET expiration switch
         self.market_close_timer = QTimer()
@@ -2250,13 +2281,21 @@ class MainWindow(QMainWindow):
             days = int(days_text)
             duration = f"{days} D"
             
-            # Create underlying contract
+            # Create contract - ES futures for confirmation chart, underlying for trade chart
             from ibapi.contract import Contract
             contract = Contract()
-            contract.symbol = self.instrument['underlying_symbol']
-            contract.secType = "IND" if self.instrument['underlying_symbol'] == "SPX" else "STK"
-            contract.exchange = "CBOE" if self.instrument['underlying_symbol'] == "SPX" else "ARCA"
-            contract.currency = "USD"
+            
+            if not is_trade_chart:  # Confirmation chart uses ES futures
+                contract.symbol = "ES"
+                contract.secType = "FUT"
+                contract.exchange = "CME"
+                contract.currency = "USD"
+                contract.lastTradeDateOrContractMonth = self.get_es_front_month()
+            else:  # Trade chart uses underlying
+                contract.symbol = self.instrument['underlying_symbol']
+                contract.secType = "IND" if self.instrument['underlying_symbol'] == "SPX" else "STK"
+                contract.exchange = "CBOE" if self.instrument['underlying_symbol'] == "SPX" else "ARCA"
+                contract.currency = "USD"
             
             req_id = self.app_state['next_req_id']
             self.app_state['next_req_id'] += 1
@@ -2265,7 +2304,7 @@ class MainWindow(QMainWindow):
             if is_trade_chart:
                 contract_key = f"UNDERLYING_{self.instrument['underlying_symbol']}_TRADE"
             else:
-                contract_key = f"UNDERLYING_{self.instrument['underlying_symbol']}"
+                contract_key = "ES_FUTURES_CONFIRM"  # Use ES futures for confirmation chart
             
             self.request_id_map[req_id] = contract_key
             
@@ -2277,7 +2316,7 @@ class MainWindow(QMainWindow):
             if is_trade_chart:
                 self.chart_data['underlying_trade'] = []
             else:
-                self.chart_data['underlying'] = []
+                self.chart_data['es_futures'] = []  # Clear ES futures data for confirmation chart
             
             # Request new data with updated settings
             self.ibkr_client.reqHistoricalData(
@@ -2287,7 +2326,7 @@ class MainWindow(QMainWindow):
                 duration,
                 bar_size,
                 "TRADES",
-                1,  # Use RTH
+                0,  # Include after-hours data
                 1,  # Format date
                 True,  # Keep up to date
                 []
@@ -2386,7 +2425,7 @@ class MainWindow(QMainWindow):
                 duration,
                 bar_size,
                 "MIDPOINT",  # Use mid price (bid+ask)/2 for option charts
-                1,  # Use RTH
+                0,  # Include after-hours data
                 1,  # Format date
                 True,  # Keep up to date
                 []
@@ -2419,41 +2458,48 @@ class MainWindow(QMainWindow):
             logger.error(f"Error requesting chart data: {e}")
     
     def request_underlying_historical_data(self):
-        """Request historical data for the underlying instrument (SPX/XSP)"""
+        """Request historical data for ES futures (confirmation chart) and underlying (trade chart)"""
         try:
             from ibapi.contract import Contract
             
-            # Create underlying contract
-            contract = Contract()
-            contract.symbol = self.instrument['underlying_symbol']
-            contract.secType = "IND" if self.instrument['underlying_symbol'] == "SPX" else "STK"
-            contract.exchange = "CBOE" if self.instrument['underlying_symbol'] == "SPX" else "ARCA"
-            contract.currency = "USD"
+            # Create ES futures contract for confirmation chart (24/6 trading)
+            es_contract = Contract()
+            es_contract.symbol = "ES"
+            es_contract.secType = "FUT"
+            es_contract.exchange = "CME"
+            es_contract.currency = "USD"
+            es_contract.lastTradeDateOrContractMonth = self.get_es_front_month()
             
             req_id = self.app_state['next_req_id']
             self.app_state['next_req_id'] += 1
             
-            # Store request mapping for chart updates
-            contract_key = f"UNDERLYING_{self.instrument['underlying_symbol']}"
+            # Store request mapping for chart updates - use ES for confirmation chart
+            contract_key = f"ES_FUTURES_CONFIRM"
             self.request_id_map[req_id] = contract_key
             
             # Request 1 day of 1-minute data for confirmation chart with real-time updates
             self.ibkr_client.reqHistoricalData(
                 req_id,
-                contract,
+                es_contract,
                 "",  # End time (empty = now)
                 "1 D",  # Duration
                 "1 min",  # Bar size
                 "TRADES",
-                1,  # Use RTH
+                0,  # Include after-hours data
                 1,  # Format date
                 True,  # Keep up to date - enables real-time bar updates via historicalDataUpdate
                 []
             )
             
-            logger.info(f"Requested underlying historical data for {contract_key}")
+            logger.info(f"Requested ES futures historical data for confirmation chart")
             
-            # Request second dataset for trade chart (shorter timeframe)
+            # Request second dataset for trade chart - use underlying (SPX/XSP)
+            underlying_contract = Contract()
+            underlying_contract.symbol = self.instrument['underlying_symbol']
+            underlying_contract.secType = "IND" if self.instrument['underlying_symbol'] == "SPX" else "STK"
+            underlying_contract.exchange = "CBOE" if self.instrument['underlying_symbol'] == "SPX" else "ARCA"
+            underlying_contract.currency = "USD"
+            
             req_id_trade = self.app_state['next_req_id']
             self.app_state['next_req_id'] += 1
             
@@ -2463,12 +2509,12 @@ class MainWindow(QMainWindow):
             # Request 4 hours of 30-second data for trade chart with real-time updates
             self.ibkr_client.reqHistoricalData(
                 req_id_trade,
-                contract,
+                underlying_contract,
                 "",  # End time (empty = now)
                 "14400 S",  # 4 hours in seconds
                 "30 secs",  # Bar size
                 "TRADES",
-                1,  # Use RTH
+                0,  # Include after-hours data
                 1,  # Format date
                 True,  # Keep up to date - enables real-time bar updates via historicalDataUpdate
                 []
@@ -2538,7 +2584,7 @@ class MainWindow(QMainWindow):
                 "1 D",  # Duration  
                 "1 min",  # Bar size
                 "MIDPOINT",  # Use mid price (bid+ask)/2 for option charts
-                1,  # Use RTH
+                0,  # Include after-hours data
                 1,  # Format date
                 True,  # Keep up to date - enables real-time bar updates via historicalDataUpdate
                 []
@@ -2594,7 +2640,7 @@ class MainWindow(QMainWindow):
                 "1 D",  # Duration  
                 "1 min",  # Bar size
                 "MIDPOINT",  # Use mid price (bid+ask)/2 for option charts
-                1,  # Use RTH
+                0,  # Include after-hours data
                 1,  # Format date
                 True,  # Keep up to date - enables real-time bar updates via historicalDataUpdate
                 []
@@ -2610,35 +2656,6 @@ class MainWindow(QMainWindow):
         """Create the main trading dashboard tab"""
         tab = QWidget()
         main_layout = QVBoxLayout(tab)  # This is the main layout for the tab
-        
-        # Top button row - Show Charts button
-        top_button_row = QFrame()
-        top_button_layout = QHBoxLayout(top_button_row)
-        top_button_layout.setContentsMargins(0, 0, 0, 5)
-        
-        self.show_charts_btn = QPushButton("Show Charts")
-        self.show_charts_btn.clicked.connect(self.toggle_chart_window)
-        self.show_charts_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #4CAF50;
-                color: white;
-                font-weight: bold;
-                font-size: 12pt;
-                padding: 8px 20px;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #45a049;
-            }
-            QPushButton:pressed {
-                background-color: #3d8b40;
-            }
-        """)
-        top_button_layout.addWidget(self.show_charts_btn)
-        top_button_layout.addStretch()
-        
-        main_layout.addWidget(top_button_row)
         
         # Header with underlying price and expiration selector
         header = QFrame()
@@ -2667,7 +2684,41 @@ class MainWindow(QMainWindow):
         self.es_offset_label.setToolTip("ES futures premium/discount to cash index (persistent during overnight)")
         header_layout.addWidget(self.es_offset_label)
         
+        # Add 25-pixel spacing
+        header_layout.addSpacing(25)
+        
+        # ATM Strike display (based on 0.5 delta)
+        self.atm_strike_label = QLabel("ATM: Calculating...")
+        self.atm_strike_label.setStyleSheet("font-size: 12pt; font-weight: bold; color: #FFD700;")
+        self.atm_strike_label.setToolTip("True ATM strike identified by options with delta closest to 0.5")
+        header_layout.addWidget(self.atm_strike_label)
+        
         header_layout.addStretch()
+        
+        # Show Charts button (before Expiration controls)
+        self.show_charts_btn = QPushButton("Show Charts")
+        self.show_charts_btn.clicked.connect(self.toggle_chart_window)
+        self.show_charts_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                font-weight: bold;
+                font-size: 10pt;
+                padding: 5px 15px;
+                border: none;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+            QPushButton:pressed {
+                background-color: #3d8b40;
+            }
+        """)
+        header_layout.addWidget(self.show_charts_btn)
+        
+        # Add spacing before Expiration label
+        header_layout.addSpacing(20)
         
         self.expiry_combo = QComboBox()
         self.expiry_combo.addItems(self.get_expiration_options())
@@ -2742,7 +2793,7 @@ class MainWindow(QMainWindow):
         )
         
         # Confirmation Chart (Bottom Left) - Professional underlying with Z-Score
-        self.confirm_chart_widget = ProfessionalUnderlyingChart("Confirmation Chart", "#FFA726")
+        self.confirm_chart_widget = ProfessionalUnderlyingChart("Confirmation Chart", "#FFA726", main_window=self)
         self.confirm_chart_widget.interval_combo.currentTextChanged.connect(
             lambda: self.on_underlying_settings_changed(self.confirm_chart_widget, is_trade_chart=False)
         )
@@ -2751,7 +2802,7 @@ class MainWindow(QMainWindow):
         )
         
         # Trade Chart (Bottom Right) - Professional underlying with Z-Score
-        self.trade_chart_widget = ProfessionalUnderlyingChart("Trade Chart", "#66BB6A")
+        self.trade_chart_widget = ProfessionalUnderlyingChart("Trade Chart", "#66BB6A", main_window=self)
         self.trade_chart_widget.interval_combo.currentTextChanged.connect(
             lambda: self.on_underlying_settings_changed(self.trade_chart_widget, is_trade_chart=True)
         )
@@ -3377,6 +3428,16 @@ class MainWindow(QMainWindow):
             self.subscribe_underlying_price()  # Subscribe to underlying instrument (SPX, XSP, etc.) for display
             self.subscribe_es_price()   # ES for strike calculations (23/6 trading)
             self.request_option_chain()
+            
+            # Calculate offset from historical 3pm close if stale
+            if self.is_offset_stale() and not self.is_market_hours():
+                if self.es_to_cash_offset == 0:
+                    self.log_message("No saved offset found and connected after market hours - calculating from historical 3pm close", "INFO")
+                else:
+                    from datetime import datetime
+                    last_update = datetime.fromtimestamp(self.last_offset_update_time).strftime('%Y-%m-%d %H:%M:%S')
+                    self.log_message(f"Saved offset is stale (last updated: {last_update}) - recalculating from historical 3pm close", "INFO")
+                self.calculate_offset_from_historical_close()
         elif status == "DISCONNECTED":
             self.connect_btn.setText("Connect")
             self.connect_btn.setEnabled(True)
@@ -3440,6 +3501,37 @@ class MainWindow(QMainWindow):
         market_close = now_ct.replace(hour=15, minute=0, second=0, microsecond=0)
         
         return market_open <= now_ct <= market_close
+    
+    def is_offset_stale(self):
+        """
+        Check if the ES-to-cash offset is stale and needs to be recalculated.
+        Offset is considered stale if:
+        - It's zero (never set)
+        - It's older than the most recent 3pm market close
+        """
+        if self.es_to_cash_offset == 0:
+            return True
+        
+        if self.last_offset_update_time == 0:
+            return True
+        
+        import pytz
+        ct_tz = pytz.timezone('US/Central')
+        now_ct = datetime.now(ct_tz)
+        last_update = datetime.fromtimestamp(self.last_offset_update_time, tz=ct_tz)
+        
+        # Find the most recent 3pm market close
+        if now_ct.hour >= 15:  # After 3pm today
+            latest_close = now_ct.replace(hour=15, minute=0, second=0, microsecond=0)
+        else:  # Before 3pm today, use yesterday's close
+            latest_close = now_ct.replace(hour=15, minute=0, second=0, microsecond=0) - timedelta(days=1)
+        
+        # Move back to Friday if latest_close is on weekend
+        while latest_close.weekday() >= 5:  # Saturday or Sunday
+            latest_close -= timedelta(days=1)
+        
+        # Offset is stale if it was updated before the most recent 3pm close
+        return last_update < latest_close
     
     def is_futures_market_closed(self):
         """
@@ -3536,7 +3628,16 @@ class MainWindow(QMainWindow):
             self.es_offset_label.setStyleSheet(f"font-size: 12pt; color: {color};")
     
     def get_adjusted_es_price(self):
-        """Get ES price adjusted for the cash offset for strike calculations"""
+        """
+        Get ES price adjusted for the cash offset for strike calculations.
+        
+        IMPORTANT: This should ONLY be used as a fallback when the actual underlying
+        index (XSP/SPX) is not available. During regular market hours, always prefer
+        the actual underlying price.
+        
+        The ES futures trade 23/6 but have a basis difference from the cash index.
+        Using ES/10 for XSP will give incorrect ATM strikes that don't match TWS.
+        """
         es_price = self.app_state['es_price']
         if es_price <= 0:
             return 0
@@ -3549,6 +3650,68 @@ class MainWindow(QMainWindow):
         else:
             # For SPX: ES - offset
             return es_price - self.es_to_cash_offset
+    
+    def find_atm_strike_by_delta(self):
+        """
+        Find the TRUE ATM strike by identifying options with delta closest to 0.5.
+        
+        This is the industry-standard way to determine ATM:
+        - ATM Call: Delta closest to +0.5
+        - ATM Put: Delta closest to -0.5 (absolute value 0.5)
+        
+        Returns:
+            float: The strike price closest to ATM, or 0 if no deltas available
+        """
+        min_call_diff = float('inf')
+        min_put_diff = float('inf')
+        atm_call_strike = 0
+        atm_put_strike = 0
+        
+        # Search through all option market data for deltas
+        for contract_key, data in self.market_data.items():
+            if '_C_' not in contract_key and '_P_' not in contract_key:
+                continue
+            
+            delta = data.get('delta', None)
+            if delta is None or delta == 0:
+                continue
+            
+            # Parse strike from contract_key: "XSP_589_C_20251029"
+            try:
+                parts = contract_key.split('_')
+                if len(parts) != 4:
+                    continue
+                strike = float(parts[1])
+                
+                if '_C_' in contract_key:
+                    # Call delta should be between 0 and 1, target 0.5
+                    if 0 < delta < 1:
+                        diff = abs(delta - 0.5)
+                        if diff < min_call_diff:
+                            min_call_diff = diff
+                            atm_call_strike = strike
+                
+                elif '_P_' in contract_key:
+                    # Put delta should be between -1 and 0, target -0.5
+                    if -1 < delta < 0:
+                        diff = abs(abs(delta) - 0.5)
+                        if diff < min_put_diff:
+                            min_put_diff = diff
+                            atm_put_strike = strike
+            
+            except (ValueError, IndexError):
+                continue
+        
+        # Prefer call-based ATM, fallback to put-based ATM
+        if atm_call_strike > 0:
+            logger.debug(f"ATM strike identified by CALL delta: {atm_call_strike} (delta diff: {min_call_diff:.4f})")
+            return atm_call_strike
+        elif atm_put_strike > 0:
+            logger.debug(f"ATM strike identified by PUT delta: {atm_put_strike} (delta diff: {min_put_diff:.4f})")
+            return atm_put_strike
+        else:
+            logger.debug("No ATM strike found by delta - waiting for greeks data")
+            return 0
     
     def get_es_front_month(self):
         """
@@ -3672,6 +3835,10 @@ class MainWindow(QMainWindow):
         
         # Update option chain display
         self.update_option_chain_cell(contract_key)
+        
+        # Update strike backgrounds based on delta-identified ATM
+        # This ensures the ATM strike is always accurately highlighted
+        self.update_strike_backgrounds_by_delta()
     
     @pyqtSlot(str, dict)
     def on_position_update(self, contract_key: str, position_data: dict):
@@ -3832,13 +3999,22 @@ class MainWindow(QMainWindow):
     @pyqtSlot(str, dict)
     def on_historical_bar(self, contract_key: str, bar_data: dict):
         """Handle historical bar data"""
+        # Check if this is for offset calculation from historical close
+        if hasattr(self, 'historical_close_data') and self.historical_close_data:
+            # This might be offset calculation data, handle separately
+            if contract_key == 'HISTORICAL_CLOSE_SPX' or contract_key == 'HISTORICAL_CLOSE_ES':
+                req_id = self.app_state.get('historical_close_spx_req_id') if 'SPX' in contract_key else self.app_state.get('historical_close_es_req_id')
+                if req_id is not None:
+                    self.on_historical_close_data_received(req_id, bar_data)
+                return
+        
         if contract_key not in self.historical_data:
             self.historical_data[contract_key] = []
         
         self.historical_data[contract_key].append(bar_data)
         
         # Update charts based on contract type
-        if contract_key.startswith("UNDERLYING_"):
+        if contract_key.startswith("UNDERLYING_") or contract_key == "ES_FUTURES_CONFIRM":
             self.update_underlying_chart_data(contract_key, bar_data)
         elif contract_key.startswith("CHART_"):
             self.update_option_chart_data(contract_key, bar_data)
@@ -3846,12 +4022,20 @@ class MainWindow(QMainWindow):
     @pyqtSlot(str)
     def on_historical_complete(self, contract_key: str):
         """Handle historical data complete"""
+        # Check if this is for offset calculation from historical close
+        if hasattr(self, 'historical_close_data') and self.historical_close_data:
+            if contract_key == 'HISTORICAL_CLOSE_SPX' or contract_key == 'HISTORICAL_CLOSE_ES':
+                req_id = self.app_state.get('historical_close_spx_req_id') if 'SPX' in contract_key else self.app_state.get('historical_close_es_req_id')
+                if req_id is not None:
+                    self.on_historical_close_data_complete(req_id)
+                return
+        
         if contract_key in self.historical_data:
             bars = self.historical_data[contract_key]
             self.log_message(f"Historical data complete for {contract_key}: {len(bars)} bars", "SUCCESS")
             
             # Update appropriate charts with complete data
-            if contract_key.startswith("UNDERLYING_"):
+            if contract_key.startswith("UNDERLYING_") or contract_key == "ES_FUTURES_CONFIRM":
                 self.update_underlying_charts_complete(contract_key)
             elif contract_key.startswith("CHART_"):
                 self.update_option_charts_complete(contract_key)
@@ -3915,8 +4099,16 @@ class MainWindow(QMainWindow):
                 # Keep only last 200 bars for trade chart
                 if len(self.chart_data['underlying_trade']) > 200:
                     self.chart_data['underlying_trade'] = self.chart_data['underlying_trade'][-200:]
+            elif contract_key == "ES_FUTURES_CONFIRM":
+                # This is ES futures data for the confirmation chart
+                if 'es_futures' not in self.chart_data:
+                    self.chart_data['es_futures'] = []
+                self.chart_data['es_futures'].append(chart_bar)
+                # Keep only last 400 bars for confirmation chart
+                if len(self.chart_data['es_futures']) > 400:
+                    self.chart_data['es_futures'] = self.chart_data['es_futures'][-400:]
             else:
-                # This is for the confirmation chart
+                # This is for the confirmation chart (legacy underlying data)
                 self.chart_data['underlying'].append(chart_bar)
                 # Keep only last 400 bars for confirmation chart
                 if len(self.chart_data['underlying']) > 400:
@@ -4014,6 +4206,9 @@ class MainWindow(QMainWindow):
                 if "TRADE" in contract_key:
                     # Update trade chart with ALL data - throttled for performance
                     self.trade_chart_widget.update_chart_throttled(chart_bars)
+                elif contract_key == "ES_FUTURES_CONFIRM":
+                    # Update confirmation chart with ES futures data - throttled for performance
+                    self.confirm_chart_widget.update_chart_throttled(chart_bars, is_es_futures=True)
                 else:
                     # Update confirmation chart with ALL data - throttled for performance
                     self.confirm_chart_widget.update_chart_throttled(chart_bars)
@@ -4283,12 +4478,6 @@ class MainWindow(QMainWindow):
             self.log_message("Cannot request option chain - not connected", "WARNING")
             return
         
-        # Use ES price for strike calculations (trades 23/6 - always available)
-        if self.app_state['es_price'] == 0:
-            self.log_message("Waiting for ES futures price...", "INFO")
-            QTimer.singleShot(2000, self.request_option_chain)
-            return
-        
         # Cancel existing option chain subscriptions to avoid duplicate ticker ID errors
         if self.app_state.get('active_option_req_ids'):
             self.log_message(f"Canceling {len(self.app_state['active_option_req_ids'])} existing subscriptions...", "INFO")
@@ -4302,26 +4491,33 @@ class MainWindow(QMainWindow):
             self.app_state['market_data_map'] = {k: v for k, v in self.app_state['market_data_map'].items() 
                                                   if not (isinstance(k, int) and 100 <= k <= 999)}
         
-        # Use ES futures price for strike calculations (available 23 hours/day)
-        es_price = self.app_state['es_price']
-        if es_price == 0:
-            self.log_message("Waiting for ES futures price...", "INFO")
-            QTimer.singleShot(2000, self.request_option_chain)
-            return
+        # PRIORITY 1: Use actual underlying index price (XSP or SPX)
+        # This is the CORRECT price for ATM strike calculation as it matches TWS
+        underlying_price = self.app_state.get('underlying_price', 0)
         
-        # Get ES price adjusted for cash offset
-        adjusted_es_price = self.get_adjusted_es_price()
-        if adjusted_es_price == 0:
-            # Fallback to raw ES if adjustment fails
-            adjusted_es_price = es_price / 10.0 if self.instrument['underlying_symbol'] == 'XSP' else es_price
-        
-        reference_price = adjusted_es_price
-        
-        # Log the adjustment being applied
-        if self.instrument['underlying_symbol'] == 'XSP':
-            logger.info(f"Using adjusted ES price ${reference_price:.2f} for XSP (ES: {es_price:.2f}, offset: {self.es_to_cash_offset:+.2f})")
+        if underlying_price > 0:
+            reference_price = underlying_price
+            logger.info(f"Using actual {self.instrument['underlying_symbol']} index price ${reference_price:.2f} for ATM calculation")
         else:
-            logger.info(f"Using adjusted ES price ${reference_price:.2f} for SPX (ES: {es_price:.2f}, offset: {self.es_to_cash_offset:+.2f})")
+            # FALLBACK: Use ES futures adjusted for cash offset (after-hours only)
+            # WARNING: This gives approximate ATM and may not match TWS exactly during after-hours
+            es_price = self.app_state['es_price']
+            if es_price == 0:
+                self.log_message("Waiting for price data (XSP index or ES futures)...", "INFO")
+                QTimer.singleShot(2000, self.request_option_chain)
+                return
+            
+            # Get ES price adjusted for cash offset
+            adjusted_es_price = self.get_adjusted_es_price()
+            if adjusted_es_price == 0:
+                # Fallback to raw ES if adjustment fails
+                adjusted_es_price = es_price / 10.0 if self.instrument['underlying_symbol'] == 'XSP' else es_price
+            
+            reference_price = adjusted_es_price
+            
+            # Log the adjustment being applied
+            logger.warning(f"Using FALLBACK ES-derived price ${reference_price:.2f} (ES: {es_price:.2f}, offset: {self.es_to_cash_offset:+.2f})")
+            logger.warning(f"ATM strike may not match TWS - {self.instrument['underlying_symbol']} index not available")
         
         strike_increment = self.instrument['strike_increment']
         center_strike = round(reference_price / strike_increment) * strike_increment
@@ -4405,7 +4601,7 @@ class MainWindow(QMainWindow):
             strike_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             strike_item.setFont(QFont("Arial", 10, QFont.Weight.Bold))
             
-            # Dynamic strike background based on ATM position (using adjusted ES price)
+            # Initial strike background based on price (will be updated by delta-based ATM)
             # Strikes above reference price = lighter blue (#2a4a6a)
             # Strikes below reference price = darker blue (#1a2a3a)
             if strike >= reference_price:
@@ -4418,6 +4614,9 @@ class MainWindow(QMainWindow):
         # Store active request IDs for future cleanup
         self.app_state['active_option_req_ids'] = new_req_ids
         self.log_message(f"Subscribed to {len(strikes) * 2} option contracts", "SUCCESS")
+        
+        # Clear recentering flag now that chain is loaded
+        self.is_recentering_chain = False
     
     def update_option_chain_cell(self, contract_key: str):
         """Update a single option chain row with market data"""
@@ -4516,6 +4715,105 @@ class MainWindow(QMainWindow):
         
         except Exception as e:
             logger.debug(f"Error updating option chain cell for {contract_key}: {e}")
+    
+    def update_strike_backgrounds_by_delta(self):
+        """
+        Update strike row backgrounds based on delta-based ATM identification.
+        
+        This method:
+        1. Finds the true ATM strike using 0.5 delta
+        2. Highlights the ATM strike row with gold/yellow
+        3. Colors strikes above ATM lighter blue
+        4. Colors strikes below ATM darker blue
+        5. Updates the ATM strike label in the header
+        6. Checks for drift and auto-recenters if needed
+        """
+        atm_strike = self.find_atm_strike_by_delta()
+        
+        if atm_strike == 0:
+            return  # No ATM found yet, keep initial coloring
+        
+        # Update ATM strike label in header
+        self.atm_strike_label.setText(f"ATM: {atm_strike:.0f}")
+        self.atm_strike_label.setStyleSheet("font-size: 12pt; font-weight: bold; color: #FFD700;")
+        
+        # Check for drift and auto-recenter if needed
+        self.check_chain_drift_and_recenter(atm_strike)
+        
+        # Update all strike backgrounds based on delta-identified ATM
+        for row in range(self.option_table.rowCount()):
+            strike_item = self.option_table.item(row, 10)  # Strike column
+            if not strike_item:
+                continue
+            
+            try:
+                strike = float(strike_item.text())
+                
+                if abs(strike - atm_strike) < 0.01:  # ATM strike (within rounding)
+                    # Highlight ATM strike with gold/yellow
+                    strike_item.setBackground(QColor("#FFD700"))  # Gold
+                    strike_item.setForeground(QColor("#000000"))  # Black text
+                elif strike > atm_strike:
+                    # Above ATM: lighter blue
+                    strike_item.setBackground(QColor("#2a4a6a"))
+                    strike_item.setForeground(QColor("#ffffff"))  # White text
+                else:
+                    # Below ATM: darker blue
+                    strike_item.setBackground(QColor("#1a2a3a"))
+                    strike_item.setForeground(QColor("#ffffff"))  # White text
+            
+            except (ValueError, AttributeError):
+                continue
+    
+    def check_chain_drift_and_recenter(self, atm_strike: float):
+        """
+        Check if the delta-based ATM strike has drifted from the chain center.
+        Auto-recenter the chain if drift exceeds the configured threshold.
+        
+        Args:
+            atm_strike: The current ATM strike identified by 0.5 delta
+        """
+        if self.last_chain_center_strike == 0:
+            return  # First time setting ATM, no drift yet
+        
+        if self.connection_state != ConnectionState.CONNECTED:
+            return  # Can't recenter if not connected
+        
+        # Prevent recentering loops
+        if self.is_recentering_chain:
+            return  # Already recentering, don't trigger again
+        
+        # Throttle recentering - don't recenter more than once per 10 seconds
+        import time
+        current_time = time.time()
+        if current_time - self.last_recenter_time < 10:
+            return  # Too soon since last recenter
+        
+        # Calculate drift in number of strikes
+        strike_increment = self.instrument['strike_increment']
+        drift_strikes = abs(atm_strike - self.last_chain_center_strike) / strike_increment
+        
+        # Check if drift exceeds threshold
+        if drift_strikes >= self.chain_drift_threshold:
+            logger.info(
+                f"🎯 ATM drifted {drift_strikes:.0f} strikes from center "
+                f"(ATM: {atm_strike:.0f}, Center: {self.last_chain_center_strike:.0f}, "
+                f"Threshold: {self.chain_drift_threshold} strikes) - AUTO-RECENTERING"
+            )
+            
+            # Set flag and timestamp to prevent loops
+            self.is_recentering_chain = True
+            self.last_recenter_time = current_time
+            
+            # Request new chain centered on current ATM
+            self.request_option_chain()
+        else:
+            # Log debug info about current drift
+            logger.debug(
+                f"ATM drift: {drift_strikes:.1f} strikes "
+                f"(ATM: {atm_strike:.0f}, Center: {self.last_chain_center_strike:.0f}, "
+                f"Threshold: {self.chain_drift_threshold})"
+            )
     
     def on_option_cell_clicked(self, row: int, col: int):
         """Handle option chain cell click - with Ctrl+click for quick trading"""
@@ -5186,7 +5484,7 @@ class MainWindow(QMainWindow):
                 "2 D",  # Duration
                 "5 mins",  # Bar size
                 "TRADES",  # What to show
-                1,  # Use RTH (regular trading hours)
+                0,  # Include after-hours data
                 1,  # Format date
                 True,  # Keep up to date - enables real-time bar updates via historicalDataUpdate
                 []
@@ -6062,6 +6360,161 @@ class MainWindow(QMainWindow):
                     )
                     self.request_option_chain()
     
+    def calculate_offset_from_historical_close(self):
+        """
+        Calculate ES-to-cash offset from historical 3:00 PM CT close prices.
+        Used when app starts after market hours and no offset was saved from today's session.
+        Fetches 5-minute historical data for both SPX and ES, compares their 3pm closes.
+        """
+        if self.connection_state != ConnectionState.CONNECTED:
+            logger.warning("Cannot calculate historical offset - not connected")
+            return False
+        
+        import pytz
+        ct_tz = pytz.timezone('US/Central')
+        now_ct = datetime.now(ct_tz)
+        
+        # Determine today's date in CT
+        today_ct = now_ct.date()
+        
+        # Define 3:00 PM CT close time for today
+        close_time = datetime.combine(today_ct, datetime.min.time().replace(hour=15, minute=0))
+        close_time_ct = ct_tz.localize(close_time)
+        
+        logger.info(f"Fetching historical data to calculate offset from {close_time_ct.strftime('%Y-%m-%d 3:00 PM CT')} close")
+        self.log_message("Calculating offset from historical 3pm close...", "INFO")
+        
+        # Create temporary storage for historical close data
+        self.historical_close_data = {
+            'spx_close': None,
+            'es_close': None,
+            'requests_pending': 2  # Track both requests
+        }
+        
+        try:
+            # Request 1: SPX 5-minute bars for today up to 3:05 PM
+            spx_contract = Contract()
+            spx_contract.symbol = self.instrument['underlying_symbol']
+            spx_contract.secType = self.instrument['underlying_type']
+            spx_contract.currency = "USD"
+            spx_contract.exchange = self.instrument['underlying_exchange']
+            
+            spx_req_id = 9001  # Unique ID for historical close request
+            self.app_state['historical_close_spx_req_id'] = spx_req_id
+            
+            # Request 1 day of 5-minute bars ending at current time
+            self.ibkr_client.reqHistoricalData(
+                spx_req_id,
+                spx_contract,
+                "",  # End time (empty = now)
+                "1 D",  # Duration: 1 day
+                "5 mins",  # Bar size
+                "TRADES",
+                1,  # Use RTH (regular trading hours only)
+                1,  # Format date as string
+                False,  # Don't keep up to date
+                []
+            )
+            logger.info(f"Requested historical SPX data for offset calculation (reqId={spx_req_id})")
+            
+            # Request 2: ES 5-minute bars for today up to 3:05 PM
+            es_contract = Contract()
+            es_contract.symbol = "ES"
+            es_contract.secType = "FUT"
+            es_contract.currency = "USD"
+            es_contract.exchange = "CME"
+            es_contract.lastTradeDateOrContractMonth = self.get_es_front_month()
+            
+            es_req_id = 9002  # Unique ID for historical close request
+            self.app_state['historical_close_es_req_id'] = es_req_id
+            
+            self.ibkr_client.reqHistoricalData(
+                es_req_id,
+                es_contract,
+                "",  # End time (empty = now)
+                "1 D",  # Duration: 1 day
+                "5 mins",  # Bar size
+                "TRADES",
+                1,  # Use RTH
+                1,  # Format date as string
+                False,  # Don't keep up to date
+                []
+            )
+            logger.info(f"Requested historical ES data for offset calculation (reqId={es_req_id})")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error requesting historical close data: {e}", exc_info=True)
+            self.log_message(f"Error fetching historical data: {e}", "ERROR")
+            return False
+    
+    def on_historical_close_data_received(self, req_id: int, bar_data: dict):
+        """Handle historical bar data for offset calculation from 3pm close"""
+        # Safety check: ensure historical_close_data exists
+        if not hasattr(self, 'historical_close_data') or self.historical_close_data is None:
+            return
+            
+        if req_id == self.app_state.get('historical_close_spx_req_id'):
+            # SPX bar received - look for 3:00 PM bar
+            bar_time_str = str(bar_data['date']).strip()
+            if '15:00' in bar_time_str or '1500' in bar_time_str:  # 3:00 PM bar
+                self.historical_close_data['spx_close'] = bar_data['close']
+                logger.info(f"SPX 3pm close: {bar_data['close']:.2f}")
+                
+        elif req_id == self.app_state.get('historical_close_es_req_id'):
+            # ES bar received - look for 3:00 PM bar
+            bar_time_str = str(bar_data['date']).strip()
+            if '15:00' in bar_time_str or '1500' in bar_time_str:  # 3:00 PM bar
+                self.historical_close_data['es_close'] = bar_data['close']
+                logger.info(f"ES 3pm close: {bar_data['close']:.2f}")
+    
+    def on_historical_close_data_complete(self, req_id: int):
+        """Called when historical data request completes"""
+        # Safety check: ensure historical_close_data exists
+        if not hasattr(self, 'historical_close_data') or self.historical_close_data is None:
+            return
+            
+        if req_id in [self.app_state.get('historical_close_spx_req_id'), self.app_state.get('historical_close_es_req_id')]:
+            # Decrement pending requests
+            self.historical_close_data['requests_pending'] -= 1
+            
+            # If both requests complete, calculate offset
+            if self.historical_close_data['requests_pending'] == 0:
+                underlying_close = self.historical_close_data.get('spx_close')  # Actually could be XSP
+                es_close = self.historical_close_data.get('es_close')
+                
+                if underlying_close and es_close:
+                    # Calculate offset based on instrument type
+                    # For XSP, we need to scale ES to match XSP scale (ES/10)
+                    if self.instrument['underlying_symbol'] == 'XSP':
+                        # ES futures vs XSP cash: ES/10 - XSP
+                        scaled_es = es_close / 10.0
+                        offset = scaled_es - underlying_close
+                        logger.info(f"✓ Calculated offset from historical 3pm close: {offset:+.2f} (ES: {es_close:.2f} -> {scaled_es:.2f}, XSP: {underlying_close:.2f})")
+                    else:
+                        # ES futures vs SPX cash: ES - SPX
+                        offset = es_close - underlying_close
+                        logger.info(f"✓ Calculated offset from historical 3pm close: {offset:+.2f} (ES: {es_close:.2f}, SPX: {underlying_close:.2f})")
+                    
+                    self.es_to_cash_offset = offset
+                    self.last_offset_update_time = time.time()
+                    
+                    self.log_message(f"Offset calculated from 3pm close: {offset:+.2f}", "SUCCESS")
+                    self.update_offset_display()
+                    
+                    # Save to settings
+                    self.save_settings()
+                else:
+                    symbol = self.instrument['underlying_symbol']
+                    logger.warning(f"Could not find 3pm close bars ({symbol}: {underlying_close}, ES: {es_close})")
+                    self.log_message("Could not calculate offset - missing 3pm close data", "WARNING")
+                
+                # Cleanup
+                self.historical_close_data = None
+                self.app_state.pop('historical_close_spx_req_id', None)
+                self.app_state.pop('historical_close_es_req_id', None)
+    
     def check_offset_monitoring(self):
         """
         Check market hours and update ES offset monitoring status.
@@ -6249,16 +6702,6 @@ class MainWindow(QMainWindow):
                 'trade_ema_length': self.trade_ema_length,
                 'trade_z_period': self.trade_z_period,
                 'trade_z_threshold': self.trade_z_threshold,
-                
-                # Chart Interval/Days Settings
-                'call_chart_interval': self.call_chart_widget.interval_combo.currentText(),
-                'call_chart_days': self.call_chart_widget.days_combo.currentText(),
-                'put_chart_interval': self.put_chart_widget.interval_combo.currentText(),
-                'put_chart_days': self.put_chart_widget.days_combo.currentText(),
-                'confirm_chart_interval': self.confirm_chart_widget.interval_combo.currentText(),
-                'confirm_chart_days': self.confirm_chart_widget.days_combo.currentText(),
-                'trade_chart_interval': self.trade_chart_widget.interval_combo.currentText(),
-                'trade_chart_days': self.trade_chart_widget.days_combo.currentText(),
             }
             
             Path('settings.json').write_text(json.dumps(settings, indent=2))
@@ -6352,25 +6795,8 @@ class MainWindow(QMainWindow):
                 self.trade_z_period_spin.setValue(self.trade_z_period)
                 self.trade_z_threshold_spin.setValue(self.trade_z_threshold)
                 
-                # Restore Chart Interval/Days Settings
-                call_interval = settings.get('call_chart_interval', '15 secs')
-                call_days = settings.get('call_chart_days', '1')
-                put_interval = settings.get('put_chart_interval', '15 secs')
-                put_days = settings.get('put_chart_days', '1')
-                confirm_interval = settings.get('confirm_chart_interval', '15 secs')
-                confirm_days = settings.get('confirm_chart_days', '1')
-                trade_interval = settings.get('trade_chart_interval', '15 secs')
-                trade_days = settings.get('trade_chart_days', '1')
-                
-                # Set combo box values (this will trigger chart reload via signals)
-                self.call_chart_widget.interval_combo.setCurrentText(call_interval)
-                self.call_chart_widget.days_combo.setCurrentText(call_days)
-                self.put_chart_widget.interval_combo.setCurrentText(put_interval)
-                self.put_chart_widget.days_combo.setCurrentText(put_days)
-                self.confirm_chart_widget.interval_combo.setCurrentText(confirm_interval)
-                self.confirm_chart_widget.days_combo.setCurrentText(confirm_days)
-                self.trade_chart_widget.interval_combo.setCurrentText(trade_interval)
-                self.trade_chart_widget.days_combo.setCurrentText(trade_days)
+                # Note: Chart interval/days are NOT restored from settings
+                # All charts default to: 1 min interval, 2 days of data, 12 hours view
                 
                 # Update button states
                 self.update_strategy_button_states()
