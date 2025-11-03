@@ -16,7 +16,7 @@ Technology Stack:
 # ============================================================================
 # Set this to either 'SPX' (full-size S&P 500) or 'XSP' (mini 1/10 size)
 # This controls which instrument the application will trade
-SELECTED_INSTRUMENT = 'SPX'  # Change to 'XSP' for mini-SPX trading
+SELECTED_INSTRUMENT = 'XSP'  # Change to 'XSP' for mini-SPX trading
 # ============================================================================
 
 import sys
@@ -707,10 +707,18 @@ class ProfessionalChart(QWidget):
         self.title = title
         self.border_color = border_color
         self.chart_data = []
+        
+        # Blitting optimization attributes
         self.background = None  # Cached background for blitting
-        self.line_artist = None  # Line object for fast updates
+        self.line_artist = None  # Main line object for fast updates
+        self.price_line_artist = None  # Current price line
+        self.price_text_artist = None  # Current price text
+        self.animated_artists = []  # List of all animated artists
         self.needs_full_redraw = True  # Flag to force full redraw
-        self.last_update_time = 0  # Throttle updates - track last update timestamp
+        self.is_first_draw = True  # Track first draw for initialization
+        
+        # Throttling attributes
+        self.last_update_time = 0  # Track last update timestamp
         self.update_interval = 0.25  # Minimum 250ms between updates (4 FPS) for trading
         self.pending_update = None  # QTimer for pending update
         
@@ -756,12 +764,13 @@ class ProfessionalChart(QWidget):
         """)
         toolbar_layout.addWidget(self.interval_combo)
         
-        # Days selector
+        # Days selector (Note: Always loads 12 hours initially to prevent freezing)
         toolbar_layout.addWidget(QLabel("Days:"))
         self.days_combo = QComboBox()
         self.days_combo.addItems(["1", "2", "3", "5"])
         self.days_combo.setCurrentText("2")
         self.days_combo.setFixedWidth(50)
+        self.days_combo.setToolTip("Display setting only - data loads 12 hours at a time")
         self.days_combo.setStyleSheet(self.interval_combo.styleSheet())
         toolbar_layout.addWidget(self.days_combo)
         
@@ -797,6 +806,12 @@ class ProfessionalChart(QWidget):
         
         # Enable mouse wheel zoom
         self.canvas.mpl_connect('scroll_event', self.on_scroll)
+        
+        # Connect to resize event to invalidate background cache for blitting
+        self.canvas.mpl_connect('resize_event', self.on_resize)
+        
+        # Connect to draw_event to recapture background after navigation toolbar actions
+        self.canvas.mpl_connect('draw_event', self.on_draw)
         
         # Add navigation toolbar for pan/zoom
         self.nav_toolbar = NavigationToolbar(self.canvas, self)
@@ -883,6 +898,40 @@ class ProfessionalChart(QWidget):
         ax.axis('off')
         self.canvas.draw()
     
+    def on_draw(self, event):
+        """Handle draw events - recapture background and redraw animated artists after toolbar operations"""
+        try:
+            # Only handle if we have an axis and animated artists
+            if not hasattr(self, 'ax') or self.ax is None:
+                return
+            if not hasattr(self, 'animated_artists') or len(self.animated_artists) == 0:
+                return
+            if self.is_first_draw:
+                return
+            
+            # After matplotlib does a full draw (from zoom/pan/home), 
+            # the animated artists are NOT drawn, so we need to:
+            # 1. Recapture the clean background (without animated artists)
+            self.background = self.canvas.copy_from_bbox(self.ax.bbox)
+            
+            # 2. Redraw the animated artists on top
+            for artist in self.animated_artists:
+                if artist in self.ax.lines or artist in self.ax.texts or artist in self.ax.artists:
+                    self.ax.draw_artist(artist)
+            
+            # 3. Blit to show them
+            self.canvas.blit(self.ax.bbox)
+        except Exception as e:
+            # Don't let draw callback errors propagate - just log them
+            logger.debug(f"Error in on_draw callback: {e}")
+    
+    def on_resize(self, event):
+        """Handle canvas resize - invalidate background cache for blitting"""
+        # When canvas size changes, background becomes invalid
+        self.background = None
+        # Don't set needs_full_redraw here - let the on_draw callback handle it
+        # This prevents clearing the chart when there's no data to redraw with
+    
     def on_scroll(self, event):
         """Handle mouse wheel scroll for zoom in/out on x-axis"""
         if event.inaxes is None or not hasattr(self, 'ax') or self.ax is None:
@@ -915,6 +964,9 @@ class ProfessionalChart(QWidget):
         
         # Apply new limits
         self.ax.set_xlim(new_left, new_right)
+        
+        # NOTE: Don't force full redraw for zoom - let matplotlib handle it efficiently
+        # The background cache remains valid, only the view changes
         self.canvas.draw_idle()
     
     def update_chart_throttled(self, price_data, contract_description: str = ""):
@@ -945,19 +997,20 @@ class ProfessionalChart(QWidget):
         self.update_chart(price_data, contract_description)
     
     def update_chart(self, price_data, contract_description: str = ""):
-        """Update chart with price data (line chart for mid-price)"""
+        """Update chart with price data (line chart for mid-price) - optimized with blitting"""
         if not price_data or len(price_data) < 2:
             self.draw_empty_chart()
             return
         
         try:
-            # Save current view limits BEFORE clearing figure
-            saved_xlim = None
-            if hasattr(self, 'ax') and self.ax is not None:
-                try:
-                    saved_xlim = self.ax.get_xlim()
-                except:
-                    pass
+            # PERFORMANCE: Limit maximum bars to prevent UI freezing
+            MAX_BARS = 2000  # Reasonable limit for smooth rendering
+            original_len = len(price_data)
+            if original_len > MAX_BARS:
+                # Downsample: keep every Nth bar to reduce to MAX_BARS
+                step = original_len // MAX_BARS
+                price_data = price_data[::step]
+                logger.info(f"Downsampled chart data from {original_len} to {len(price_data)} bars")
             
             # Convert to DataFrame
             df = pd.DataFrame(price_data)
@@ -980,90 +1033,166 @@ class ProfessionalChart(QWidget):
                 self.draw_empty_chart()
                 return
             
-            # Clear figure
-            self.figure.clear()
-            self.ax = self.figure.add_subplot(111)
-            
             # Convert timestamps to matplotlib date numbers for proper spacing
             from matplotlib.dates import date2num
-            x_dates = date2num(df.index)
+            import numpy as np
+            x_dates = np.asarray(date2num(df.index))
+            y_data = np.asarray(df['close'].values)
+            current_price = float(y_data[-1])
             
-            # Plot line chart (mid-price) using date numbers for x-axis
-            self.ax.plot(x_dates, df['close'].values.tolist(), color=self.border_color, 
-                        linewidth=2, alpha=0.9, label='Mid Price')
+            # Determine if we need a full redraw or can use blitting
+            needs_full_redraw = (self.is_first_draw or 
+                                self.ax is None or 
+                                self.line_artist is None or
+                                self.needs_full_redraw)
             
-            # Format x-axis as datetime
-            self.ax.xaxis_date()
-            
-            # Style the chart
-            self.ax.set_facecolor('#0a0a0a')
-            self.ax.grid(True, color='#1a1a1a', linestyle='-', linewidth=0.5, alpha=0.5)
-            self.ax.tick_params(colors='#e0e0e0', labelsize=9)
-            self.ax.set_ylabel('Price', color='#e0e0e0', fontsize=9)
-            self.ax.set_xlabel('Time', color='#e0e0e0', fontsize=9)
-            self.ax.yaxis.tick_right()
-            self.ax.yaxis.set_label_position("right")
-            
-            # Format x-axis with time labels
-            self.ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-            self.ax.xaxis.set_major_locator(mdates.AutoDateLocator())
-            self.ax.tick_params(axis='x', rotation=0, colors='#e0e0e0')
-            
-            # Style spines
-            for spine in self.ax.spines.values():
-                spine.set_color(self.border_color)
-                spine.set_linewidth(1.5)
-            
-            # Set title with contract description
-            current_price = float(df['close'].iloc[-1])
-            title_text = f"{self.title}"
-            if contract_description:
-                title_text += f" - {contract_description}"
-            
-            self.title_label.setText(title_text)
-            
-            # Add current price horizontal line
-            self.ax.axhline(y=current_price, color=self.border_color, 
-                          linestyle='--', linewidth=1, alpha=0.5)
-            
-            # Add current price text label on right y-axis
-            self.ax.text(1.01, current_price, f'${current_price:.2f}', 
-                        transform=self.ax.get_yaxis_transform(),
-                        color=self.border_color, fontsize=10, fontweight='bold',
-                        va='center', ha='left',
-                        bbox=dict(boxstyle='round,pad=0.3', facecolor='#0a0a0a', 
-                                 edgecolor=self.border_color, linewidth=1))
-            
-            # Preserve current zoom/pan state if we saved it, otherwise set default view
-            if saved_xlim is not None:
-                # Restore the user's view from before figure was cleared
-                self.ax.set_xlim(saved_xlim)
-                self.ax.autoscale(enable=False, axis='x')
-            else:
-                # First time drawing - set default view to show last 12 hours (720 bars at 1-min intervals)
-                visible_bars = min(720, len(x_dates))  # 12 hours = 720 minutes
-                if len(x_dates) > visible_bars:
-                    x_range = x_dates[-1] - x_dates[-visible_bars]
-                    padding = x_range * 0.02
-                    self.ax.set_xlim(x_dates[-visible_bars], x_dates[-1] + padding)
+            if needs_full_redraw:
+                # === FULL REDRAW - First time or after significant changes ===
+                
+                # Save current view limits before clearing
+                saved_xlim = None
+                if hasattr(self, 'ax') and self.ax is not None:
+                    try:
+                        saved_xlim = self.ax.get_xlim()
+                    except:
+                        pass
+                
+                # Clear figure
+                self.figure.clear()
+                self.ax = self.figure.add_subplot(111)
+                
+                # Plot ANIMATED line chart (will be updated via blitting)
+                self.line_artist, = self.ax.plot(x_dates, y_data, 
+                                                 color=self.border_color, 
+                                                 linewidth=2, alpha=0.9, 
+                                                 label='Mid Price',
+                                                 animated=True)  # KEY: Enable blitting
+                
+                # Plot ANIMATED current price line
+                self.price_line_artist = self.ax.axhline(y=current_price, 
+                                                        color=self.border_color, 
+                                                        linestyle='--', linewidth=1, 
+                                                        alpha=0.5, animated=True)
+                
+                # Plot ANIMATED price text (will update with price changes)
+                self.price_text_artist = self.ax.text(1.01, current_price, 
+                                                      f'${current_price:.2f}', 
+                                                      transform=self.ax.get_yaxis_transform(),
+                                                      color=self.border_color, fontsize=10, 
+                                                      fontweight='bold',
+                                                      va='center', ha='left',
+                                                      bbox=dict(boxstyle='round,pad=0.3', 
+                                                               facecolor='#0a0a0a', 
+                                                               edgecolor=self.border_color, 
+                                                               linewidth=1),
+                                                      animated=True)
+                
+                # Store all animated artists for blitting
+                self.animated_artists = [self.line_artist, self.price_line_artist, 
+                                        self.price_text_artist]
+                
+                # Format x-axis as datetime
+                self.ax.xaxis_date()
+                
+                # Style the chart (STATIC elements - drawn once)
+                self.ax.set_facecolor('#0a0a0a')
+                self.ax.grid(True, color='#1a1a1a', linestyle='-', linewidth=0.5, alpha=0.5)
+                self.ax.tick_params(colors='#e0e0e0', labelsize=9)
+                self.ax.set_ylabel('Price', color='#e0e0e0', fontsize=9)
+                self.ax.set_xlabel('Time', color='#e0e0e0', fontsize=9)
+                self.ax.yaxis.tick_right()
+                self.ax.yaxis.set_label_position("right")
+                
+                # Format x-axis with time labels
+                self.ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+                self.ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+                self.ax.tick_params(axis='x', rotation=0, colors='#e0e0e0')
+                
+                # Style spines
+                for spine in self.ax.spines.values():
+                    spine.set_color(self.border_color)
+                    spine.set_linewidth(1.5)
+                
+                # Set title
+                title_text = f"{self.title}"
+                if contract_description:
+                    title_text += f" - {contract_description}"
+                self.title_label.setText(title_text)
+                
+                # Preserve zoom/pan or set default view
+                if saved_xlim is not None:
+                    self.ax.set_xlim(saved_xlim)
+                    self.ax.autoscale(enable=False, axis='x')
                 else:
-                    # Show all data if less than 12 hours available
-                    x_range = x_dates[-1] - x_dates[0]
-                    padding = x_range * 0.02
-                    self.ax.set_xlim(x_dates[0], x_dates[-1] + padding)
-                self.ax.autoscale(enable=False, axis='x')
-            
-            # No need to call tight_layout - using constrained_layout in Figure constructor
-            
-            # Redraw canvas - use draw_idle() to avoid blocking UI
-            self.canvas.draw_idle()
-            
-            # Update navigation toolbar to reflect current view
-            if hasattr(self, 'nav_toolbar'):
-                self.nav_toolbar.push_current()
+                    # Default view: last 12 hours (720 bars at 1-min intervals)
+                    visible_bars = min(720, len(x_dates))
+                    if len(x_dates) > visible_bars:
+                        x_range = x_dates[-1] - x_dates[-visible_bars]
+                        padding = x_range * 0.02
+                        self.ax.set_xlim(x_dates[-visible_bars], x_dates[-1] + padding)
+                    else:
+                        x_range = x_dates[-1] - x_dates[0]
+                        padding = x_range * 0.02
+                        self.ax.set_xlim(x_dates[0], x_dates[-1] + padding)
+                    self.ax.autoscale(enable=False, axis='x')
+                
+                # Draw everything (static + animated) to create the background
+                self.canvas.draw()
+                
+                # Cache the background for blitting (excluding animated artists)
+                self.background = self.canvas.copy_from_bbox(self.ax.bbox)
+                
+                # Mark as drawn
+                self.is_first_draw = False
+                self.needs_full_redraw = False
+                
+                # Update navigation toolbar
+                if hasattr(self, 'nav_toolbar'):
+                    self.nav_toolbar.push_current()
+                
+            else:
+                # === FAST UPDATE with BLITTING - Only update animated elements ===
+                
+                if self.background is None:
+                    # Safety: if background was lost, force full redraw
+                    self.needs_full_redraw = True
+                    self.update_chart(price_data, contract_description)
+                    return
+                
+                # Safety check: ensure all artist attributes exist
+                if (self.line_artist is None or self.price_line_artist is None or 
+                    self.price_text_artist is None or self.ax is None):
+                    # Fall back to full redraw if any artist is missing
+                    self.needs_full_redraw = True
+                    self.update_chart(price_data, contract_description)
+                    return
+                
+                # Restore the clean background
+                self.canvas.restore_region(self.background)
+                
+                # Update the line data
+                self.line_artist.set_data(x_dates, y_data)
+                
+                # Update current price line position
+                self.price_line_artist.set_ydata([current_price, current_price])
+                
+                # Update price text position and value
+                self.price_text_artist.set_position((1.01, current_price))
+                self.price_text_artist.set_text(f'${current_price:.2f}')
+                
+                # Redraw only the animated artists
+                for artist in self.animated_artists:
+                    self.ax.draw_artist(artist)
+                
+                # Blit the updated artists onto the canvas
+                self.canvas.blit(self.ax.bbox)
+                
+                # Flush events to update the display
+                self.canvas.flush_events()
             
         except Exception as e:
             logger.error(f"Error updating chart {self.title}: {e}", exc_info=True)
+            self.needs_full_redraw = True  # Force redraw on next update
             self.draw_empty_chart()
 
 
@@ -1078,10 +1207,26 @@ class ProfessionalUnderlyingChart(QWidget):
         self.title = title
         self.border_color = border_color
         self.chart_data = []
+        
+        # Blitting optimization attributes
+        self.background = None
+        self.needs_full_redraw = True
+        self.is_first_draw = True
+        
+        # Throttling attributes
         self.last_update_time = 0  # Throttle updates
         self.update_interval = 0.25  # Minimum 250ms between updates (4 FPS)
         self.pending_update = None  # QTimer for pending update
         self.main_window = main_window  # Reference to main window for offset access
+        
+        # Auto-fetch attributes for loading more historical data
+        self.contract_key = None  # Will be set when data is first loaded
+        self.is_fetching_more_data = False  # Flag to prevent multiple simultaneous requests
+        self.earliest_data_timestamp = None  # Track earliest data point
+        self.backfill_req_id = None  # Track request ID for backfill requests
+        self.backfill_data = []  # Temporary storage for backfill data before prepending
+        self.auto_fetch_timer = None  # Timer for debouncing auto-fetch on scroll
+        self.auto_fetch_delay = 500  # Wait 500ms after last scroll before checking
         
         # Create layout
         layout = QVBoxLayout(self)
@@ -1253,6 +1398,10 @@ class ProfessionalUnderlyingChart(QWidget):
         # Apply new limits (will affect both subplots due to sharex)
         self.price_ax.set_xlim(new_left, new_right)
         self.canvas.draw_idle()
+        
+        # Debounced auto-fetch: Reset timer on each scroll, check after 500ms of no scrolling
+        if event.button == 'down':  # Only when zooming out
+            self.schedule_auto_fetch_check()
     
     def draw_empty_chart(self):
         """Draw empty chart"""
@@ -1267,6 +1416,201 @@ class ProfessionalUnderlyingChart(QWidget):
         ax.set_ylim(0, 1)
         ax.axis('off')
         self.canvas.draw()
+    
+    def schedule_auto_fetch_check(self):
+        """Schedule a check for auto-fetching more data after scroll stops"""
+        # Cancel existing timer if any
+        if self.auto_fetch_timer is not None:
+            self.auto_fetch_timer.stop()
+            self.auto_fetch_timer = None
+        
+        # Create new timer - will fire after 500ms of no scrolling
+        from PyQt6.QtCore import QTimer
+        self.auto_fetch_timer = QTimer()
+        self.auto_fetch_timer.setSingleShot(True)
+        self.auto_fetch_timer.timeout.connect(self.check_and_fetch_more_data)
+        self.auto_fetch_timer.start(self.auto_fetch_delay)
+    
+    def check_and_fetch_more_data(self):
+        """Check if we need more data based on current view and fetch if needed"""
+        if not hasattr(self, 'chart_data') or len(self.chart_data) == 0:
+            return
+        
+        if not hasattr(self, 'price_ax') or self.price_ax is None:
+            return
+        
+        try:
+            from matplotlib.dates import date2num, num2date
+            import pandas as pd
+            
+            # Get current visible range
+            xlim = self.price_ax.get_xlim()
+            visible_start_num = xlim[0]
+            visible_end_num = xlim[1]
+            
+            # Get data range
+            df = pd.DataFrame(self.chart_data)
+            if df.empty or 'time' not in df.columns:
+                return
+            
+            df['time'] = pd.to_datetime(df['time'])
+            earliest_data_num = date2num(df['time'].min())
+            latest_data_num = date2num(df['time'].max())
+            
+            # Check if view extends significantly beyond our data on the left
+            data_range = latest_data_num - earliest_data_num
+            margin = data_range * 0.15  # 15% margin
+            
+            if visible_start_num < (earliest_data_num + margin):
+                logger.info(f"Auto-fetch triggered: visible start {num2date(visible_start_num)} < earliest data {num2date(earliest_data_num)} + margin")
+                self.request_more_historical_data()
+        except Exception as e:
+            logger.error(f"Error checking for auto-fetch: {e}", exc_info=True)
+    
+    def request_more_historical_data(self):
+        """Request more historical data when zooming out past existing data"""
+        if self.is_fetching_more_data or not self.main_window or not self.contract_key:
+            return
+        
+        # Prevent multiple simultaneous requests
+        self.is_fetching_more_data = True
+        
+        try:
+            # Get earliest timestamp from current data
+            if not self.chart_data or len(self.chart_data) == 0:
+                return
+            
+            import pandas as pd
+            from datetime import timedelta
+            from matplotlib.dates import date2num
+            
+            df = pd.DataFrame(self.chart_data)
+            df['time'] = pd.to_datetime(df['time'])
+            earliest_time = df['time'].min()
+            latest_time = df['time'].max()
+            
+            # Calculate how much data we need based on the GAP between visible start and earliest data
+            if hasattr(self, 'price_ax') and self.price_ax is not None:
+                xlim = self.price_ax.get_xlim()
+                # Convert matplotlib date numbers to datetime
+                from matplotlib.dates import num2date
+                visible_start = num2date(xlim[0])
+                visible_end = num2date(xlim[1])
+                earliest_data = num2date(date2num(earliest_time))
+                
+                # Calculate the gap: from visible start to earliest data
+                gap = earliest_data - visible_start
+                
+                # Request 1.5x the gap to have some buffer
+                buffer_multiplier = 1.5
+                total_seconds = gap.total_seconds() * buffer_multiplier
+                
+                # Ensure minimum request size (at least 1 hour of data)
+                min_seconds = 3600
+                total_seconds = max(total_seconds, min_seconds)
+                
+                # Calculate duration using IBAPI valid units: S, D, W, M, Y (no H for hours!)
+                if total_seconds < 86400:  # Less than 1 day
+                    # Use seconds for intraday ranges
+                    duration = f"{int(total_seconds)} S"
+                elif total_seconds < 604800:  # Less than 1 week
+                    # Use days (round up)
+                    days = int(total_seconds / 86400) + 1
+                    duration = f"{days} D"
+                else:
+                    # Use weeks (round up)
+                    weeks = int(total_seconds / 604800) + 1
+                    duration = f"{weeks} W"
+                
+                logger.info(f"Auto-fetch: Gap is {gap.total_seconds()/3600:.1f} hours, requesting {duration}")
+            else:
+                # Fallback: request 1 day
+                duration = "1 D"
+            
+            # Format the end time for the request (request data BEFORE the earliest we have)
+            # IBAPI format: yyyyMMdd-HH:mm:ss (note the dash, not space)
+            end_time_str = earliest_time.strftime("%Y%m%d-%H:%M:%S")
+            
+            # Get current bar size and duration settings
+            interval_text = self.interval_combo.currentText()
+            # Map display text to IBAPI bar size format
+            bar_size_map = {
+                "15 secs": "15 secs",
+                "30 secs": "30 secs",
+                "1 min": "1 min",
+                "5 min": "5 mins",
+                "15 min": "15 mins",
+                "30 min": "30 mins",
+                "1 hour": "1 hour"
+            }
+            bar_size = bar_size_map.get(interval_text, "1 min")  # Default to 1 min if not found
+            
+            # Determine the contract based on contract_key
+            if self.contract_key == "ES_FUTURES_CONFIRM":
+                # ES Futures contract
+                from ibapi.contract import Contract
+                contract = Contract()
+                contract.symbol = "ES"
+                contract.secType = "FUT"
+                contract.exchange = "CME"
+                contract.currency = "USD"
+                # Get front month
+                from datetime import datetime
+                today = datetime.now()
+                month_code = {12: 'Z', 3: 'H', 6: 'M', 9: 'U'}
+                current_month = today.month
+                current_year = today.year % 100
+                # Determine which quarter we're in and get next contract
+                if current_month <= 3:
+                    contract.lastTradeDateOrContractMonth = f"{current_year}03"
+                elif current_month <= 6:
+                    contract.lastTradeDateOrContractMonth = f"{current_year}06"
+                elif current_month <= 9:
+                    contract.lastTradeDateOrContractMonth = f"{current_year}09"
+                else:
+                    contract.lastTradeDateOrContractMonth = f"{current_year}12"
+                    
+            elif self.contract_key.startswith("UNDERLYING_"):
+                # SPX/XSP underlying contract
+                from ibapi.contract import Contract
+                contract = Contract()
+                symbol = self.contract_key.replace("UNDERLYING_", "").split("_")[0]
+                contract.symbol = symbol
+                contract.secType = "IND"
+                contract.exchange = "CBOE"
+                contract.currency = "USD"
+            else:
+                logger.warning(f"Unknown contract_key: {self.contract_key}")
+                self.is_fetching_more_data = False
+                return
+            
+            # Get next request ID
+            req_id = self.main_window.app_state.get('next_order_id', 1)
+            self.main_window.app_state['next_order_id'] = req_id + 1
+            
+            # Track this request and mark it as a backfill
+            self.main_window.app_state['historical_data_requests'][req_id] = self.contract_key
+            self.backfill_req_id = req_id  # Remember this is a backfill request
+            
+            # Request historical data ending at our earliest point
+            self.main_window.ibkr_client.reqHistoricalData(
+                req_id,
+                contract,
+                end_time_str,  # End at our earliest existing data point
+                duration,  # Get 1 more day
+                bar_size,  # Use current chart interval
+                "TRADES",
+                0,  # Include after-hours
+                1,  # Format date
+                False,  # Don't keep up to date for historical backfill
+                []
+            )
+            
+            logger.info(f"Requested more historical data for {self.contract_key} ending at {end_time_str} (req_id={req_id})")
+            
+        except Exception as e:
+            logger.error(f"Error requesting more historical data: {e}", exc_info=True)
+            self.is_fetching_more_data = False
     
     def update_chart_throttled(self, price_data, ema_period=9, z_period=30, z_threshold=1.5, is_es_futures=False):
         """Throttled chart update - limits update frequency to prevent UI freezing"""
@@ -1296,19 +1640,44 @@ class ProfessionalUnderlyingChart(QWidget):
         self.update_chart(price_data, ema_period, z_period, z_threshold, is_es_futures)
     
     def update_chart(self, price_data, ema_period=9, z_period=30, z_threshold=1.5, is_es_futures=False):
-        """Update chart with price data, EMA, and Z-Score. If is_es_futures=True, also plot offset-adjusted line."""
+        """Update chart with price data, EMA, and Z-Score - optimized with downsampling"""
         if not price_data or len(price_data) < max(ema_period, z_period):
             self.draw_empty_chart()
             return
         
         try:
+            # Store the chart data for auto-fetch feature
+            self.chart_data = price_data.copy() if isinstance(price_data, list) else list(price_data)
+            
+            # Set contract_key based on chart title if not already set
+            if self.contract_key is None:
+                if "Confirmation" in self.title:
+                    self.contract_key = "ES_FUTURES_CONFIRM"
+                elif "Trade" in self.title:
+                    # Will be set by main window based on selected underlying
+                    self.contract_key = "UNDERLYING_SPX_TRADE"  # Default
+            
+            # PERFORMANCE: Limit maximum bars to prevent UI freezing
+            MAX_BARS = 2000  # Reasonable limit for smooth candlestick rendering
+            original_len = len(price_data)
+            if original_len > MAX_BARS:
+                # Downsample: keep every Nth bar to reduce to MAX_BARS
+                step = original_len // MAX_BARS
+                price_data = price_data[::step]
+                logger.info(f"Downsampled candlestick chart from {original_len} to {len(price_data)} bars")
+            
             # Save current view limits BEFORE clearing figure
+            # BUT: Don't save xlim if this is a full redraw after backfill
+            # (the xlim date numbers won't match the new data after prepending)
             saved_xlim = None
-            if hasattr(self, 'price_ax') and self.price_ax is not None:
+            if hasattr(self, 'price_ax') and self.price_ax is not None and not self.needs_full_redraw:
                 try:
                     saved_xlim = self.price_ax.get_xlim()
+                    logger.debug(f"Saved xlim: {saved_xlim}")
                 except:
                     pass
+            elif self.needs_full_redraw:
+                logger.debug("Skipping xlim save due to full redraw flag")
             
             # Convert to DataFrame
             df = pd.DataFrame(price_data)
@@ -1349,11 +1718,12 @@ class ProfessionalUnderlyingChart(QWidget):
             self.figure.clear()
             gs = self.figure.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.05)
             
-            # Price chart (top) - manual candlestick rendering with proper datetime x-axis
+            # Price chart (top) - optimized candlestick rendering with LineCollection
             self.price_ax = self.figure.add_subplot(gs[0])
             
             # Convert timestamps to matplotlib date numbers for proper spacing
             from matplotlib.dates import date2num
+            from matplotlib.collections import LineCollection, PatchCollection
             x_dates = date2num(df.index)
             
             # Calculate bar width based on time interval (in days)
@@ -1362,27 +1732,45 @@ class ProfessionalUnderlyingChart(QWidget):
             else:
                 bar_width = 0.0003  # ~30 seconds for single bar
             
-            # Plot candlesticks using datetime x-axis
+            # OPTIMIZED: Use collections instead of individual plots for better performance
+            wick_segments = []  # High-low lines
+            wick_colors = []
+            body_patches = []  # Open-close rectangles
+            body_colors = []
+            
             for i, (timestamp, row) in enumerate(df.iterrows()):
                 x = x_dates[i]
-                color = '#00ff00' if row['close'] >= row['open'] else '#ff0000'
+                is_bullish = row['close'] >= row['open']
+                color = '#00ff00' if is_bullish else '#ff0000'
                 
-                # Draw high-low line (wick)
-                self.price_ax.plot([x, x], [row['low'], row['high']], 
-                                  color=color, linewidth=1, alpha=0.8)
+                # Collect wick data (high-low line)
+                wick_segments.append([(x, row['low']), (x, row['high'])])
+                wick_colors.append(color)
                 
-                # Draw open-close box (body)
+                # Collect body data (open-close rectangle)
                 body_height = abs(row['close'] - row['open'])
                 body_bottom = min(row['open'], row['close'])
                 rect = Rectangle(
                     (x - bar_width/2, body_bottom), 
                     bar_width, 
                     body_height if body_height > 0 else 0.01,
-                    facecolor=color, 
+                    facecolor=color,
                     edgecolor=color,
                     alpha=0.9
                 )
-                self.price_ax.add_patch(rect)
+                body_patches.append(rect)
+                body_colors.append(color)
+            
+            # Draw all wicks as a single LineCollection (much faster than individual plots)
+            if wick_segments:
+                wick_collection = LineCollection(wick_segments, colors=wick_colors, 
+                                                linewidths=1, alpha=0.8)
+                self.price_ax.add_collection(wick_collection)
+            
+            # Draw all bodies as a PatchCollection (faster than individual patches)
+            if body_patches:
+                body_collection = PatchCollection(body_patches, match_original=True)
+                self.price_ax.add_collection(body_collection)
             
             # Add EMA overlay using datetime x-axis
             self.price_ax.plot(x_dates, df['ema'].values.tolist(), color=self.border_color, 
@@ -1392,6 +1780,14 @@ class ProfessionalUnderlyingChart(QWidget):
             if is_es_futures and 'offset_adjusted' in df.columns:
                 self.price_ax.plot(x_dates, df['offset_adjusted'].values.tolist(), color='#FFFF00', 
                                  linewidth=1.5, label='Offset', alpha=0.8)
+            
+            # Set axis limits to include all data
+            if len(x_dates) > 0:
+                self.price_ax.set_xlim(x_dates[0] - bar_width, x_dates[-1] + bar_width)
+                y_min = df[['low']].min().min()
+                y_max = df[['high']].max().max()
+                y_range = y_max - y_min
+                self.price_ax.set_ylim(y_min - y_range * 0.05, y_max + y_range * 0.05)
             
             # Style price chart
             self.price_ax.set_facecolor('#0a0a0a')
@@ -1488,6 +1884,11 @@ class ProfessionalUnderlyingChart(QWidget):
             # No need to call tight_layout - using constrained_layout in Figure constructor
             # Use draw_idle() to avoid blocking UI thread
             self.canvas.draw_idle()
+            
+            # Reset the full redraw flag after completing the redraw
+            if self.needs_full_redraw:
+                self.needs_full_redraw = False
+                logger.debug("Reset needs_full_redraw flag after completing full redraw")
             
             # Update navigation toolbar to reflect current view
             if hasattr(self, 'nav_toolbar'):
@@ -1783,8 +2184,26 @@ class MainWindow(QMainWindow):
         self.status_bar.addWidget(self.connect_btn)
         
         self.pnl_label = QLabel("Total P&L: $0.00")
-        self.pnl_label.setStyleSheet("font-weight: bold;")
+        self.pnl_label.setStyleSheet("font-weight: bold; padding: 2px 12px;")
         self.status_bar.addPermanentWidget(self.pnl_label)
+        
+        # Add spacer
+        spacer1 = QLabel("  |  ")
+        spacer1.setStyleSheet("color: #666666;")
+        self.status_bar.addPermanentWidget(spacer1)
+        
+        self.cost_basis_label = QLabel("Total Cost Basis: $0.00")
+        self.cost_basis_label.setStyleSheet("font-weight: bold; color: #aaaaaa; padding: 2px 12px;")
+        self.status_bar.addPermanentWidget(self.cost_basis_label)
+        
+        # Add spacer
+        spacer2 = QLabel("  |  ")
+        spacer2.setStyleSheet("color: #666666;")
+        self.status_bar.addPermanentWidget(spacer2)
+        
+        self.mkt_value_label = QLabel("Total Mkt Value: $0.00")
+        self.mkt_value_label.setStyleSheet("font-weight: bold; color: #aaaaaa; padding: 2px 12px;")
+        self.status_bar.addPermanentWidget(self.mkt_value_label)
     
     def create_option_chart(self, title: str, border_color: str):
         """Create a single option chart widget"""
@@ -2277,9 +2696,11 @@ class MainWindow(QMainWindow):
             }
             bar_size = interval_map.get(interval_text, "1 min")
             
-            # Calculate duration based on days
-            days = int(days_text)
-            duration = f"{days} D"
+            # SMART LOADING: Only fetch 12 hours of data initially (what's visible)
+            # This prevents app freezing with small intervals (15sec, 30sec) over multiple days
+            # User can zoom/pan and we'll fetch more data on-demand if needed
+            hours_needed = 12  # Always fetch 12 hours initially (visible amount)
+            duration = f"{hours_needed * 3600} S"  # Duration in seconds
             
             # Create contract - ES futures for confirmation chart, underlying for trade chart
             from ibapi.contract import Contract
@@ -2333,8 +2754,8 @@ class MainWindow(QMainWindow):
             )
             
             chart_name = "Trade" if is_trade_chart else "Confirmation"
-            logger.info(f"Reloading {chart_name} chart with {interval_text} bars, {days} days")
-            self.log_message(f"Reloading {chart_name} chart: {interval_text}, {days} days", "INFO")
+            logger.info(f"Reloading {chart_name} chart with {interval_text} bars, 12 hours of data")
+            self.log_message(f"Reloading {chart_name} chart: {interval_text}, 12 hours", "INFO")
             
         except Exception as e:
             logger.error(f"Error reloading underlying chart: {e}")
@@ -2369,9 +2790,10 @@ class MainWindow(QMainWindow):
             }
             bar_size = interval_map.get(interval_text, "1 min")
             
-            # Calculate duration based on days
-            days = int(days_text)
-            duration = f"{days} D"
+            # SMART LOADING: Only fetch 12 hours of data initially (what's visible)
+            # This prevents app freezing with small intervals (15sec, 30sec) over multiple days
+            hours_needed = 12  # Always fetch 12 hours initially (visible amount)
+            duration = f"{hours_needed * 3600} S"  # Duration in seconds
             
             # Get the contract key for the current option
             contract_key = getattr(self, contract_attr)
@@ -2432,8 +2854,8 @@ class MainWindow(QMainWindow):
             )
             
             chart_name = "Call" if is_call else "Put"
-            logger.info(f"Reloading {chart_name} chart with {interval_text} bars, {days} days")
-            self.log_message(f"Reloading {chart_name} chart: {interval_text}, {days} days", "INFO")
+            logger.info(f"Reloading {chart_name} chart with {interval_text} bars, 12 hours of data")
+            self.log_message(f"Reloading {chart_name} chart: {interval_text}, 12 hours", "INFO")
             
         except Exception as e:
             logger.error(f"Error reloading option chart: {e}")
@@ -2818,9 +3240,9 @@ class MainWindow(QMainWindow):
         pos_layout = QVBoxLayout(positions_group)
         
         self.positions_table = QTableWidget()
-        self.positions_table.setColumnCount(9)
+        self.positions_table.setColumnCount(11)
         self.positions_table.setHorizontalHeaderLabels([
-            "Contract", "Qty", "Entry", "Current", "P&L", "P&L %", "EntryTime", "TimeSpan", "Action"
+            "Contract", "Qty", "Entry", "Current", "P&L", "P&L %", "$ Cost Basis", "$ Mkt Value", "EntryTime", "TimeSpan", "Action"
         ])
         self.positions_table.verticalHeader().setVisible(False)  # type: ignore[union-attr]
         self.positions_table.setMaximumHeight(339)  # Increased by 3x (was 113)
@@ -4008,16 +4430,35 @@ class MainWindow(QMainWindow):
                     self.on_historical_close_data_received(req_id, bar_data)
                 return
         
-        if contract_key not in self.historical_data:
-            self.historical_data[contract_key] = []
+        # Check if this is a backfill request for a chart
+        is_backfill = False
+        if contract_key == "ES_FUTURES_CONFIRM" and hasattr(self, 'confirm_chart_widget'):
+            if self.confirm_chart_widget.backfill_req_id is not None:
+                # Find the req_id for this bar
+                for req_id, key in self.app_state.get('historical_data_requests', {}).items():
+                    if key == contract_key and req_id == self.confirm_chart_widget.backfill_req_id:
+                        is_backfill = True
+                        self.confirm_chart_widget.backfill_data.append(bar_data)
+                        return  # Don't append to main data yet
+        elif contract_key.startswith("UNDERLYING_") and hasattr(self, 'trade_chart_widget'):
+            if self.trade_chart_widget.backfill_req_id is not None:
+                for req_id, key in self.app_state.get('historical_data_requests', {}).items():
+                    if key == contract_key and req_id == self.trade_chart_widget.backfill_req_id:
+                        is_backfill = True
+                        self.trade_chart_widget.backfill_data.append(bar_data)
+                        return  # Don't append to main data yet
         
-        self.historical_data[contract_key].append(bar_data)
-        
-        # Update charts based on contract type
-        if contract_key.startswith("UNDERLYING_") or contract_key == "ES_FUTURES_CONFIRM":
-            self.update_underlying_chart_data(contract_key, bar_data)
-        elif contract_key.startswith("CHART_"):
-            self.update_option_chart_data(contract_key, bar_data)
+        if not is_backfill:
+            if contract_key not in self.historical_data:
+                self.historical_data[contract_key] = []
+            
+            self.historical_data[contract_key].append(bar_data)
+            
+            # Update charts based on contract type
+            if contract_key.startswith("UNDERLYING_") or contract_key == "ES_FUTURES_CONFIRM":
+                self.update_underlying_chart_data(contract_key, bar_data)
+            elif contract_key.startswith("CHART_"):
+                self.update_option_chart_data(contract_key, bar_data)
     
     @pyqtSlot(str)
     def on_historical_complete(self, contract_key: str):
@@ -4028,6 +4469,45 @@ class MainWindow(QMainWindow):
                 req_id = self.app_state.get('historical_close_spx_req_id') if 'SPX' in contract_key else self.app_state.get('historical_close_es_req_id')
                 if req_id is not None:
                     self.on_historical_close_data_complete(req_id)
+                return
+        
+        # Check if this is a backfill completion
+        is_backfill = False
+        if contract_key == "ES_FUTURES_CONFIRM" and hasattr(self, 'confirm_chart_widget'):
+            if self.confirm_chart_widget.backfill_req_id is not None and len(self.confirm_chart_widget.backfill_data) > 0:
+                # Prepend backfill data to existing data
+                if contract_key not in self.historical_data:
+                    self.historical_data[contract_key] = []
+                self.historical_data[contract_key] = self.confirm_chart_widget.backfill_data + self.historical_data[contract_key]
+                logger.info(f"Prepended {len(self.confirm_chart_widget.backfill_data)} backfill bars to {contract_key}")
+                logger.info(f"Total bars after prepend: {len(self.historical_data[contract_key])}")
+                # Clear backfill state
+                self.confirm_chart_widget.backfill_data = []
+                self.confirm_chart_widget.backfill_req_id = None
+                self.confirm_chart_widget.is_fetching_more_data = False
+                # Force full redraw of chart
+                self.confirm_chart_widget.needs_full_redraw = True
+                is_backfill = True
+                # Force chart refresh with new data immediately (not throttled)
+                self.update_underlying_charts_complete(contract_key, immediate=True)
+                return
+        elif contract_key.startswith("UNDERLYING_") and hasattr(self, 'trade_chart_widget'):
+            if self.trade_chart_widget.backfill_req_id is not None and len(self.trade_chart_widget.backfill_data) > 0:
+                # Prepend backfill data to existing data
+                if contract_key not in self.historical_data:
+                    self.historical_data[contract_key] = []
+                self.historical_data[contract_key] = self.trade_chart_widget.backfill_data + self.historical_data[contract_key]
+                logger.info(f"Prepended {len(self.trade_chart_widget.backfill_data)} backfill bars to {contract_key}")
+                logger.info(f"Total bars after prepend: {len(self.historical_data[contract_key])}")
+                # Clear backfill state
+                self.trade_chart_widget.backfill_data = []
+                self.trade_chart_widget.backfill_req_id = None
+                self.trade_chart_widget.is_fetching_more_data = False
+                # Force full redraw of chart
+                self.trade_chart_widget.needs_full_redraw = True
+                is_backfill = True
+                # Force chart refresh with new data immediately (not throttled)
+                self.update_underlying_charts_complete(contract_key, immediate=True)
                 return
         
         if contract_key in self.historical_data:
@@ -4185,8 +4665,13 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.error(f"Error updating option chart data: {e}")
     
-    def update_underlying_charts_complete(self, contract_key: str):
-        """Update underlying charts when historical data is complete"""
+    def update_underlying_charts_complete(self, contract_key: str, immediate=False):
+        """Update underlying charts when historical data is complete
+        
+        Args:
+            contract_key: The contract key for the data
+            immediate: If True, bypass throttling and update immediately (used for backfill)
+        """
         try:
             # Use ALL historical data, not the truncated chart_data
             if contract_key in self.historical_data and self.historical_data[contract_key]:
@@ -4204,14 +4689,23 @@ class MainWindow(QMainWindow):
                     })
                 
                 if "TRADE" in contract_key:
-                    # Update trade chart with ALL data - throttled for performance
-                    self.trade_chart_widget.update_chart_throttled(chart_bars)
+                    # Update trade chart with ALL data
+                    if immediate:
+                        self.trade_chart_widget.update_chart(chart_bars)
+                    else:
+                        self.trade_chart_widget.update_chart_throttled(chart_bars)
                 elif contract_key == "ES_FUTURES_CONFIRM":
-                    # Update confirmation chart with ES futures data - throttled for performance
-                    self.confirm_chart_widget.update_chart_throttled(chart_bars, is_es_futures=True)
+                    # Update confirmation chart with ES futures data
+                    if immediate:
+                        self.confirm_chart_widget.update_chart(chart_bars, is_es_futures=True)
+                    else:
+                        self.confirm_chart_widget.update_chart_throttled(chart_bars, is_es_futures=True)
                 else:
-                    # Update confirmation chart with ALL data - throttled for performance
-                    self.confirm_chart_widget.update_chart_throttled(chart_bars)
+                    # Update confirmation chart with ALL data
+                    if immediate:
+                        self.confirm_chart_widget.update_chart(chart_bars)
+                    else:
+                        self.confirm_chart_widget.update_chart_throttled(chart_bars)
                     
         except Exception as e:
             logger.error(f"Error updating underlying charts: {e}")
@@ -5876,6 +6370,8 @@ class MainWindow(QMainWindow):
         """Update positions table with real-time P&L and time tracking"""
         self.positions_table.setRowCount(0)
         total_pnl = 0
+        total_cost_basis = 0
+        total_mkt_value = 0
         
         for row, (contract_key, pos) in enumerate(self.positions.items()):
             self.positions_table.insertRow(row)
@@ -5904,7 +6400,13 @@ class MainWindow(QMainWindow):
             minutes, seconds = divmod(remainder, 60)
             time_span_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
             
-            # Populate row (9 columns now: Contract, Qty, Entry, Current, P&L, P&L %, EntryTime, TimeSpan, Action)
+            # Calculate cost basis and market value
+            cost_basis = pos['avgCost'] * abs(pos['position']) * 100
+            market_value = pos['currentPrice'] * abs(pos['position']) * 100
+            total_cost_basis += cost_basis
+            total_mkt_value += market_value
+            
+            # Populate row (11 columns now: Contract, Qty, Entry, Current, P&L, P&L %, $ Cost Basis, $ Mkt Value, EntryTime, TimeSpan, Action)
             items = [
                 QTableWidgetItem(contract_key),
                 QTableWidgetItem(f"{pos['position']:.0f}"),
@@ -5912,6 +6414,8 @@ class MainWindow(QMainWindow):
                 QTableWidgetItem(f"${pos['currentPrice']:.2f}"),
                 QTableWidgetItem(f"${pnl:.2f}"),
                 QTableWidgetItem(f"{pnl_pct:.2f}%"),
+                QTableWidgetItem(f"${cost_basis:.2f}"),
+                QTableWidgetItem(f"${market_value:.2f}"),
                 QTableWidgetItem(entry_time_str),
                 QTableWidgetItem(time_span_str),
                 QTableWidgetItem("Close")
@@ -5927,8 +6431,8 @@ class MainWindow(QMainWindow):
                     elif pnl < 0:
                         item.setForeground(QColor("#ff0000"))
                 
-                # Close button styling (now column 8)
-                if col == 8:
+                # Close button styling (now column 10)
+                if col == 10:
                     item.setBackground(QColor("#cc0000"))
                     item.setForeground(QColor("#ffffff"))
                 
@@ -5937,7 +6441,11 @@ class MainWindow(QMainWindow):
         # Update total P&L label with color
         pnl_color = "#44ff44" if total_pnl >= 0 else "#ff4444"
         self.pnl_label.setText(f"Total P&L: ${total_pnl:.2f}")
-        self.pnl_label.setStyleSheet(f"font-weight: bold; color: {pnl_color};")
+        self.pnl_label.setStyleSheet(f"font-weight: bold; color: {pnl_color}; padding: 2px 12px;")
+        
+        # Update total cost basis and market value labels
+        self.cost_basis_label.setText(f"Total Cost Basis: ${total_cost_basis:.2f}")
+        self.mkt_value_label.setText(f"Total Mkt Value: ${total_mkt_value:.2f}")
     
     def on_position_cell_clicked(self, row: int, col: int):
         """
@@ -5948,8 +6456,8 @@ class MainWindow(QMainWindow):
         logger.info(f"Position cell clicked: row={row}, col={col}")
         self.log_message(f"Position table click: row={row}, col={col}", "INFO")
         
-        if col != 8:  # Only handle Close button column (column 8)
-            logger.info(f"Click on column {col} - not Close button (column 8), ignoring")
+        if col != 10:  # Only handle Close button column (column 10)
+            logger.info(f"Click on column {col} - not Close button (column 10), ignoring")
             return
         
         logger.info("Close button clicked - starting close position flow")
