@@ -2123,6 +2123,12 @@ class MainWindow(QMainWindow):
         self.mes_price = 0  # Current MES price
         self.mes_req_id = None  # Market data request ID for MES
         
+        # Long Straddles Strategy Settings
+        self.straddle_strategy_enabled = False  # Straddle strategy OFF by default
+        self.straddle_otm_strikes = 1  # Number of strikes OTM (1 = first OTM, 2 = second OTM, etc.)
+        self.straddle_positions = {}  # Track straddle positions: {trade_id: position_data}
+        self.straddle_trade_counter = 1  # Counter for generating unique trade IDs
+        
         # Chart Settings - Confirmation Chart
         self.confirm_ema_length = 9
         self.confirm_z_period = 30
@@ -2210,7 +2216,11 @@ class MainWindow(QMainWindow):
         self.vega_tab = self.create_vega_strategy_tab()
         self.tabs.addTab(self.vega_tab, "Vega Strategy")
         
-        # Tab 3: Settings
+        # Tab 3: Long Straddles Strategy
+        self.straddle_tab = self.create_straddle_strategy_tab()
+        self.tabs.addTab(self.straddle_tab, "Long Straddles")
+        
+        # Tab 4: Settings
         self.settings_tab = self.create_settings_tab()
         self.tabs.addTab(self.settings_tab, "Settings")
         
@@ -3770,6 +3780,165 @@ class MainWindow(QMainWindow):
         main_splitter.setSizes([500, 500])
         
         main_layout.addWidget(main_splitter)
+        
+        return tab
+    
+    def create_straddle_strategy_tab(self):
+        """Create the Long Straddles Strategy tab"""
+        tab = QWidget()
+        main_layout = QVBoxLayout(tab)
+        main_layout.setContentsMargins(5, 5, 5, 5)
+        
+        # Main splitter - vertical split
+        main_splitter = QSplitter(Qt.Orientation.Vertical)
+        
+        # ===== TOP SECTION: Controls & Entry =====
+        top_widget = QWidget()
+        top_layout = QVBoxLayout(top_widget)
+        
+        # Strategy Control Panel
+        control_group = QGroupBox("Long Straddles Control")
+        control_layout = QGridLayout(control_group)
+        
+        # Row 0: Strategy Enable/Disable
+        self.straddle_strategy_enabled_cb = QCheckBox("Enable Straddle Strategy")
+        self.straddle_strategy_enabled_cb.setChecked(self.straddle_strategy_enabled)
+        self.straddle_strategy_enabled_cb.stateChanged.connect(self.on_straddle_strategy_toggle)
+        control_layout.addWidget(self.straddle_strategy_enabled_cb, 0, 0, 1, 2)
+        
+        # Row 1: OTM Strikes Selection
+        control_layout.addWidget(QLabel("OTM Strikes Away:"), 1, 0)
+        self.straddle_otm_spin = QSpinBox()
+        self.straddle_otm_spin.setRange(1, 10)
+        self.straddle_otm_spin.setSingleStep(1)
+        self.straddle_otm_spin.setValue(self.straddle_otm_strikes)
+        self.straddle_otm_spin.setToolTip("Number of strikes away from ATM (1 = first OTM, 2 = second OTM, etc.)")
+        self.straddle_otm_spin.valueChanged.connect(self.on_straddle_otm_changed)
+        control_layout.addWidget(self.straddle_otm_spin, 1, 1)
+        
+        # Row 2: Trade Quantity
+        control_layout.addWidget(QLabel("Trade Quantity:"), 2, 0)
+        self.straddle_qty_spin = QSpinBox()
+        self.straddle_qty_spin.setRange(1, 100)
+        self.straddle_qty_spin.setSingleStep(1)
+        self.straddle_qty_spin.setValue(self.trade_qty)
+        self.straddle_qty_spin.setToolTip("Number of contracts per leg")
+        control_layout.addWidget(self.straddle_qty_spin, 2, 1)
+        
+        top_layout.addWidget(control_group)
+        
+        # Strike Selection Display
+        strike_group = QGroupBox("Current Strike Selection")
+        strike_layout = QGridLayout(strike_group)
+        
+        # ATM Strike Display
+        strike_layout.addWidget(QLabel("Current ATM:"), 0, 0)
+        self.straddle_atm_label = QLabel("--")
+        self.straddle_atm_label.setStyleSheet("font-size: 14pt; font-weight: bold; color: #FFD700;")
+        strike_layout.addWidget(self.straddle_atm_label, 0, 1)
+        
+        # Call Strike Display
+        strike_layout.addWidget(QLabel("Call Strike:"), 1, 0)
+        self.straddle_call_strike_label = QLabel("--")
+        self.straddle_call_strike_label.setStyleSheet("font-size: 14pt; font-weight: bold; color: #00ff00;")
+        strike_layout.addWidget(self.straddle_call_strike_label, 1, 1)
+        
+        # Call Greeks
+        strike_layout.addWidget(QLabel("Call IV:"), 1, 2)
+        self.straddle_call_iv_label = QLabel("--")
+        strike_layout.addWidget(self.straddle_call_iv_label, 1, 3)
+        
+        strike_layout.addWidget(QLabel("Call Delta:"), 1, 4)
+        self.straddle_call_delta_label = QLabel("--")
+        strike_layout.addWidget(self.straddle_call_delta_label, 1, 5)
+        
+        strike_layout.addWidget(QLabel("Call Price:"), 1, 6)
+        self.straddle_call_price_label = QLabel("--")
+        strike_layout.addWidget(self.straddle_call_price_label, 1, 7)
+        
+        # Put Strike Display
+        strike_layout.addWidget(QLabel("Put Strike:"), 2, 0)
+        self.straddle_put_strike_label = QLabel("--")
+        self.straddle_put_strike_label.setStyleSheet("font-size: 14pt; font-weight: bold; color: #ff4444;")
+        strike_layout.addWidget(self.straddle_put_strike_label, 2, 1)
+        
+        # Put Greeks
+        strike_layout.addWidget(QLabel("Put IV:"), 2, 2)
+        self.straddle_put_iv_label = QLabel("--")
+        strike_layout.addWidget(self.straddle_put_iv_label, 2, 3)
+        
+        strike_layout.addWidget(QLabel("Put Delta:"), 2, 4)
+        self.straddle_put_delta_label = QLabel("--")
+        strike_layout.addWidget(self.straddle_put_delta_label, 2, 5)
+        
+        strike_layout.addWidget(QLabel("Put Price:"), 2, 6)
+        self.straddle_put_price_label = QLabel("--")
+        strike_layout.addWidget(self.straddle_put_price_label, 2, 7)
+        
+        # Total Cost
+        strike_layout.addWidget(QLabel("Total Cost:"), 3, 0)
+        self.straddle_total_cost_label = QLabel("--")
+        self.straddle_total_cost_label.setStyleSheet("font-size: 16pt; font-weight: bold; color: #ff8c00;")
+        strike_layout.addWidget(self.straddle_total_cost_label, 3, 1, 1, 2)
+        
+        # Max Risk
+        strike_layout.addWidget(QLabel("Max Risk:"), 3, 3)
+        self.straddle_max_risk_label = QLabel("--")
+        self.straddle_max_risk_label.setStyleSheet("font-size: 16pt; font-weight: bold; color: #ff4444;")
+        strike_layout.addWidget(self.straddle_max_risk_label, 3, 4, 1, 2)
+        
+        top_layout.addWidget(strike_group)
+        
+        # Action Buttons
+        button_layout = QHBoxLayout()
+        
+        self.enter_straddle_btn = QPushButton("🎯 Enter Straddle")
+        self.enter_straddle_btn.setStyleSheet("font-size: 14pt; padding: 10px; background-color: #006400;")
+        self.enter_straddle_btn.clicked.connect(self.enter_straddle_position)
+        button_layout.addWidget(self.enter_straddle_btn)
+        
+        self.refresh_straddle_btn = QPushButton("🔄 Refresh Strikes")
+        self.refresh_straddle_btn.clicked.connect(self.update_straddle_strike_display)
+        button_layout.addWidget(self.refresh_straddle_btn)
+        
+        top_layout.addLayout(button_layout)
+        
+        main_splitter.addWidget(top_widget)
+        
+        # ===== BOTTOM SECTION: Active Straddle Positions =====
+        bottom_widget = QWidget()
+        bottom_layout = QVBoxLayout(bottom_widget)
+        
+        positions_group = QGroupBox("Active Straddle Positions")
+        positions_layout = QVBoxLayout(positions_group)
+        
+        self.straddle_positions_table = QTableWidget()
+        self.straddle_positions_table.setColumnCount(12)
+        self.straddle_positions_table.setHorizontalHeaderLabels([
+            "Trade ID", "Entry Time", "Call Strike", "Call Qty", "Put Strike", "Put Qty",
+            "Entry Cost", "Current Value", "P&L", "P&L %", "Greeks", "Action"
+        ])
+        header = self.straddle_positions_table.horizontalHeader()
+        if header:
+            header.setStretchLastSection(False)
+            for i in range(12):
+                header.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
+        self.straddle_positions_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        positions_layout.addWidget(self.straddle_positions_table)
+        
+        bottom_layout.addWidget(positions_group)
+        
+        main_splitter.addWidget(bottom_widget)
+        
+        # Set splitter proportions (40% top, 60% bottom)
+        main_splitter.setSizes([400, 600])
+        
+        main_layout.addWidget(main_splitter)
+        
+        # Start update timer for strike display
+        self.straddle_update_timer = QTimer()
+        self.straddle_update_timer.timeout.connect(self.update_straddle_strike_display)
+        self.straddle_update_timer.start(2000)  # Update every 2 seconds
         
         return tab
     
@@ -8365,6 +8534,339 @@ class MainWindow(QMainWindow):
     
     # ========================================================================
     # END VEGA DELTA NEUTRAL STRATEGY METHODS
+    # ========================================================================
+    
+    # ========================================================================
+    # LONG STRADDLES STRATEGY METHODS
+    # ========================================================================
+    
+    def on_straddle_strategy_toggle(self, state):
+        """Handle straddle strategy enable/disable toggle"""
+        self.straddle_strategy_enabled = (state == Qt.CheckState.Checked.value)
+        status = "ENABLED" if self.straddle_strategy_enabled else "DISABLED"
+        self.log_message(f"Long Straddles Strategy: {status}", "INFO")
+        logger.info(f"Straddle strategy toggled: {status}")
+    
+    def on_straddle_otm_changed(self, value):
+        """Handle OTM strikes setting change"""
+        self.straddle_otm_strikes = value
+        self.log_message(f"Straddle OTM strikes set to: {value}", "INFO")
+        self.update_straddle_strike_display()
+    
+    def get_straddle_strikes(self):
+        """
+        Get the call and put strikes for straddle entry based on OTM setting.
+        
+        Returns:
+            tuple: (call_strike, put_strike, atm_strike) or (None, None, None) if not available
+        """
+        try:
+            # Find ATM strike from delta
+            atm_strike = self.find_atm_strike_by_delta()
+            
+            if atm_strike == 0:
+                return None, None, None
+            
+            strike_increment = self.instrument['strike_increment']
+            otm_offset = self.straddle_otm_strikes * strike_increment
+            
+            # Call strike: ATM + offset (OTM calls are above ATM)
+            call_strike = atm_strike + otm_offset
+            
+            # Put strike: ATM - offset (OTM puts are below ATM)
+            put_strike = atm_strike - otm_offset
+            
+            return call_strike, put_strike, atm_strike
+        
+        except Exception as e:
+            logger.error(f"Error calculating straddle strikes: {e}")
+            return None, None, None
+    
+    def update_straddle_strike_display(self):
+        """Update the strike selection display with current prices and greeks"""
+        try:
+            call_strike, put_strike, atm_strike = self.get_straddle_strikes()
+            
+            if call_strike is None:
+                # No data available yet
+                self.straddle_atm_label.setText("--")
+                self.straddle_call_strike_label.setText("--")
+                self.straddle_put_strike_label.setText("--")
+                self.straddle_call_iv_label.setText("--")
+                self.straddle_call_delta_label.setText("--")
+                self.straddle_call_price_label.setText("--")
+                self.straddle_put_iv_label.setText("--")
+                self.straddle_put_delta_label.setText("--")
+                self.straddle_put_price_label.setText("--")
+                self.straddle_total_cost_label.setText("--")
+                self.straddle_max_risk_label.setText("--")
+                return
+            
+            # Update ATM
+            self.straddle_atm_label.setText(f"{atm_strike:.0f}")
+            
+            # Get call data
+            call_key = f"{self.instrument['options_symbol']}_{call_strike:.0f}_C_{self.current_expiry}"
+            call_data = self.market_data.get(call_key, {})
+            call_bid = call_data.get('bid', 0)
+            call_ask = call_data.get('ask', 0)
+            call_mid = (call_bid + call_ask) / 2 if call_bid and call_ask else 0
+            call_iv = call_data.get('iv', 0)
+            call_delta = call_data.get('delta', 0)
+            
+            # Update call display
+            self.straddle_call_strike_label.setText(f"{call_strike:.0f}")
+            self.straddle_call_iv_label.setText(f"{call_iv*100:.1f}%" if call_iv > 0 else "--")
+            self.straddle_call_delta_label.setText(f"{call_delta:.3f}" if call_delta != 0 else "--")
+            self.straddle_call_price_label.setText(f"${call_mid:.2f}" if call_mid > 0 else "--")
+            
+            # Get put data
+            put_key = f"{self.instrument['options_symbol']}_{put_strike:.0f}_P_{self.current_expiry}"
+            put_data = self.market_data.get(put_key, {})
+            put_bid = put_data.get('bid', 0)
+            put_ask = put_data.get('ask', 0)
+            put_mid = (put_bid + put_ask) / 2 if put_bid and put_ask else 0
+            put_iv = put_data.get('iv', 0)
+            put_delta = put_data.get('delta', 0)
+            
+            # Update put display
+            self.straddle_put_strike_label.setText(f"{put_strike:.0f}")
+            self.straddle_put_iv_label.setText(f"{put_iv*100:.1f}%" if put_iv > 0 else "--")
+            self.straddle_put_delta_label.setText(f"{put_delta:.3f}" if put_delta != 0 else "--")
+            self.straddle_put_price_label.setText(f"${put_mid:.2f}" if put_mid > 0 else "--")
+            
+            # Calculate totals
+            if call_mid > 0 and put_mid > 0:
+                qty = self.straddle_qty_spin.value()
+                total_cost = (call_mid + put_mid) * qty * self.instrument['multiplier']
+                max_risk = total_cost  # Max risk for long straddle is premium paid
+                
+                self.straddle_total_cost_label.setText(f"${total_cost:.2f}")
+                self.straddle_max_risk_label.setText(f"${max_risk:.2f}")
+            else:
+                self.straddle_total_cost_label.setText("--")
+                self.straddle_max_risk_label.setText("--")
+        
+        except Exception as e:
+            logger.error(f"Error updating straddle strike display: {e}")
+    
+    def enter_straddle_position(self):
+        """Enter a long straddle position"""
+        try:
+            if not self.straddle_strategy_enabled:
+                self.log_message("❌ Straddle strategy not enabled", "WARNING")
+                return
+            
+            if self.connection_state != ConnectionState.CONNECTED:
+                self.log_message("❌ Not connected to IBKR", "WARNING")
+                return
+            
+            # Get strikes
+            call_strike, put_strike, atm_strike = self.get_straddle_strikes()
+            
+            if call_strike is None:
+                self.log_message("❌ Cannot determine strikes - wait for market data", "WARNING")
+                return
+            
+            # Get market data
+            call_key = f"{self.instrument['options_symbol']}_{call_strike:.0f}_C_{self.current_expiry}"
+            put_key = f"{self.instrument['options_symbol']}_{put_strike:.0f}_P_{self.current_expiry}"
+            
+            call_data = self.market_data.get(call_key, {})
+            put_data = self.market_data.get(put_key, {})
+            
+            call_bid = call_data.get('bid', 0)
+            call_ask = call_data.get('ask', 0)
+            put_bid = put_data.get('bid', 0)
+            put_ask = put_data.get('ask', 0)
+            
+            if not all([call_bid, call_ask, put_bid, put_ask]):
+                self.log_message("❌ Missing market data for strikes", "WARNING")
+                return
+            
+            # Calculate mid prices
+            call_mid = (call_bid + call_ask) / 2
+            put_mid = (put_bid + put_ask) / 2
+            
+            qty = self.straddle_qty_spin.value()
+            
+            # Generate trade ID
+            trade_id = f"STRAD_{self.straddle_trade_counter:04d}"
+            self.straddle_trade_counter += 1
+            
+            self.log_message(f"🎯 Entering Long Straddle: {trade_id}", "INFO")
+            self.log_message(f"  ATM: {atm_strike:.0f}, Call: {call_strike:.0f}, Put: {put_strike:.0f}", "INFO")
+            
+            # Buy Call
+            self.place_order(call_key, "BUY", qty, call_mid, enable_chasing=True)
+            self.log_message(f"  ✓ BUY {qty} CALL @ {call_strike:.0f} (Mid: ${call_mid:.2f})", "SUCCESS")
+            
+            # Buy Put
+            self.place_order(put_key, "BUY", qty, put_mid, enable_chasing=True)
+            self.log_message(f"  ✓ BUY {qty} PUT @ {put_strike:.0f} (Mid: ${put_mid:.2f})", "SUCCESS")
+            
+            # Calculate entry cost
+            entry_cost = (call_mid + put_mid) * qty * self.instrument['multiplier']
+            
+            # Store position
+            self.straddle_positions[trade_id] = {
+                'trade_id': trade_id,
+                'entry_time': datetime.now(),
+                'call_strike': call_strike,
+                'call_key': call_key,
+                'call_qty': qty,
+                'call_entry_price': call_mid,
+                'put_strike': put_strike,
+                'put_key': put_key,
+                'put_qty': qty,
+                'put_entry_price': put_mid,
+                'entry_cost': entry_cost,
+                'atm_at_entry': atm_strike
+            }
+            
+            self.log_message(f"✅ Straddle entered: Cost ${entry_cost:.2f}", "SUCCESS")
+            
+            # Update display
+            self.update_straddle_positions_table()
+        
+        except Exception as e:
+            logger.error(f"Error entering straddle position: {e}")
+            self.log_message(f"Error entering straddle: {e}", "ERROR")
+    
+    def update_straddle_positions_table(self):
+        """Update the straddle positions table with current data"""
+        try:
+            self.straddle_positions_table.setRowCount(0)
+            
+            for trade_id, position in self.straddle_positions.items():
+                row = self.straddle_positions_table.rowCount()
+                self.straddle_positions_table.insertRow(row)
+                
+                # Trade ID
+                self.straddle_positions_table.setItem(row, 0, QTableWidgetItem(trade_id))
+                
+                # Entry Time
+                entry_time_str = position['entry_time'].strftime("%H:%M:%S")
+                self.straddle_positions_table.setItem(row, 1, QTableWidgetItem(entry_time_str))
+                
+                # Call Strike & Qty
+                self.straddle_positions_table.setItem(row, 2, QTableWidgetItem(f"{position['call_strike']:.0f}"))
+                self.straddle_positions_table.setItem(row, 3, QTableWidgetItem(str(position['call_qty'])))
+                
+                # Put Strike & Qty
+                self.straddle_positions_table.setItem(row, 4, QTableWidgetItem(f"{position['put_strike']:.0f}"))
+                self.straddle_positions_table.setItem(row, 5, QTableWidgetItem(str(position['put_qty'])))
+                
+                # Entry Cost
+                entry_cost = position['entry_cost']
+                cost_item = QTableWidgetItem(f"${entry_cost:.2f}")
+                self.straddle_positions_table.setItem(row, 6, cost_item)
+                
+                # Get current market data
+                call_data = self.market_data.get(position['call_key'], {})
+                put_data = self.market_data.get(position['put_key'], {})
+                
+                call_bid = call_data.get('bid', 0)
+                call_ask = call_data.get('ask', 0)
+                put_bid = put_data.get('bid', 0)
+                put_ask = put_data.get('ask', 0)
+                
+                # Calculate current value and P&L
+                if all([call_bid, call_ask, put_bid, put_ask]):
+                    call_mid = (call_bid + call_ask) / 2
+                    put_mid = (put_bid + put_ask) / 2
+                    
+                    current_value = (call_mid * position['call_qty'] + put_mid * position['put_qty']) * self.instrument['multiplier']
+                    pnl = current_value - entry_cost
+                    pnl_pct = (pnl / entry_cost * 100) if entry_cost > 0 else 0
+                    
+                    # Current Value
+                    value_item = QTableWidgetItem(f"${current_value:.2f}")
+                    self.straddle_positions_table.setItem(row, 7, value_item)
+                    
+                    # P&L
+                    pnl_item = QTableWidgetItem(f"${pnl:+.2f}")
+                    pnl_item.setForeground(QColor("#00ff00") if pnl >= 0 else QColor("#ff4444"))
+                    self.straddle_positions_table.setItem(row, 8, pnl_item)
+                    
+                    # P&L %
+                    pnl_pct_item = QTableWidgetItem(f"{pnl_pct:+.1f}%")
+                    pnl_pct_item.setForeground(QColor("#00ff00") if pnl_pct >= 0 else QColor("#ff4444"))
+                    self.straddle_positions_table.setItem(row, 9, pnl_pct_item)
+                    
+                    # Greeks
+                    call_delta = call_data.get('delta', 0)
+                    put_delta = put_data.get('delta', 0)
+                    call_gamma = call_data.get('gamma', 0)
+                    put_gamma = put_data.get('gamma', 0)
+                    call_vega = call_data.get('vega', 0)
+                    put_vega = put_data.get('vega', 0)
+                    call_theta = call_data.get('theta', 0)
+                    put_theta = put_data.get('theta', 0)
+                    
+                    total_delta = (call_delta * position['call_qty'] + put_delta * position['put_qty'])
+                    total_gamma = (call_gamma * position['call_qty'] + put_gamma * position['put_qty'])
+                    total_vega = (call_vega * position['call_qty'] + put_vega * position['put_qty'])
+                    total_theta = (call_theta * position['call_qty'] + put_theta * position['put_qty'])
+                    
+                    greeks_str = f"Δ:{total_delta:.2f} Γ:{total_gamma:.3f} V:{total_vega:.1f} Θ:{total_theta:.2f}"
+                    self.straddle_positions_table.setItem(row, 10, QTableWidgetItem(greeks_str))
+                else:
+                    self.straddle_positions_table.setItem(row, 7, QTableWidgetItem("--"))
+                    self.straddle_positions_table.setItem(row, 8, QTableWidgetItem("--"))
+                    self.straddle_positions_table.setItem(row, 9, QTableWidgetItem("--"))
+                    self.straddle_positions_table.setItem(row, 10, QTableWidgetItem("--"))
+                
+                # Close button
+                close_btn = QPushButton("Close")
+                close_btn.setStyleSheet("background-color: #8b0000; color: white;")
+                close_btn.clicked.connect(lambda checked, tid=trade_id: self.close_straddle_position(tid))
+                self.straddle_positions_table.setCellWidget(row, 11, close_btn)
+        
+        except Exception as e:
+            logger.error(f"Error updating straddle positions table: {e}")
+    
+    def close_straddle_position(self, trade_id):
+        """Close a straddle position (sell both legs)"""
+        try:
+            if trade_id not in self.straddle_positions:
+                self.log_message(f"Position {trade_id} not found", "ERROR")
+                return
+            
+            position = self.straddle_positions[trade_id]
+            
+            self.log_message(f"🔴 Closing straddle position: {trade_id}", "INFO")
+            
+            # Sell Call
+            call_data = self.market_data.get(position['call_key'], {})
+            call_mid = (call_data.get('bid', 0) + call_data.get('ask', 0)) / 2 if call_data.get('bid') and call_data.get('ask') else 0
+            
+            if call_mid > 0:
+                self.place_order(position['call_key'], "SELL", position['call_qty'], call_mid, enable_chasing=True)
+                self.log_message(f"  ✓ SELL {position['call_qty']} CALL @ {position['call_strike']:.0f}", "SUCCESS")
+            
+            # Sell Put
+            put_data = self.market_data.get(position['put_key'], {})
+            put_mid = (put_data.get('bid', 0) + put_data.get('ask', 0)) / 2 if put_data.get('bid') and put_data.get('ask') else 0
+            
+            if put_mid > 0:
+                self.place_order(position['put_key'], "SELL", position['put_qty'], put_mid, enable_chasing=True)
+                self.log_message(f"  ✓ SELL {position['put_qty']} PUT @ {position['put_strike']:.0f}", "SUCCESS")
+            
+            # Remove from active positions
+            del self.straddle_positions[trade_id]
+            
+            self.log_message(f"✅ Straddle position fully closed: {trade_id}", "SUCCESS")
+            
+            # Update display
+            self.update_straddle_positions_table()
+        
+        except Exception as e:
+            logger.error(f"Error closing straddle position: {e}")
+            self.log_message(f"Error closing position: {e}", "ERROR")
+    
+    # ========================================================================
+    # END LONG STRADDLES STRATEGY METHODS
     # ========================================================================
 
     def closeEvent(self, a0):  # type: ignore[override]
