@@ -3,12 +3,12 @@
 ## Problem Description
 
 The option chain was oscillating between two center strikes:
-- **6775** (correct ATM strike detected via 0.5 delta)
-- **6700** (incorrect ES offset approximation)
+- **678** (ES offset approximation)
+- **685** (correct ATM strike detected via 0.5 delta)
 
-This caused the chain to constantly reload, flickering between these two centers.
+This caused the chain to constantly reload every few seconds, cycling between these two centers.
 
-## Root Cause
+## Root Cause (v1 - Partially Fixed)
 
 There were **TWO competing auto-recenter mechanisms** running simultaneously:
 
@@ -76,11 +76,69 @@ After this fix:
 6. Only delta-based recenter runs (checking actual 0.5 delta strikes)
 7. **No more oscillation!** ✅
 
+## Root Cause (v2 - Complete Fix)
+
+The first fix (disabling ES-based recenter after calibration) was **incomplete**. The issue was that every time the chain loaded, `delta_calibration_done` was reset to `False` on line 5528. This caused:
+
+```
+1. Chain loads at 678 (ES offset)
+2. Delta-based recenter: ATM detected at 685
+3. Calls request_option_chain(force_center_strike=685)
+4. New chain loads at 685
+5. ❌ delta_calibration_done reset to False (line 5528)
+6. ES-based recenter re-enabled (checks `not delta_calibration_done`)
+7. ES-based recenter: Calculates center from ES → 678
+8. Calls request_option_chain() [no force_center_strike]
+9. Chain loads at 678
+10. BACK TO STEP 2 → INFINITE LOOP
+```
+
+The flag was being reset on **every chain load**, not just manual requests. This re-enabled the ES-based recenter after every delta-based recenter!
+
+## Solution (v2 - Complete)
+
+**Only reset `delta_calibration_done = False` for manual chain requests, NOT for delta-based recenters.**
+
+### Changes Made:
+
+1. **Line 5380-5388** (inside `request_option_chain()`):
+   ```python
+   # Reset delta calibration flag ONLY for manual chain requests
+   if force_center_strike is None:
+       self.delta_calibration_done = False  # Manual request → allow calibration
+   else:
+       # Delta-based recenter → keep calibration flag
+   ```
+
+2. **Lines 5528-5533** (after chain loads):
+   ```python
+   # REMOVED: self.delta_calibration_done = False
+   # Do NOT reset flag here - it's now handled at the START of request_option_chain()
+   ```
+
+### Result:
+
+- **Manual chain request** (user changes expiry, clicks refresh):
+  - `force_center_strike = None`
+  - `delta_calibration_done` reset to `False`
+  - ES-based recenter enabled initially
+  - Delta-based recenter performs initial calibration
+  - ES-based recenter disabled after calibration
+
+- **Delta-based recenter** (automatic drift correction):
+  - `force_center_strike = 685` (detected ATM)
+  - `delta_calibration_done` **kept as `True`**
+  - New chain loads
+  - ES-based recenter stays **disabled**
+  - **No oscillation!** ✅
+
 ## Timeline
 
 - **November 3, 2025**: Initial implementation of `force_center_strike` parameter
-- **November 4, 2025**: Discovered oscillation bug caused by competing recenter mechanisms
-- **November 4, 2025**: Fixed by disabling ES-based recenter after delta calibration complete
+- **November 4, 2025 (8:00 AM)**: Discovered oscillation bug caused by competing recenter mechanisms
+- **November 4, 2025 (8:00 AM)**: v1 fix - Disabled ES-based recenter after delta calibration (incomplete)
+- **November 4, 2025 (8:30 AM)**: Oscillation continued - discovered flag reset issue
+- **November 4, 2025 (8:30 AM)**: v2 fix - Only reset flag for manual requests (complete fix)
 
 ## Related Files
 

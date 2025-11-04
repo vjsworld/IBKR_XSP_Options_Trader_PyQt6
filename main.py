@@ -16,7 +16,7 @@ Technology Stack:
 # ============================================================================
 # Set this to either 'SPX' (full-size S&P 500) or 'XSP' (mini 1/10 size)
 # This controls which instrument the application will trade
-SELECTED_INSTRUMENT = 'SPX'  # Change to 'XSP' for mini-SPX trading
+SELECTED_INSTRUMENT = 'XSP'  # Change to 'XSP' for mini-SPX trading
 # ============================================================================
 
 import sys
@@ -5384,6 +5384,14 @@ class MainWindow(QMainWindow):
             self.log_message("Cannot request option chain - not connected", "WARNING")
             return
         
+        # Reset delta calibration flag ONLY for manual chain requests (not delta-based recenters)
+        # This prevents oscillation between delta-based and ES-based recenters
+        if force_center_strike is None:
+            self.delta_calibration_done = False
+            logger.debug("Manual chain request - resetting delta_calibration_done to allow initial calibration")
+        else:
+            logger.debug("Delta-based recenter - keeping delta_calibration_done to prevent ES recenter")
+        
         # Cancel existing option chain subscriptions to avoid duplicate ticker ID errors
         if self.app_state.get('active_option_req_ids'):
             self.log_message(f"Canceling {len(self.app_state['active_option_req_ids'])} existing subscriptions...", "INFO")
@@ -5525,7 +5533,12 @@ class MainWindow(QMainWindow):
         
         # Clear recentering flags now that chain is loaded
         self.is_recentering_chain = False
-        self.delta_calibration_done = False  # Reset calibration flag for new chain
+        
+        # IMPORTANT: Do NOT reset delta_calibration_done here!
+        # If we're recentering based on delta-detected ATM (force_center_strike was used),
+        # we want to KEEP delta_calibration_done = True to prevent ES-based recenter from running.
+        # The calibration flag is only reset when user manually changes expiry/settings (new chain request).
+        # This prevents oscillation: Delta recenter → New chain loads → Flag reset → ES recenter → Loop
         
         # Update recenter timestamp to give chain time to load and deltas to populate
         # before allowing initial calibration check (prevent immediate re-recenter)
