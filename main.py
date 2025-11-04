@@ -16,7 +16,7 @@ Technology Stack:
 # ============================================================================
 # Set this to either 'SPX' (full-size S&P 500) or 'XSP' (mini 1/10 size)
 # This controls which instrument the application will trade
-SELECTED_INSTRUMENT = 'XSP'  # Change to 'XSP' for mini-SPX trading
+SELECTED_INSTRUMENT = 'SPX'  # Change to 'XSP' for mini-SPX trading
 # ============================================================================
 
 import sys
@@ -7310,7 +7310,14 @@ class MainWindow(QMainWindow):
                     self.request_option_chain()
         
         # AUTO-RECENTER: Check if ES price has drifted from last center strike
-        if self.connection_state == ConnectionState.CONNECTED and self.chain_refresh_interval > 0:
+        # NOTE: This ES-based recenter is DISABLED after delta calibration is complete.
+        # Once we have live deltas, the delta-based recenter (check_chain_drift_and_recenter)
+        # takes over as it's far more accurate. ES-based recenter should only run before
+        # delta calibration to prevent chain from drifting too far while waiting for deltas.
+        if (self.connection_state == ConnectionState.CONNECTED and 
+            self.chain_refresh_interval > 0 and 
+            not self.delta_calibration_done):  # ✅ ONLY run before delta calibration
+            
             es_price = self.app_state.get('es_price', 0)
             if es_price > 0 and self.last_chain_center_strike > 0:
                 # Use adjusted ES price (same as in request_option_chain)
@@ -7328,7 +7335,7 @@ class MainWindow(QMainWindow):
                 drift_threshold = self.chain_drift_threshold * strike_increment
                 if drift >= drift_threshold:
                     logger.info(
-                        f"Price drifted {drift:.0f} points from center strike {self.last_chain_center_strike} "
+                        f"[ES-BASED RECENTER - PRE-CALIBRATION] Price drifted {drift:.0f} points from center strike {self.last_chain_center_strike} "
                         f"to {current_center} (threshold: {drift_threshold:.0f}), auto-recentering chain"
                     )
                     self.request_option_chain()
@@ -8585,10 +8592,15 @@ class MainWindow(QMainWindow):
     def update_straddle_strike_display(self):
         """Update the strike selection display with current prices and greeks"""
         try:
+            # Safety check: ensure widgets exist
+            if not hasattr(self, 'straddle_atm_label'):
+                return
+            
             call_strike, put_strike, atm_strike = self.get_straddle_strikes()
             
             if call_strike is None:
                 # No data available yet
+                logger.debug("Straddle: No ATM strike available yet (waiting for market data)")
                 self.straddle_atm_label.setText("--")
                 self.straddle_call_strike_label.setText("--")
                 self.straddle_put_strike_label.setText("--")
@@ -8601,6 +8613,8 @@ class MainWindow(QMainWindow):
                 self.straddle_total_cost_label.setText("--")
                 self.straddle_max_risk_label.setText("--")
                 return
+            
+            logger.debug(f"Straddle: ATM={atm_strike:.0f}, Call={call_strike:.0f}, Put={put_strike:.0f}")
             
             # Update ATM
             self.straddle_atm_label.setText(f"{atm_strike:.0f}")
