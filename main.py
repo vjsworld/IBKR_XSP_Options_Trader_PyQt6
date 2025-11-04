@@ -188,7 +188,13 @@ INSTRUMENT_CONFIG = {
         'strike_increment': 5.0,             # $5 increments
         'tick_size_above_3': 0.10,           # >= $3.00: $0.10 tick
         'tick_size_below_3': 0.05,           # < $3.00: $0.05 tick
-        'description': 'S&P 500 Index Options (Full size, $100 multiplier)'
+        'description': 'S&P 500 Index Options (Full size, $100 multiplier)',
+        'hedge_instrument': 'ES',            # Hedge with E-mini S&P 500 futures
+        'hedge_symbol': 'ES',
+        'hedge_exchange': 'CME',
+        'hedge_sec_type': 'FUT',
+        'hedge_multiplier': 50,              # $50 per point
+        'hedge_ratio': 2.0                   # 1 SPX option delta ~= 2 ES contracts
     },
     'XSP': {
         'name': 'XSP',
@@ -201,7 +207,13 @@ INSTRUMENT_CONFIG = {
         'strike_increment': 1.0,             # $1 increments (1/10 of SPX)
         'tick_size_above_3': 0.05,
         'tick_size_below_3': 0.05,
-        'description': 'Mini-SPX Index Options (1/10 size of SPX, $100 multiplier)'
+        'description': 'Mini-SPX Index Options (1/10 size of SPX, $100 multiplier)',
+        'hedge_instrument': 'MES',           # Hedge with Micro E-mini S&P 500 futures
+        'hedge_symbol': 'MES',
+        'hedge_exchange': 'CME',
+        'hedge_sec_type': 'FUT',
+        'hedge_multiplier': 5,               # $5 per point (1/10 of ES)
+        'hedge_ratio': 20.0                  # 1 XSP option delta (100 shares) ~= 20 MES contracts (5 per point * 20 = 100)
     }
 }
 
@@ -439,6 +451,14 @@ class IBKRWrapper(EWrapper):
             else:
                 # Log other tick types to help debug what we're receiving
                 logger.debug(f"ES futures tick (ignored): reqId={reqId}, type={tickType}, price={price}")
+            return
+        
+        # MES futures price (for delta hedging)
+        if self._main_window and reqId == self._main_window.mes_req_id:
+            # Accept LAST (4), CLOSE (9), DELAYED_LAST (68)
+            if tickType in [4, 9, 68]:
+                logger.debug(f"MES futures price tick: type={tickType}, price={price}")
+                self._main_window.update_mes_price(price)
             return
         
         # Option contract prices
@@ -2049,6 +2069,7 @@ class MainWindow(QMainWindow):
         self.chain_drift_threshold = 5  # Number of strikes to drift before auto-recentering (default: 5)
         self.is_recentering_chain = False  # Flag to prevent recentering loops
         self.last_recenter_time = 0  # Timestamp of last recenter to throttle rapid recenters
+        self.delta_calibration_done = False  # Track if we've done initial delta-based recenter after chain load
         
         # Auto-refresh timer for 4:00 PM ET expiration switch
         self.market_close_timer = QTimer()
@@ -2084,6 +2105,23 @@ class MainWindow(QMainWindow):
         self.last_straddle_time = None  # Last straddle entry timestamp
         self.active_straddles = []  # List of active straddle positions for tracking
         self.straddle_timer = None  # QTimer for straddle checks
+        
+        # Vega Delta Neutral Strategy Settings
+        self.vega_strategy_enabled = False  # Vega strategy OFF by default
+        self.vega_target = 500  # Target vega exposure
+        self.max_delta_threshold = 10  # Maximum allowed delta before rehedge
+        self.auto_hedge_enabled = False  # Auto delta hedging OFF by default
+        self.vega_positions = {}  # Track vega strategy positions: {trade_id: position_data}
+        self.vega_scan_results = []  # Store scanner results
+        self.last_vega_scan_time = None  # Last scan timestamp
+        self.portfolio_greeks = {'delta': 0, 'gamma': 0, 'vega': 0, 'theta': 0}  # Portfolio Greeks
+        
+        # MES Futures Hedging
+        self.mes_contract = None  # MES futures contract (will be initialized when needed)
+        self.mes_front_month = None  # Front month contract string (e.g., "202512")
+        self.hedge_orders = {}  # Track hedge orders: {order_id: {'trade_id': ..., 'action': ..., 'quantity': ...}}
+        self.mes_price = 0  # Current MES price
+        self.mes_req_id = None  # Market data request ID for MES
         
         # Chart Settings - Confirmation Chart
         self.confirm_ema_length = 9
@@ -2168,7 +2206,11 @@ class MainWindow(QMainWindow):
         self.trading_tab = self.create_trading_tab()
         self.tabs.addTab(self.trading_tab, "Trading Dashboard")
         
-        # Tab 2: Settings
+        # Tab 2: Vega Strategy
+        self.vega_tab = self.create_vega_strategy_tab()
+        self.tabs.addTab(self.vega_tab, "Vega Strategy")
+        
+        # Tab 3: Settings
         self.settings_tab = self.create_settings_tab()
         self.tabs.addTab(self.settings_tab, "Settings")
         
@@ -3591,6 +3633,146 @@ class MainWindow(QMainWindow):
         
         return tab
     
+    def create_vega_strategy_tab(self):
+        """Create the Vega Delta Neutral Strategy tab"""
+        tab = QWidget()
+        main_layout = QVBoxLayout(tab)
+        main_layout.setContentsMargins(5, 5, 5, 5)
+        
+        # Main splitter - vertical split
+        main_splitter = QSplitter(Qt.Orientation.Vertical)
+        
+        # ===== TOP SECTION: Controls & Scanner =====
+        top_widget = QWidget()
+        top_layout = QVBoxLayout(top_widget)
+        
+        # Strategy Control Panel
+        control_group = QGroupBox("Vega Strategy Control")
+        control_layout = QGridLayout(control_group)
+        
+        # Row 0: Strategy Enable/Disable
+        self.vega_strategy_enabled_cb = QCheckBox("Enable Vega Strategy")
+        self.vega_strategy_enabled_cb.setChecked(self.vega_strategy_enabled)
+        self.vega_strategy_enabled_cb.stateChanged.connect(self.on_vega_strategy_toggle)
+        control_layout.addWidget(self.vega_strategy_enabled_cb, 0, 0, 1, 2)
+        
+        # Row 1: Auto Hedge Toggle
+        self.auto_hedge_enabled_cb = QCheckBox("Enable Auto Delta Hedging")
+        self.auto_hedge_enabled_cb.setChecked(self.auto_hedge_enabled)
+        self.auto_hedge_enabled_cb.stateChanged.connect(self.on_auto_hedge_toggle)
+        control_layout.addWidget(self.auto_hedge_enabled_cb, 1, 0, 1, 2)
+        
+        # Row 2: Target Vega
+        control_layout.addWidget(QLabel("Target Vega:"), 2, 0)
+        self.vega_target_spin = QSpinBox()
+        self.vega_target_spin.setRange(0, 10000)
+        self.vega_target_spin.setSingleStep(100)
+        self.vega_target_spin.setValue(self.vega_target)
+        self.vega_target_spin.setToolTip("Target portfolio vega exposure")
+        control_layout.addWidget(self.vega_target_spin, 2, 1)
+        
+        # Row 3: Max Delta Threshold
+        control_layout.addWidget(QLabel("Max Delta Threshold:"), 3, 0)
+        self.max_delta_threshold_spin = QSpinBox()
+        self.max_delta_threshold_spin.setRange(1, 100)
+        self.max_delta_threshold_spin.setSingleStep(5)
+        self.max_delta_threshold_spin.setValue(self.max_delta_threshold)
+        self.max_delta_threshold_spin.setToolTip("Maximum allowed portfolio delta before auto-rehedge")
+        control_layout.addWidget(self.max_delta_threshold_spin, 3, 1)
+        
+        # Row 4: Scan Button
+        self.scan_vega_btn = QPushButton("🔍 Scan for Opportunities")
+        self.scan_vega_btn.clicked.connect(self.scan_vega_opportunities)
+        self.scan_vega_btn.setToolTip("Scan option chain for low IV rank opportunities")
+        control_layout.addWidget(self.scan_vega_btn, 4, 0, 1, 2)
+        
+        # Row 5: Manual Hedge Button
+        self.manual_hedge_btn = QPushButton("⚖️ Hedge Delta Now")
+        self.manual_hedge_btn.clicked.connect(self.manual_delta_hedge)
+        self.manual_hedge_btn.setToolTip("Manually execute delta hedge")
+        control_layout.addWidget(self.manual_hedge_btn, 5, 0, 1, 2)
+        
+        top_layout.addWidget(control_group)
+        
+        # Portfolio Greeks Display
+        greeks_group = QGroupBox("Portfolio Greeks")
+        greeks_layout = QGridLayout(greeks_group)
+        
+        # Delta
+        greeks_layout.addWidget(QLabel("Delta:"), 0, 0)
+        self.portfolio_delta_label = QLabel("0.00")
+        self.portfolio_delta_label.setStyleSheet("font-size: 14pt; font-weight: bold;")
+        greeks_layout.addWidget(self.portfolio_delta_label, 0, 1)
+        
+        # Gamma
+        greeks_layout.addWidget(QLabel("Gamma:"), 0, 2)
+        self.portfolio_gamma_label = QLabel("0.00")
+        self.portfolio_gamma_label.setStyleSheet("font-size: 14pt;")
+        greeks_layout.addWidget(self.portfolio_gamma_label, 0, 3)
+        
+        # Vega
+        greeks_layout.addWidget(QLabel("Vega:"), 1, 0)
+        self.portfolio_vega_label = QLabel("0.00")
+        self.portfolio_vega_label.setStyleSheet("font-size: 14pt; font-weight: bold; color: #ff8c00;")
+        greeks_layout.addWidget(self.portfolio_vega_label, 1, 1)
+        
+        # Theta
+        greeks_layout.addWidget(QLabel("Theta:"), 1, 2)
+        self.portfolio_theta_label = QLabel("0.00")
+        self.portfolio_theta_label.setStyleSheet("font-size: 14pt;")
+        greeks_layout.addWidget(self.portfolio_theta_label, 1, 3)
+        
+        top_layout.addWidget(greeks_group)
+        
+        # Scanner Results Table
+        scanner_group = QGroupBox("Vega Opportunity Scanner")
+        scanner_layout = QVBoxLayout(scanner_group)
+        
+        self.vega_scanner_table = QTableWidget()
+        self.vega_scanner_table.setColumnCount(8)
+        self.vega_scanner_table.setHorizontalHeaderLabels([
+            "Expiry", "IV Rank", "Put Strike", "Put IV", "Call Strike", "Call IV", "Total Cost", "Action"
+        ])
+        header = self.vega_scanner_table.horizontalHeader()
+        if header:
+            header.setStretchLastSection(False)
+        self.vega_scanner_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        scanner_layout.addWidget(self.vega_scanner_table)
+        
+        top_layout.addWidget(scanner_group)
+        
+        main_splitter.addWidget(top_widget)
+        
+        # ===== BOTTOM SECTION: Active Vega Positions =====
+        bottom_widget = QWidget()
+        bottom_layout = QVBoxLayout(bottom_widget)
+        
+        positions_group = QGroupBox("Active Vega Positions")
+        positions_layout = QVBoxLayout(positions_group)
+        
+        self.vega_positions_table = QTableWidget()
+        self.vega_positions_table.setColumnCount(11)
+        self.vega_positions_table.setHorizontalHeaderLabels([
+            "Trade ID", "Entry Time", "Put", "Call", "Hedge MES", "Portfolio Δ", 
+            "Portfolio Γ", "Portfolio V", "Portfolio Θ", "P&L", "Action"
+        ])
+        header = self.vega_positions_table.horizontalHeader()
+        if header:
+            header.setStretchLastSection(False)
+        self.vega_positions_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        positions_layout.addWidget(self.vega_positions_table)
+        
+        bottom_layout.addWidget(positions_group)
+        
+        main_splitter.addWidget(bottom_widget)
+        
+        # Set splitter proportions (50% top, 50% bottom)
+        main_splitter.setSizes([500, 500])
+        
+        main_layout.addWidget(main_splitter)
+        
+        return tab
+    
     def create_settings_tab(self):
         """Create the settings tab"""
         tab = QWidget()
@@ -3849,6 +4031,7 @@ class MainWindow(QMainWindow):
             self.ibkr_client.reqPositions()  # This will trigger position() callbacks, which auto-subscribe to market data
             self.subscribe_underlying_price()  # Subscribe to underlying instrument (SPX, XSP, etc.) for display
             self.subscribe_es_price()   # ES for strike calculations (23/6 trading)
+            self.subscribe_mes_price()  # MES for vega strategy delta hedging
             self.request_option_chain()
             
             # Calculate offset from historical 3pm close if stale
@@ -4221,6 +4404,53 @@ class MainWindow(QMainWindow):
         mode_str = "snapshot mode" if use_snapshot else "streaming mode"
         self.log_message(f"Subscribed to ES futures {es_contract.lastTradeDateOrContractMonth} ({mode_str}, LIVE data)", "INFO")
     
+    def get_mes_front_month(self):
+        """
+        Get MES (Micro E-mini S&P 500) futures front month.
+        MES has same expiration schedule as ES (quarterly: Mar, Jun, Sep, Dec).
+        
+        Returns: str - Contract month code (e.g., "202512" for December 2025)
+        """
+        # MES uses same rollover logic as ES
+        return self.get_es_front_month()
+    
+    def subscribe_mes_price(self):
+        """Subscribe to MES futures for delta hedging"""
+        if self.connection_state != ConnectionState.CONNECTED:
+            logger.warning("Cannot subscribe to MES: not connected")
+            return
+        
+        # Get front month
+        self.mes_front_month = self.get_mes_front_month()
+        
+        # Create MES contract
+        self.mes_contract = Contract()
+        self.mes_contract.symbol = self.instrument['hedge_symbol']  # "MES" for XSP
+        self.mes_contract.secType = self.instrument['hedge_sec_type']  # "FUT"
+        self.mes_contract.currency = "USD"
+        self.mes_contract.exchange = self.instrument['hedge_exchange']  # "CME"
+        self.mes_contract.lastTradeDateOrContractMonth = self.mes_front_month
+        
+        # Use a high request ID to avoid conflicts
+        self.mes_req_id = 9001
+        
+        # Request LIVE market data
+        self.ibkr_client.reqMarketDataType(1)
+        
+        # Use snapshot during market closed hours
+        use_snapshot = self.is_futures_market_closed()
+        
+        # Subscribe to market data
+        self.ibkr_client.reqMktData(self.mes_req_id, self.mes_contract, "", use_snapshot, False, [])
+        mode_str = "snapshot mode" if use_snapshot else "streaming mode"
+        self.log_message(f"✅ Subscribed to {self.mes_contract.symbol} futures {self.mes_front_month} ({mode_str}) for hedging", "SUCCESS")
+        logger.info(f"MES subscription: {self.mes_contract.symbol} {self.mes_front_month}, reqId={self.mes_req_id}")
+    
+    def update_mes_price(self, price: float):
+        """Update MES futures price (called from market data callback)"""
+        self.mes_price = price
+        logger.debug(f"MES price updated: {price:.2f}")
+    
     @pyqtSlot(float)
     def update_es_display(self, price: float):
         """Update ES futures price display"""
@@ -4259,8 +4489,15 @@ class MainWindow(QMainWindow):
         self.update_option_chain_cell(contract_key)
         
         # Update strike backgrounds based on delta-identified ATM
-        # This ensures the ATM strike is always accurately highlighted
-        self.update_strike_backgrounds_by_delta()
+        # Throttle this to run at most once per second to avoid excessive recentering checks
+        import time
+        current_time = time.time()
+        if not hasattr(self, '_last_atm_update_time'):
+            self._last_atm_update_time = 0
+        
+        if current_time - self._last_atm_update_time >= 1.0:  # Update at most once per second
+            self._last_atm_update_time = current_time
+            self.update_strike_backgrounds_by_delta()
     
     @pyqtSlot(str, dict)
     def on_position_update(self, contract_key: str, position_data: dict):
@@ -4966,8 +5203,14 @@ class MainWindow(QMainWindow):
         self.log_message("Refreshing option chain...", "INFO")
         self.request_option_chain()
     
-    def request_option_chain(self):
-        """Build and subscribe to option chain"""
+    def request_option_chain(self, force_center_strike=None):
+        """
+        Build and subscribe to option chain
+        
+        Args:
+            force_center_strike: If provided, use this strike as the center instead of calculating from price.
+                                This is used when recentering based on delta-detected ATM.
+        """
         if self.connection_state != ConnectionState.CONNECTED:
             self.log_message("Cannot request option chain - not connected", "WARNING")
             return
@@ -4985,11 +5228,13 @@ class MainWindow(QMainWindow):
             self.app_state['market_data_map'] = {k: v for k, v in self.app_state['market_data_map'].items() 
                                                   if not (isinstance(k, int) and 100 <= k <= 999)}
         
+        # If force_center_strike is provided, use it directly (delta-based recenter)
+        if force_center_strike is not None:
+            reference_price = force_center_strike
+            logger.info(f"🎯 RECENTERING on delta-detected ATM strike: ${reference_price:.2f}")
         # PRIORITY 1: Use actual underlying index price (XSP or SPX)
         # This is the CORRECT price for ATM strike calculation as it matches TWS
-        underlying_price = self.app_state.get('underlying_price', 0)
-        
-        if underlying_price > 0:
+        elif (underlying_price := self.app_state.get('underlying_price', 0)) > 0:
             reference_price = underlying_price
             logger.info(f"Using actual {self.instrument['underlying_symbol']} index price ${reference_price:.2f} for ATM calculation")
         else:
@@ -5109,8 +5354,14 @@ class MainWindow(QMainWindow):
         self.app_state['active_option_req_ids'] = new_req_ids
         self.log_message(f"Subscribed to {len(strikes) * 2} option contracts", "SUCCESS")
         
-        # Clear recentering flag now that chain is loaded
+        # Clear recentering flags now that chain is loaded
         self.is_recentering_chain = False
+        self.delta_calibration_done = False  # Reset calibration flag for new chain
+        
+        # Update recenter timestamp to give chain time to load and deltas to populate
+        # before allowing initial calibration check (prevent immediate re-recenter)
+        import time
+        self.last_recenter_time = time.time()
     
     def update_option_chain_cell(self, contract_key: str):
         """Update a single option chain row with market data"""
@@ -5220,7 +5471,10 @@ class MainWindow(QMainWindow):
         3. Colors strikes above ATM lighter blue
         4. Colors strikes below ATM darker blue
         5. Updates the ATM strike label in the header
-        6. Checks for drift and auto-recenters if needed
+        6. Checks for drift from the last chain center and auto-recenters if needed
+        
+        Note: last_chain_center_strike is updated by request_option_chain() when the chain
+        is loaded/reloaded. This method compares current ATM to that center point.
         """
         atm_strike = self.find_atm_strike_by_delta()
         
@@ -5232,6 +5486,7 @@ class MainWindow(QMainWindow):
         self.atm_strike_label.setStyleSheet("font-size: 12pt; font-weight: bold; color: #FFD700;")
         
         # Check for drift and auto-recenter if needed
+        # This compares ATM to last_chain_center_strike (set in request_option_chain)
         self.check_chain_drift_and_recenter(atm_strike)
         
         # Update all strike backgrounds based on delta-identified ATM
@@ -5264,6 +5519,11 @@ class MainWindow(QMainWindow):
         Check if the delta-based ATM strike has drifted from the chain center.
         Auto-recenter the chain if drift exceeds the configured threshold.
         
+        Special handling for initial calibration:
+        - On first ATM detection after chain load, if ATM is off-center by 2+ strikes,
+          immediately recenter (don't wait for full drift threshold)
+        - This handles large overnight moves where ES offset approximation is inaccurate
+        
         Args:
             atm_strike: The current ATM strike identified by 0.5 delta
         """
@@ -5277,37 +5537,73 @@ class MainWindow(QMainWindow):
         if self.is_recentering_chain:
             return  # Already recentering, don't trigger again
         
-        # Throttle recentering - don't recenter more than once per 10 seconds
+        # Throttle recentering - don't recenter too frequently
+        # During initial calibration: Wait 5 seconds after chain load for deltas to populate
+        # After calibration: Wait 10 seconds between recenters for normal drift
         import time
         current_time = time.time()
-        if current_time - self.last_recenter_time < 10:
+        min_recenter_interval = 5 if not self.delta_calibration_done else 10
+        if current_time - self.last_recenter_time < min_recenter_interval:
             return  # Too soon since last recenter
         
         # Calculate drift in number of strikes
         strike_increment = self.instrument['strike_increment']
         drift_strikes = abs(atm_strike - self.last_chain_center_strike) / strike_increment
         
-        # Check if drift exceeds threshold
-        if drift_strikes >= self.chain_drift_threshold:
+        # Check if this is initial calibration (first ATM detection after chain load)
+        # Initial calibration: If we just loaded chain and ATM is off by 2+ strikes, recenter immediately
+        # This handles cases where ES offset approximation is significantly wrong (e.g., big overnight moves)
+        is_initial_calibration = not self.delta_calibration_done
+        initial_calibration_threshold = 2  # Recenter immediately if off by 2+ strikes on initial detection
+        
+        should_recenter = False
+        reason = ""
+        
+        if is_initial_calibration and drift_strikes >= initial_calibration_threshold:
+            # Initial calibration: ATM detection shows chain is off-center
+            should_recenter = True
+            reason = "INITIAL CALIBRATION"
+            logger.info(
+                f"🎯 Initial ATM calibration: True ATM at {atm_strike:.0f}, "
+                f"chain centered at {self.last_chain_center_strike:.0f} "
+                f"({drift_strikes:.1f} strikes off) - RECENTERING IMMEDIATELY"
+            )
+            # Mark calibration as done (will be reset on next chain load)
+            self.delta_calibration_done = True
+        elif drift_strikes >= self.chain_drift_threshold:
+            # Normal drift: ATM moved beyond threshold
+            should_recenter = True
+            reason = "DRIFT THRESHOLD EXCEEDED"
             logger.info(
                 f"🎯 ATM drifted {drift_strikes:.0f} strikes from center "
                 f"(ATM: {atm_strike:.0f}, Center: {self.last_chain_center_strike:.0f}, "
                 f"Threshold: {self.chain_drift_threshold} strikes) - AUTO-RECENTERING"
             )
-            
+        else:
+            # If initial calibration check passed (drift < 2 strikes), mark it as done
+            if is_initial_calibration:
+                self.delta_calibration_done = True
+                logger.info(
+                    f"✅ Initial ATM calibration complete: ATM at {atm_strike:.0f}, "
+                    f"chain centered at {self.last_chain_center_strike:.0f} "
+                    f"({drift_strikes:.1f} strikes off - within tolerance)"
+                )
+        
+        if should_recenter:
             # Set flag and timestamp to prevent loops
             self.is_recentering_chain = True
             self.last_recenter_time = current_time
             
-            # Request new chain centered on current ATM
-            self.request_option_chain()
+            # Request new chain centered on current ATM (force center to detected ATM strike)
+            self.request_option_chain(force_center_strike=atm_strike)
         else:
-            # Log debug info about current drift
-            logger.debug(
-                f"ATM drift: {drift_strikes:.1f} strikes "
-                f"(ATM: {atm_strike:.0f}, Center: {self.last_chain_center_strike:.0f}, "
-                f"Threshold: {self.chain_drift_threshold})"
-            )
+            # Log debug info about current drift (only after initial calibration is done)
+            if self.delta_calibration_done:
+                logger.debug(
+                    f"ATM drift: {drift_strikes:.1f} strikes "
+                    f"(ATM: {atm_strike:.0f}, Center: {self.last_chain_center_strike:.0f}, "
+                    f"Threshold: {self.chain_drift_threshold})"
+                )
     
     def on_option_cell_clicked(self, row: int, col: int):
         """Handle option chain cell click - with Ctrl+click for quick trading"""
@@ -7459,6 +7755,618 @@ class MainWindow(QMainWindow):
             self.log_message(f"Error during cleanup: {str(e)}", "ERROR")
             logger.error(f"Cleanup error: {e}", exc_info=True)
     
+    # ========================================================================
+    # VEGA DELTA NEUTRAL STRATEGY METHODS
+    # ========================================================================
+    
+    def on_vega_strategy_toggle(self, state):
+        """Handle vega strategy enable/disable toggle"""
+        self.vega_strategy_enabled = (state == Qt.CheckState.Checked.value)
+        status = "ENABLED" if self.vega_strategy_enabled else "DISABLED"
+        self.log_message(f"Vega Strategy: {status}", "INFO")
+        logger.info(f"Vega strategy toggled: {status}")
+        
+        if self.vega_strategy_enabled:
+            self.log_message("Vega strategy is now active. Use 'Scan for Opportunities' to find trades.", "SUCCESS")
+        else:
+            self.log_message("Vega strategy is now inactive.", "INFO")
+    
+    def on_auto_hedge_toggle(self, state):
+        """Handle auto delta hedging enable/disable toggle"""
+        self.auto_hedge_enabled = (state == Qt.CheckState.Checked.value)
+        status = "ENABLED" if self.auto_hedge_enabled else "DISABLED"
+        self.log_message(f"Auto Delta Hedging: {status}", "INFO")
+        logger.info(f"Auto delta hedging toggled: {status}")
+        
+        if self.auto_hedge_enabled:
+            self.log_message("Auto hedging active. Portfolio delta will be monitored continuously.", "SUCCESS")
+            # Start monitoring timer
+            QTimer.singleShot(5000, self.monitor_portfolio_delta)
+        else:
+            self.log_message("Auto hedging disabled. Use manual hedge button when needed.", "INFO")
+    
+    def scan_vega_opportunities(self):
+        """Scan the option chain for vega trading opportunities"""
+        try:
+            if not self.connection_state == ConnectionState.CONNECTED:
+                self.log_message("Cannot scan: Not connected to IBKR", "ERROR")
+                return
+            
+            if not self.current_expiry:
+                self.log_message("Cannot scan: No expiry selected", "ERROR")
+                return
+            
+            self.log_message("🔍 Scanning for vega opportunities...", "INFO")
+            logger.info("Starting vega opportunity scan")
+            
+            # Clear previous results
+            self.vega_scan_results.clear()
+            self.vega_scanner_table.setRowCount(0)
+            
+            # Get current ATM strike using delta method
+            atm_strike = self.find_atm_strike_by_delta()
+            
+            if not atm_strike or atm_strike == 0:
+                # Fallback to ES-adjusted price
+                atm_strike = self.get_adjusted_es_price()
+            
+            if not atm_strike or atm_strike == 0:
+                self.log_message("Cannot determine ATM strike for scan", "ERROR")
+                return
+            
+            # Scan logic: Look for strangles around ATM
+            # Typically 5-10 delta OTM options (about 1-2 strikes away from ATM)
+            strike_increment = self.instrument['strike_increment']
+            
+            # Find put and call strikes for strangle
+            put_strike = atm_strike - (2 * strike_increment)
+            call_strike = atm_strike + (2 * strike_increment)
+            
+            # Build contract keys
+            put_key = f"{self.instrument['options_symbol']}_{put_strike}_P_{self.current_expiry}"
+            call_key = f"{self.instrument['options_symbol']}_{call_strike}_C_{self.current_expiry}"
+            
+            # Get market data for both legs
+            put_data = self.market_data.get(put_key, {})
+            call_data = self.market_data.get(call_key, {})
+            
+            put_mid = (put_data.get('bid', 0) + put_data.get('ask', 0)) / 2 if put_data.get('bid') and put_data.get('ask') else 0
+            call_mid = (call_data.get('bid', 0) + call_data.get('ask', 0)) / 2 if call_data.get('bid') and call_data.get('ask') else 0
+            
+            if put_mid == 0 or call_mid == 0:
+                self.log_message("Insufficient market data for scan. Ensure chain is loaded.", "WARNING")
+                return
+            
+            total_cost = put_mid + call_mid
+            
+            # Get IV values
+            put_iv = put_data.get('impliedVolatility', 0) * 100
+            call_iv = call_data.get('impliedVolatility', 0) * 100
+            avg_iv = (put_iv + call_iv) / 2 if put_iv and call_iv else 0
+            
+            # For now, calculate simple IV rank (would need historical data for true IV rank)
+            # Placeholder: assume IV rank based on absolute IV level
+            iv_rank = "Low" if avg_iv < 15 else ("Medium" if avg_iv < 25 else "High")
+            
+            # Add to results
+            result = {
+                'expiry': self.current_expiry,
+                'iv_rank': iv_rank,
+                'put_strike': put_strike,
+                'put_iv': put_iv,
+                'call_strike': call_strike,
+                'call_iv': call_iv,
+                'total_cost': total_cost,
+                'put_key': put_key,
+                'call_key': call_key
+            }
+            
+            self.vega_scan_results.append(result)
+            
+            # Update scanner table
+            self.update_vega_scanner_table()
+            
+            self.log_message(f"✅ Scan complete. Found {len(self.vega_scan_results)} opportunity(ies)", "SUCCESS")
+            logger.info(f"Vega scan complete: {len(self.vega_scan_results)} results")
+            
+        except Exception as e:
+            logger.error(f"Error in scan_vega_opportunities: {e}", exc_info=True)
+            self.log_message(f"Scan error: {e}", "ERROR")
+    
+    def update_vega_scanner_table(self):
+        """Update the vega scanner results table"""
+        try:
+            self.vega_scanner_table.setRowCount(len(self.vega_scan_results))
+            
+            for row, result in enumerate(self.vega_scan_results):
+                # Expiry
+                self.vega_scanner_table.setItem(row, 0, QTableWidgetItem(result['expiry']))
+                
+                # IV Rank
+                self.vega_scanner_table.setItem(row, 1, QTableWidgetItem(result['iv_rank']))
+                
+                # Put Strike
+                self.vega_scanner_table.setItem(row, 2, QTableWidgetItem(f"{result['put_strike']:.1f}"))
+                
+                # Put IV
+                self.vega_scanner_table.setItem(row, 3, QTableWidgetItem(f"{result['put_iv']:.1f}%"))
+                
+                # Call Strike
+                self.vega_scanner_table.setItem(row, 4, QTableWidgetItem(f"{result['call_strike']:.1f}"))
+                
+                # Call IV
+                self.vega_scanner_table.setItem(row, 5, QTableWidgetItem(f"{result['call_iv']:.1f}%"))
+                
+                # Total Cost
+                self.vega_scanner_table.setItem(row, 6, QTableWidgetItem(f"${result['total_cost']:.2f}"))
+                
+                # Action button
+                enter_btn = QPushButton("Enter Trade")
+                enter_btn.clicked.connect(lambda checked, r=result: self.enter_vega_trade(r))
+                self.vega_scanner_table.setCellWidget(row, 7, enter_btn)
+        
+        except Exception as e:
+            logger.error(f"Error updating vega scanner table: {e}", exc_info=True)
+    
+    def enter_vega_trade(self, result):
+        """Enter a vega delta neutral trade (long strangle + delta hedge)"""
+        try:
+            if not self.vega_strategy_enabled:
+                self.log_message("Vega strategy is not enabled", "WARNING")
+                return
+            
+            self.log_message(f"🎯 Entering vega trade: {result['put_strike']}/{result['call_strike']} strangle", "INFO")
+            logger.info(f"Entering vega trade: {result}")
+            
+            # Generate unique trade ID
+            trade_id = f"VEGA_{int(datetime.now().timestamp())}"
+            
+            # Place orders for both legs (long strangle)
+            quantity = 1  # Start with 1 contract each
+            
+            # Buy Put
+            put_data = self.market_data.get(result['put_key'], {})
+            put_mid = (put_data.get('bid', 0) + put_data.get('ask', 0)) / 2 if put_data.get('bid') and put_data.get('ask') else 0
+            
+            if put_mid > 0:
+                self.place_order(result['put_key'], "BUY", quantity, put_mid, enable_chasing=True)
+                self.log_message(f"  ✓ BUY {quantity} PUT @ {result['put_strike']}", "SUCCESS")
+            else:
+                self.log_message("Cannot enter: No put price", "ERROR")
+                return
+            
+            # Buy Call
+            call_data = self.market_data.get(result['call_key'], {})
+            call_mid = (call_data.get('bid', 0) + call_data.get('ask', 0)) / 2 if call_data.get('bid') and call_data.get('ask') else 0
+            
+            if call_mid > 0:
+                self.place_order(result['call_key'], "BUY", quantity, call_mid, enable_chasing=True)
+                self.log_message(f"  ✓ BUY {quantity} CALL @ {result['call_strike']}", "SUCCESS")
+            else:
+                self.log_message("Cannot enter: No call price", "ERROR")
+                return
+            
+            # Store vega position
+            self.vega_positions[trade_id] = {
+                'entry_time': datetime.now().strftime('%H:%M:%S'),
+                'put_key': result['put_key'],
+                'call_key': result['call_key'],
+                'put_strike': result['put_strike'],
+                'call_strike': result['call_strike'],
+                'put_qty': quantity,
+                'call_qty': quantity,
+                'hedge_shares': 0,  # Will be calculated and set by delta hedge
+                'entry_cost': result['total_cost'] * quantity * self.instrument['multiplier']
+            }
+            
+            self.log_message(f"✅ Vega trade entered: {trade_id}", "SUCCESS")
+            
+            # Execute initial delta hedge
+            QTimer.singleShot(2000, lambda: self.calculate_and_hedge_delta(trade_id))
+            
+            # Update display
+            self.update_vega_positions_table()
+            
+        except Exception as e:
+            logger.error(f"Error entering vega trade: {e}", exc_info=True)
+            self.log_message(f"Error entering trade: {e}", "ERROR")
+    
+    def place_mes_hedge_order(self, action: str, quantity: int, trade_id: Optional[str] = None):
+        """
+        Place MES futures hedge order.
+        
+        Args:
+            action: "BUY" or "SELL"
+            quantity: Number of MES contracts
+            trade_id: Optional trade ID to associate hedge with specific vega position
+            
+        Returns:
+            bool: True if order placed successfully, False otherwise
+        """
+        try:
+            if self.connection_state != ConnectionState.CONNECTED:
+                self.log_message("Cannot place hedge: Not connected to IBKR", "ERROR")
+                return False
+            
+            if not self.mes_contract:
+                self.log_message("MES contract not initialized. Subscribing now...", "WARNING")
+                self.subscribe_mes_price()
+                QTimer.singleShot(2000, lambda: self.place_mes_hedge_order(action, quantity, trade_id))
+                return False
+            
+            if self.next_order_id is None:
+                self.log_message("Cannot place hedge: No order ID available", "ERROR")
+                return False
+            
+            # Create order
+            order = Order()
+            order.action = action
+            order.orderType = "MKT"  # Market order for immediate execution
+            order.totalQuantity = quantity
+            order.transmit = True
+            
+            # Get order ID
+            order_id = self.next_order_id
+            self.next_order_id += 1
+            
+            # Track hedge order
+            self.hedge_orders[order_id] = {
+                'trade_id': trade_id,
+                'action': action,
+                'quantity': quantity,
+                'contract': self.mes_contract.symbol,
+                'month': self.mes_contract.lastTradeDateOrContractMonth,
+                'timestamp': datetime.now().strftime('%H:%M:%S')
+            }
+            
+            # Place order
+            self.ibkr_client.placeOrder(order_id, self.mes_contract, order)
+            
+            logger.info(f"MES hedge order placed: ID={order_id}, {action} {quantity} {self.mes_contract.symbol} {self.mes_contract.lastTradeDateOrContractMonth}")
+            self.log_message(f"🛡️ Hedge order #{order_id}: {action} {quantity} MES", "INFO")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error placing MES hedge order: {e}", exc_info=True)
+            self.log_message(f"Error placing hedge: {e}", "ERROR")
+            return False
+    
+    def calculate_and_hedge_delta(self, trade_id):
+        """Calculate portfolio delta and place hedge order"""
+        try:
+            if trade_id not in self.vega_positions:
+                logger.warning(f"Trade ID {trade_id} not found in vega positions")
+                return
+            
+            position = self.vega_positions[trade_id]
+            
+            # Get greeks for both legs
+            put_data = self.market_data.get(position['put_key'], {})
+            call_data = self.market_data.get(position['call_key'], {})
+            
+            put_delta = put_data.get('delta', 0)
+            call_delta = call_data.get('delta', 0)
+            
+            # Calculate position delta (per contract)
+            position_delta = (put_delta * position['put_qty']) + (call_delta * position['call_qty'])
+            
+            # Multiply by multiplier to get actual delta
+            total_delta = position_delta * self.instrument['multiplier']
+            
+            self.log_message(f"Position delta: {total_delta:.2f}", "INFO")
+            
+            # Calculate shares needed to hedge
+            # To neutralize delta, we need to short if delta is positive, long if negative
+            shares_needed = -int(total_delta)  # Negative of delta, rounded to nearest share
+            
+            if shares_needed == 0:
+                self.log_message("Delta already neutral (< 1 share needed)", "INFO")
+                return
+            
+            # Determine action
+            action = "BUY" if shares_needed > 0 else "SELL"
+            shares = abs(shares_needed)
+            
+            self.log_message(f"🛡️ Delta hedge required: {total_delta:.2f} delta", "INFO")
+            
+            # Calculate MES contracts needed
+            # XSP option delta (100 multiplier) / MES multiplier (5) = MES contracts
+            # Example: 50 delta / 5 = 10 MES contracts
+            mes_contracts_raw = total_delta / self.instrument['hedge_multiplier']
+            mes_contracts = int(round(mes_contracts_raw))
+            
+            if mes_contracts == 0:
+                self.log_message("Delta already neutral (< 1 MES contract needed)", "INFO")
+                position['hedge_contracts'] = 0
+                self.vega_positions[trade_id] = position
+                self.update_vega_positions_table()
+                return
+            
+            # Determine action (opposite of delta to neutralize)
+            # Positive delta = bullish exposure → SELL MES to neutralize
+            # Negative delta = bearish exposure → BUY MES to neutralize
+            action = "SELL" if mes_contracts > 0 else "BUY"
+            quantity = abs(mes_contracts)
+            
+            mes_month = self.mes_contract.lastTradeDateOrContractMonth if self.mes_contract else "pending"
+            self.log_message(f"📊 Calculated hedge: {action} {quantity} MES contracts ({mes_month})", "INFO")
+            
+            # Place MES hedge order
+            success = self.place_mes_hedge_order(action, quantity, trade_id)
+            
+            if success:
+                # Update position record with actual hedge placed
+                position['hedge_contracts'] = -mes_contracts  # Store negative for SELL, positive for BUY
+                position['hedge_symbol'] = self.mes_contract.symbol if self.mes_contract else "MES"
+                position['hedge_month'] = self.mes_contract.lastTradeDateOrContractMonth if self.mes_contract else mes_month
+                self.vega_positions[trade_id] = position
+                self.log_message(f"✅ Hedge order placed: {action} {quantity} MES", "SUCCESS")
+            else:
+                self.log_message(f"❌ Failed to place hedge order", "ERROR")
+            
+            # Update display
+            self.update_vega_positions_table()
+            
+        except Exception as e:
+            logger.error(f"Error calculating delta hedge: {e}", exc_info=True)
+            self.log_message(f"Error calculating hedge: {e}", "ERROR")
+    
+    def manual_delta_hedge(self):
+        """Manually execute delta hedge for all vega positions"""
+        try:
+            if not self.vega_positions:
+                self.log_message("No active vega positions to hedge", "INFO")
+                return
+            
+            self.log_message("⚖️ Executing manual delta hedge...", "INFO")
+            
+            # Calculate total portfolio delta from all vega positions
+            total_delta = 0
+            
+            for trade_id, position in self.vega_positions.items():
+                put_data = self.market_data.get(position['put_key'], {})
+                call_data = self.market_data.get(position['call_key'], {})
+                
+                put_delta = put_data.get('delta', 0) * position['put_qty']
+                call_delta = call_data.get('delta', 0) * position['call_qty']
+                
+                total_delta += (put_delta + call_delta) * self.instrument['multiplier']
+            
+            self.log_message(f"Total portfolio delta: {total_delta:.2f}", "INFO")
+            
+            # Update portfolio greeks display
+            self.portfolio_greeks['delta'] = total_delta
+            self.update_portfolio_greeks_display()
+            
+            # Calculate hedge needed
+            shares_needed = -int(total_delta)
+            
+            if abs(shares_needed) < 1:
+                self.log_message("✅ Portfolio already delta neutral", "SUCCESS")
+                return
+            
+            # Calculate MES contracts needed
+            mes_contracts_raw = total_delta / self.instrument['hedge_multiplier']
+            mes_contracts = int(round(mes_contracts_raw))
+            
+            if mes_contracts == 0:
+                self.log_message("✅ Portfolio already delta neutral (< 1 MES contract)", "SUCCESS")
+                return
+            
+            # Determine action
+            action = "SELL" if mes_contracts > 0 else "BUY"
+            quantity = abs(mes_contracts)
+            
+            self.log_message(f"📊 Portfolio hedge: {action} {quantity} MES contracts (Δ={total_delta:.2f})", "INFO")
+            
+            # Place aggregate hedge order (not tied to specific trade)
+            success = self.place_mes_hedge_order(action, quantity, trade_id=None)
+            
+            if success:
+                self.log_message(f"✅ Portfolio hedge placed: {action} {quantity} MES", "SUCCESS")
+            else:
+                self.log_message(f"❌ Failed to place portfolio hedge", "ERROR")
+            
+        except Exception as e:
+            logger.error(f"Error in manual_delta_hedge: {e}", exc_info=True)
+            self.log_message(f"Error executing hedge: {e}", "ERROR")
+    
+    def monitor_portfolio_delta(self):
+        """Continuously monitor portfolio delta and auto-hedge if needed"""
+        try:
+            if not self.auto_hedge_enabled or not self.vega_positions:
+                # Stop monitoring if auto-hedge disabled or no positions
+                return
+            
+            # Calculate current portfolio delta
+            total_delta = 0
+            for trade_id, position in self.vega_positions.items():
+                put_data = self.market_data.get(position['put_key'], {})
+                call_data = self.market_data.get(position['call_key'], {})
+                
+                put_delta = put_data.get('delta', 0) * position['put_qty']
+                call_delta = call_data.get('delta', 0) * position['call_qty']
+                
+                total_delta += (put_delta + call_delta) * self.instrument['multiplier']
+            
+            self.portfolio_greeks['delta'] = total_delta
+            self.update_portfolio_greeks_display()
+            
+            # Check if rehedge needed
+            threshold = self.max_delta_threshold_spin.value()
+            if abs(total_delta) > threshold:
+                self.log_message(f"⚠️ Delta threshold breached: {total_delta:.2f} (threshold: ±{threshold})", "WARNING")
+                # Trigger auto-hedge
+                # Note: This would place actual hedge orders
+                self.manual_delta_hedge()
+            
+            # Schedule next check (every 30 seconds)
+            if self.auto_hedge_enabled:
+                QTimer.singleShot(30000, self.monitor_portfolio_delta)
+            
+        except Exception as e:
+            logger.error(f"Error monitoring portfolio delta: {e}", exc_info=True)
+    
+    def update_portfolio_greeks_display(self):
+        """Update the portfolio greeks display labels"""
+        try:
+            # Update labels with color coding
+            delta = self.portfolio_greeks.get('delta', 0)
+            self.portfolio_delta_label.setText(f"{delta:.2f}")
+            
+            # Color code delta (green if near zero, yellow if moderate, red if high)
+            if abs(delta) < 5:
+                self.portfolio_delta_label.setStyleSheet("font-size: 14pt; font-weight: bold; color: #00ff00;")
+            elif abs(delta) < 15:
+                self.portfolio_delta_label.setStyleSheet("font-size: 14pt; font-weight: bold; color: #ffff00;")
+            else:
+                self.portfolio_delta_label.setStyleSheet("font-size: 14pt; font-weight: bold; color: #ff0000;")
+            
+            # Update other greeks
+            self.portfolio_gamma_label.setText(f"{self.portfolio_greeks.get('gamma', 0):.2f}")
+            self.portfolio_vega_label.setText(f"{self.portfolio_greeks.get('vega', 0):.2f}")
+            self.portfolio_theta_label.setText(f"{self.portfolio_greeks.get('theta', 0):.2f}")
+            
+        except Exception as e:
+            logger.error(f"Error updating portfolio greeks display: {e}", exc_info=True)
+    
+    def update_vega_positions_table(self):
+        """Update the active vega positions table"""
+        try:
+            self.vega_positions_table.setRowCount(len(self.vega_positions))
+            
+            row = 0
+            for trade_id, position in self.vega_positions.items():
+                # Trade ID
+                self.vega_positions_table.setItem(row, 0, QTableWidgetItem(trade_id))
+                
+                # Entry Time
+                self.vega_positions_table.setItem(row, 1, QTableWidgetItem(position['entry_time']))
+                
+                # Put
+                put_str = f"{position['put_strike']} x{position['put_qty']}"
+                self.vega_positions_table.setItem(row, 2, QTableWidgetItem(put_str))
+                
+                # Call
+                call_str = f"{position['call_strike']} x{position['call_qty']}"
+                self.vega_positions_table.setItem(row, 3, QTableWidgetItem(call_str))
+                
+                # Hedge MES Contracts (show with sign: -10 = short 10, +10 = long 10)
+                hedge_contracts = position.get('hedge_contracts', 0)
+                hedge_str = f"{hedge_contracts:+d} MES" if hedge_contracts != 0 else "None"
+                self.vega_positions_table.setItem(row, 4, QTableWidgetItem(hedge_str))
+                
+                # Get current greeks
+                put_data = self.market_data.get(position['put_key'], {})
+                call_data = self.market_data.get(position['call_key'], {})
+                
+                put_delta = put_data.get('delta', 0) * position['put_qty']
+                call_delta = call_data.get('delta', 0) * position['call_qty']
+                pos_delta = (put_delta + call_delta) * self.instrument['multiplier']
+                
+                put_gamma = put_data.get('gamma', 0) * position['put_qty']
+                call_gamma = call_data.get('gamma', 0) * position['call_qty']
+                pos_gamma = (put_gamma + call_gamma) * self.instrument['multiplier']
+                
+                put_vega = put_data.get('vega', 0) * position['put_qty']
+                call_vega = call_data.get('vega', 0) * position['call_qty']
+                pos_vega = (put_vega + call_vega) * self.instrument['multiplier']
+                
+                put_theta = put_data.get('theta', 0) * position['put_qty']
+                call_theta = call_data.get('theta', 0) * position['call_qty']
+                pos_theta = (put_theta + call_theta) * self.instrument['multiplier']
+                
+                # Portfolio Greeks
+                self.vega_positions_table.setItem(row, 5, QTableWidgetItem(f"{pos_delta:.2f}"))
+                self.vega_positions_table.setItem(row, 6, QTableWidgetItem(f"{pos_gamma:.2f}"))
+                self.vega_positions_table.setItem(row, 7, QTableWidgetItem(f"{pos_vega:.2f}"))
+                self.vega_positions_table.setItem(row, 8, QTableWidgetItem(f"{pos_theta:.2f}"))
+                
+                # Calculate P&L
+                put_mid = (put_data.get('bid', 0) + put_data.get('ask', 0)) / 2 if put_data.get('bid') and put_data.get('ask') else 0
+                call_mid = (call_data.get('bid', 0) + call_data.get('ask', 0)) / 2 if call_data.get('bid') and call_data.get('ask') else 0
+                
+                current_value = (put_mid * position['put_qty'] + call_mid * position['call_qty']) * self.instrument['multiplier']
+                pnl = current_value - position.get('entry_cost', 0)
+                
+                pnl_item = QTableWidgetItem(f"${pnl:.2f}")
+                if pnl > 0:
+                    pnl_item.setForeground(QColor(0, 255, 0))  # Green for profit
+                else:
+                    pnl_item.setForeground(QColor(255, 0, 0))  # Red for loss
+                self.vega_positions_table.setItem(row, 9, pnl_item)
+                
+                # Action button (Close)
+                close_btn = QPushButton("Close")
+                close_btn.clicked.connect(lambda checked, tid=trade_id: self.close_vega_position(tid))
+                self.vega_positions_table.setCellWidget(row, 10, close_btn)
+                
+                row += 1
+        
+        except Exception as e:
+            logger.error(f"Error updating vega positions table: {e}", exc_info=True)
+    
+    def close_vega_position(self, trade_id):
+        """Close a vega position (sell both legs)"""
+        try:
+            if trade_id not in self.vega_positions:
+                self.log_message(f"Position {trade_id} not found", "ERROR")
+                return
+            
+            position = self.vega_positions[trade_id]
+            
+            self.log_message(f"🔴 Closing vega position: {trade_id}", "INFO")
+            
+            # Sell Put
+            put_data = self.market_data.get(position['put_key'], {})
+            put_mid = (put_data.get('bid', 0) + put_data.get('ask', 0)) / 2 if put_data.get('bid') and put_data.get('ask') else 0
+            
+            if put_mid > 0:
+                self.place_order(position['put_key'], "SELL", position['put_qty'], put_mid, enable_chasing=True)
+                self.log_message(f"  ✓ SELL {position['put_qty']} PUT @ {position['put_strike']}", "SUCCESS")
+            
+            # Sell Call
+            call_data = self.market_data.get(position['call_key'], {})
+            call_mid = (call_data.get('bid', 0) + call_data.get('ask', 0)) / 2 if call_data.get('bid') and call_data.get('ask') else 0
+            
+            if call_mid > 0:
+                self.place_order(position['call_key'], "SELL", position['call_qty'], call_mid, enable_chasing=True)
+                self.log_message(f"  ✓ SELL {position['call_qty']} CALL @ {position['call_strike']}", "SUCCESS")
+            
+            # Close MES hedge position automatically
+            hedge_contracts = position.get('hedge_contracts', 0)
+            if hedge_contracts != 0:
+                # Opposite action to close
+                # If we SOLD MES (negative contracts), we need to BUY to close
+                # If we BOUGHT MES (positive contracts), we need to SELL to close
+                close_action = "BUY" if hedge_contracts < 0 else "SELL"
+                close_quantity = abs(hedge_contracts)
+                
+                self.log_message(f"🛡️ Closing hedge: {close_action} {close_quantity} MES", "INFO")
+                success = self.place_mes_hedge_order(close_action, close_quantity, trade_id)
+                
+                if success:
+                    self.log_message(f"  ✓ Hedge closed: {close_action} {close_quantity} MES", "SUCCESS")
+                else:
+                    self.log_message(f"  ❌ Failed to close hedge - may need manual intervention", "WARNING")
+            
+            # Remove from active positions
+            del self.vega_positions[trade_id]
+            
+            self.log_message(f"✅ Vega position fully closed: {trade_id}", "SUCCESS")
+            
+            # Update display
+            self.update_vega_positions_table()
+            
+        except Exception as e:
+            logger.error(f"Error closing vega position: {e}", exc_info=True)
+            self.log_message(f"Error closing position: {e}", "ERROR")
+    
+    # ========================================================================
+    # END VEGA DELTA NEUTRAL STRATEGY METHODS
+    # ========================================================================
+
     def closeEvent(self, a0):  # type: ignore[override]
         """Handle window close event"""
         reply = QMessageBox.question(
