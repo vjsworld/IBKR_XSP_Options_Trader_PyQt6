@@ -205,8 +205,8 @@ INSTRUMENT_CONFIG = {
         'underlying_exchange': 'CBOE',       # CBOE exchange like SPX
         'multiplier': '100',
         'strike_increment': 1.0,             # $1 increments (1/10 of SPX)
-        'tick_size_above_3': 0.05,
-        'tick_size_below_3': 0.05,
+        'tick_size_above_3': 0.01,           # XSP trades in $0.01 increments (all prices)
+        'tick_size_below_3': 0.01,           # XSP trades in $0.01 increments (all prices)
         'description': 'Mini-SPX Index Options (1/10 size of SPX, $100 multiplier)',
         'hedge_instrument': 'MES',           # Hedge with Micro E-mini S&P 500 futures
         'hedge_symbol': 'MES',
@@ -2087,7 +2087,7 @@ class MainWindow(QMainWindow):
         self.offset_save_timer.start(60000)  # Save every 60 seconds
         
         # Manual trading settings
-        self.give_in_interval = 10.0  # Seconds between "give in" price adjustments (configurable)
+        self.give_in_interval = 5.0  # Seconds between "give in" price adjustments (configurable)
         
         # Master Settings (Strategy Control Panel)
         self.strategy_enabled = False  # Strategy automation OFF by default
@@ -6292,11 +6292,11 @@ class MainWindow(QMainWindow):
             ask_price = market_data.get('ask', 0)
             bid_price = market_data.get('bid', 0)
             
-            # Determine tick size based on current mid price
+            # Determine tick size based on current mid price (from instrument configuration)
             if current_mid >= 3.0:
-                tick_size = 0.10
+                tick_size = self.instrument['tick_size_above_3']
             else:
-                tick_size = 0.05
+                tick_size = self.instrument['tick_size_below_3']
             
             should_update = False
             update_reason = ""
@@ -6312,8 +6312,9 @@ class MainWindow(QMainWindow):
                 should_update = True
                 update_reason = f"Give in timer ({time_since_last_update:.1f}s) → X_ticks={give_in_ticks}"
             
-            # Check if mid-price has moved significantly
-            if abs(current_mid - order_info['last_mid']) >= 0.05:
+            # Check if mid-price has moved significantly (use minimum tick size as threshold)
+            min_tick = min(self.instrument['tick_size_above_3'], self.instrument['tick_size_below_3'])
+            if abs(current_mid - order_info['last_mid']) >= min_tick:
                 should_update = True
                 if update_reason:
                     update_reason += f" + Mid moved ${order_info['last_mid']:.2f}→${current_mid:.2f}"
