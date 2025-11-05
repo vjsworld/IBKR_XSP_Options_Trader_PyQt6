@@ -6868,9 +6868,6 @@ class MainWindow(QMainWindow):
             pnl_pct = (pos['currentPrice'] / pos['avgCost'] - 1) * 100 if pos['avgCost'] > 0 else 0
             total_pnl += pnl
             
-            # Check if option is worthless (price at or near zero)
-            is_worthless = pos['currentPrice'] <= 0.01
-            
             # Calculate time tracking
             entry_time = pos.get('entryTime', datetime.now())
             time_span = datetime.now() - entry_time
@@ -6887,22 +6884,14 @@ class MainWindow(QMainWindow):
             total_cost_basis += cost_basis
             total_mkt_value += market_value
             
-            # Format P&L display - show "TOTAL LOSS" for worthless options
-            if is_worthless and pos['position'] > 0:
-                pnl_display = f"${pnl:.2f} (TOTAL LOSS)"
-                pnl_pct_display = "-100.00% (WORTHLESS)"
-            else:
-                pnl_display = f"${pnl:.2f}"
-                pnl_pct_display = f"{pnl_pct:.2f}%"
-            
             # Populate row (11 columns now: Contract, Qty, Entry, Current, P&L, P&L %, $ Cost Basis, $ Mkt Value, EntryTime, TimeSpan, Action)
             items = [
                 QTableWidgetItem(contract_key),
                 QTableWidgetItem(f"{pos['position']:.0f}"),
                 QTableWidgetItem(f"${pos['avgCost']:.2f}"),
                 QTableWidgetItem(f"${pos['currentPrice']:.2f}"),
-                QTableWidgetItem(pnl_display),
-                QTableWidgetItem(pnl_pct_display),
+                QTableWidgetItem(f"${pnl:.2f}"),
+                QTableWidgetItem(f"{pnl_pct:.2f}%"),
                 QTableWidgetItem(f"${cost_basis:.2f}"),
                 QTableWidgetItem(f"${market_value:.2f}"),
                 QTableWidgetItem(entry_time_str),
@@ -8490,17 +8479,7 @@ class MainWindow(QMainWindow):
                 current_value = (put_mid * position['put_qty'] + call_mid * position['call_qty']) * self.instrument['multiplier']
                 pnl = current_value - position.get('entry_cost', 0)
                 
-                # Check if both options are worthless (near zero value)
-                is_worthless = put_mid <= 0.01 and call_mid <= 0.01
-                entry_cost = position.get('entry_cost', 0)
-                
-                # Format P&L display - show "TOTAL LOSS" for worthless positions
-                if is_worthless and entry_cost > 0:
-                    pnl_display = f"${pnl:.2f} (TOTAL LOSS)"
-                else:
-                    pnl_display = f"${pnl:.2f}"
-                
-                pnl_item = QTableWidgetItem(pnl_display)
+                pnl_item = QTableWidgetItem(f"${pnl:.2f}")
                 if pnl > 0:
                     pnl_item.setForeground(QColor(0, 255, 0))  # Green for profit
                 else:
@@ -8828,27 +8807,17 @@ class MainWindow(QMainWindow):
                     pnl = current_value - entry_cost
                     pnl_pct = (pnl / entry_cost * 100) if entry_cost > 0 else 0
                     
-                    # Check if both options are worthless (near zero value)
-                    is_worthless = call_mid <= 0.01 and put_mid <= 0.01
-                    
                     # Current Value
                     value_item = QTableWidgetItem(f"${current_value:.2f}")
                     self.straddle_positions_table.setItem(row, 7, value_item)
                     
-                    # P&L - show "TOTAL LOSS" for worthless straddles
-                    if is_worthless and entry_cost > 0:
-                        pnl_display = f"${pnl:+.2f} (TOTAL LOSS)"
-                        pnl_pct_display = "-100.0% (WORTHLESS)"
-                    else:
-                        pnl_display = f"${pnl:+.2f}"
-                        pnl_pct_display = f"{pnl_pct:+.1f}%"
-                    
-                    pnl_item = QTableWidgetItem(pnl_display)
+                    # P&L
+                    pnl_item = QTableWidgetItem(f"${pnl:+.2f}")
                     pnl_item.setForeground(QColor("#00ff00") if pnl >= 0 else QColor("#ff4444"))
                     self.straddle_positions_table.setItem(row, 8, pnl_item)
                     
                     # P&L %
-                    pnl_pct_item = QTableWidgetItem(pnl_pct_display)
+                    pnl_pct_item = QTableWidgetItem(f"{pnl_pct:+.1f}%")
                     pnl_pct_item.setForeground(QColor("#00ff00") if pnl_pct >= 0 else QColor("#ff4444"))
                     self.straddle_positions_table.setItem(row, 9, pnl_pct_item)
                     
