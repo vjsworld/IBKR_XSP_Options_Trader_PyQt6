@@ -6862,11 +6862,16 @@ class MainWindow(QMainWindow):
                     current_price = (bid + ask) / 2
                     pos['currentPrice'] = current_price
                     pos['pnl'] = (current_price - pos['avgCost']) * pos['position'] * 100
-                elif bid == 0 and ask == 0:
-                    # Option is worthless - set price to 0 and calculate total loss
+                else:
+                    # Option has no valid bid/ask (worthless or no market data)
+                    # Treat as worthless: set price to 0 and calculate total loss
                     pos['currentPrice'] = 0.0
                     pos['pnl'] = (0.0 - pos['avgCost']) * pos['position'] * 100
                     # Removed debug spam - position updates every second don't need logging
+            else:
+                # No market data at all - treat as worthless
+                pos['currentPrice'] = 0.0
+                pos['pnl'] = (0.0 - pos['avgCost']) * pos['position'] * 100
             
             pnl = pos.get('pnl', 0)
             pnl_pct = (pos['currentPrice'] / pos['avgCost'] - 1) * 100 if pos['avgCost'] > 0 else 0
