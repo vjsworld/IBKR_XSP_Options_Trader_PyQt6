@@ -1,0 +1,304 @@
+{**********************************************************************
+ * TradeStation EasyLanguage Indicator - IBKR Auto Trading Example
+ * 
+ * This indicator demonstrates how to send entry and exit signals to
+ * the IBKR XSP Options Trader Python application via GlobalDictionary
+ * 
+ * Dictionary Name: IBKR_TRADER (must match Python application)
+ * 
+ * Features:
+ * - RSI-based entry signals (BUY_CALL, BUY_PUT, BUY_STRADDLE)
+ * - Multiple exit strategies (CLOSE_ALL, CLOSE_CALLS, CLOSE_PUTS)
+ * - Signal counter for unique IDs
+ * - Status monitoring (optional)
+ * 
+ * Author: VJS World
+ * Date: November 2025
+ **********************************************************************}
+
+variables:
+    GD(GlobalDictionary.Create("IBKR_TRADER")),
+    signalCounter(0),
+    rsiValue(0),
+    pythonStatus(""),
+    ibkrStatus(""),
+    lastUpdate("");
+
+{**********************************************************************
+ * INITIALIZATION - Run once on first bar
+ **********************************************************************}
+if CurrentBar = 1 then
+begin
+    GD.Clear();
+    signalCounter = 0;
+    Print("========================================");
+    Print("IBKR Auto Trader Initialized");
+    Print("Dictionary: IBKR_TRADER");
+    Print("========================================");
+end;
+
+{**********************************************************************
+ * CALCULATE INDICATORS
+ **********************************************************************}
+rsiValue = RSI(Close, 14);
+
+{**********************************************************************
+ * ENTRY SIGNALS - BUY CALL
+ * Trigger: RSI crosses above 30 (oversold recovery)
+ **********************************************************************}
+if RSI(Close, 14) crosses above 30 then
+begin
+    signalCounter = signalCounter + 1;
+    
+    GD.SetValue("ENTRY_" + NumToStr(signalCounter, 0), 
+        dict(
+            "action", "BUY_CALL",
+            "symbol", "XSP",
+            "quantity", 1,
+            "delta_target", 30
+        )
+    );
+    
+    Print("SIGNAL SENT: BUY_CALL (", signalCounter, ") - RSI=", rsiValue:0:2);
+end;
+
+{**********************************************************************
+ * ENTRY SIGNALS - BUY PUT
+ * Trigger: RSI crosses below 70 (overbought reversal)
+ **********************************************************************}
+if RSI(Close, 14) crosses below 70 then
+begin
+    signalCounter = signalCounter + 1;
+    
+    GD.SetValue("ENTRY_" + NumToStr(signalCounter, 0), 
+        dict(
+            "action", "BUY_PUT",
+            "symbol", "XSP",
+            "quantity", 1,
+            "delta_target", 30
+        )
+    );
+    
+    Print("SIGNAL SENT: BUY_PUT (", signalCounter, ") - RSI=", rsiValue:0:2);
+end;
+
+{**********************************************************************
+ * ENTRY SIGNALS - BUY STRADDLE
+ * Trigger: RSI in neutral range (45-55) indicating low volatility
+ **********************************************************************}
+if RSI(Close, 14) crosses above 45 and RSI(Close, 14) < 55 then
+begin
+    signalCounter = signalCounter + 1;
+    
+    GD.SetValue("ENTRY_" + NumToStr(signalCounter, 0), 
+        dict(
+            "action", "BUY_STRADDLE",
+            "symbol", "XSP",
+            "quantity", 1
+        )
+    );
+    
+    Print("SIGNAL SENT: BUY_STRADDLE (", signalCounter, ") - RSI=", rsiValue:0:2);
+end;
+
+{**********************************************************************
+ * EXIT SIGNALS - CLOSE ALL
+ * Trigger: RSI at extremes (above 80 or below 20)
+ **********************************************************************}
+if RSI(Close, 14) crosses above 80 or RSI(Close, 14) crosses below 20 then
+begin
+    signalCounter = signalCounter + 1;
+    
+    GD.SetValue("EXIT_" + NumToStr(signalCounter, 0), 
+        dict(
+            "action", "CLOSE_ALL",
+            "symbol", "XSP"
+        )
+    );
+    
+    Print("SIGNAL SENT: CLOSE_ALL (", signalCounter, ") - RSI=", rsiValue:0:2);
+end;
+
+{**********************************************************************
+ * EXIT SIGNALS - CLOSE CALLS ONLY
+ * Trigger: RSI crosses above 75 (take profit on calls)
+ **********************************************************************}
+if RSI(Close, 14) crosses above 75 then
+begin
+    signalCounter = signalCounter + 1;
+    
+    GD.SetValue("EXIT_" + NumToStr(signalCounter, 0), 
+        dict(
+            "action", "CLOSE_CALLS",
+            "symbol", "XSP"
+        )
+    );
+    
+    Print("SIGNAL SENT: CLOSE_CALLS (", signalCounter, ") - RSI=", rsiValue:0:2);
+end;
+
+{**********************************************************************
+ * EXIT SIGNALS - CLOSE PUTS ONLY
+ * Trigger: RSI crosses below 25 (take profit on puts)
+ **********************************************************************}
+if RSI(Close, 14) crosses below 25 then
+begin
+    signalCounter = signalCounter + 1;
+    
+    GD.SetValue("EXIT_" + NumToStr(signalCounter, 0), 
+        dict(
+            "action", "CLOSE_PUTS",
+            "symbol", "XSP"
+        )
+    );
+    
+    Print("SIGNAL SENT: CLOSE_PUTS (", signalCounter, ") - RSI=", rsiValue:0:2);
+end;
+
+{**********************************************************************
+ * TIME-BASED EXIT - End of Day
+ * Close all positions at 3:45 PM CT (15 minutes before market close)
+ **********************************************************************}
+if Time = 1545 then
+begin
+    signalCounter = signalCounter + 1;
+    
+    GD.SetValue("EXIT_" + NumToStr(signalCounter, 0), 
+        dict(
+            "action", "CLOSE_ALL",
+            "symbol", "XSP"
+        )
+    );
+    
+    Print("SIGNAL SENT: EOD CLOSE_ALL (", signalCounter, ") - Time=15:45");
+end;
+
+{**********************************************************************
+ * STRATEGY STATE PUBLISHING (Optional)
+ * Update Python with current strategy state
+ * 
+ * States: FLAT, LONG_CALL, SHORT_CALL, LONG_PUT, SHORT_PUT, LONG_STRADDLE
+ **********************************************************************}
+// Example: Publish state based on your position tracking logic
+// if positions = 0 then
+//     GD.SetValue("TS_STRATEGY_STATE", "FLAT")
+// else if callPositions > 0 and putPositions = 0 then
+//     GD.SetValue("TS_STRATEGY_STATE", "LONG_CALL")
+// else if putPositions > 0 and callPositions = 0 then
+//     GD.SetValue("TS_STRATEGY_STATE", "LONG_PUT")
+// else if callPositions > 0 and putPositions > 0 then
+//     GD.SetValue("TS_STRATEGY_STATE", "LONG_STRADDLE");
+
+{**********************************************************************
+ * MONITOR PYTHON STATUS (Optional - commented out by default)
+ * Read status updates from Python application every 5 minutes
+ **********************************************************************}
+// if Time mod 500 = 0 then  // Every 5 minutes
+// begin
+//     pythonStatus = GD.GetValue("PYTHON_STATUS");
+//     ibkrStatus = GD.GetValue("IBKR_STATUS");
+//     lastUpdate = GD.GetValue("LAST_UPDATE");
+//     
+//     Print("=== Python Status ===");
+//     Print("Python: ", pythonStatus);
+//     Print("IBKR: ", ibkrStatus);
+//     Print("Last Update: ", lastUpdate);
+//     Print("====================");
+// end;
+
+{**********************************************************************
+ * CHECK FOR ACKNOWLEDGMENTS (Optional)
+ * Verify Python received your signals
+ **********************************************************************}
+// vars: ackReceived(false);
+// 
+// // Check if signal 123 was acknowledged
+// ackReceived = GD.GetValue("ACK_ENTRY_123");
+// if ackReceived then
+//     Print("Signal 123 acknowledged by Python");
+// 
+// // Check trade result
+// vars: resultDict(dict());
+// resultDict = GD.GetValue("RESULT_123");
+// if resultDict.Count > 0 then
+//     Print("Result: ", resultDict.GetValue("status"));
+
+{**********************************************************************
+ * PLOTTING (Optional)
+ * Visualize RSI levels and signal zones
+ **********************************************************************}
+Plot1(rsiValue, "RSI");
+Plot2(70, "Overbought");
+Plot3(30, "Oversold");
+Plot4(50, "Neutral");
+
+{**********************************************************************
+ * NOTES FOR CUSTOMIZATION
+ **********************************************************************}
+{
+ * Signal ID Management:
+ * - signalCounter auto-increments for unique IDs
+ * - Alternative: Use CurrentBar or timestamp (ELDateToDateTime(Date) + Time)
+ * 
+ * Dictionary Format:
+ * - dict() creates a dictionary (key-value pairs)
+ * - Keys must be strings
+ * - Values can be strings, numbers, or nested dicts
+ * 
+ * Entry Signal Keys:
+ * - "action": "BUY_CALL" | "BUY_PUT" | "BUY_STRADDLE"
+ * - "symbol": "XSP" or "SPX"
+ * - "quantity": Number of contracts
+ * - "delta_target": Optional, target delta (10-50)
+ * 
+ * Exit Signal Keys:
+ * - "action": "CLOSE_ALL" | "CLOSE_CALLS" | "CLOSE_PUTS" | "CLOSE_POSITION"
+ * - "symbol": "XSP" or "SPX"
+ * - "contract_key": Optional, specific contract to close (e.g., "XSP_590_C_20251105")
+ * 
+ * Testing:
+ * 1. Apply this indicator to a chart
+ * 2. Enable TradeStation integration in Python app (TradeStation tab → Enable TS)
+ * 3. Watch the Signal History table for incoming signals
+ * 4. Monitor TradeStation Output Bar for Print statements
+ * 5. Check Python Activity Log for signal processing details
+ * 
+ * Common Issues:
+ * - If signals not received: Check dictionary name is "IBKR_TRADER" in both TS and Python
+ * - If orders not executing: Ensure IBKR connection is active
+ * - If duplicate signals: Use unique signal IDs (increment signalCounter)
+ * - If wrong contract: Check time-based 0DTE/1DTE logic in Python
+ * 
+ * Performance:
+ * - Signal latency: 60-250ms typical (TS → Python → IBKR → Fill)
+ * - Max signals/second: ~10-20 practical (avoid spam)
+ * - COM overhead: ~10ms per signal
+ * 
+ * Best Practices:
+ * - Clear dictionary on initialization (GD.Clear())
+ * - Use unique signal IDs
+ * - Test with paper trading first
+ * - Monitor acknowledgments for critical signals
+ * - Log all signals to TradeStation Output Bar
+ * - Implement error handling for trade failures
+ * - Use time-based exits to avoid overnight positions
+ * 
+ * Advanced Features:
+ * - Implement position tracking
+ * - Publish strategy state to Python
+ * - Monitor Python/IBKR status
+ * - Check trade results
+ * - Implement risk management (max daily trades, max loss)
+ * - Add position sizing logic
+ * - Implement delta hedging signals
+ * 
+ * Contact:
+ * For questions or issues, check the documentation:
+ * - TRADESTATION_INTEGRATION.md
+ * - TRADESTATION_QUICK_REFERENCE.md
+ * - TRADESTATION_TAB_GUIDE.md
+ }
+
+{**********************************************************************
+ * END OF INDICATOR
+ **********************************************************************}

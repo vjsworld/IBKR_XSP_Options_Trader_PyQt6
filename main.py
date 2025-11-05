@@ -1,14 +1,30 @@
 """
 SPX 0DTE Options Trading Application - PyQt6 Edition
 Professional Bloomberg-style GUI for Interactive Brokers API
-Author: VJS World
-Date: January 2025
+Author: Van Gothreaux
+Copyright Date: January 2025
 
 Technology Stack:
 - PyQt6: Modern GUI framework with native performance
 - PyQt6-Charts: Native Qt candlestick charting for real-time visualization
 - IBKR API: Real-time market data, order execution, and model-based greeks
 - Dual-instrument support: SPX and XSP with symbol-agnostic architecture
+
+CRITICAL TIMEZONE CONFIGURATION:
+═══════════════════════════════════════════════════════════════════════════
+🕐 ALL TIMES IN THIS APPLICATION USE CENTRAL TIME (America/Chicago) 🕐
+═══════════════════════════════════════════════════════════════════════════
+- Market hours: 8:30 AM - 3:00 PM CT
+- After-hours: 7:15 PM - 7:25 AM CT (for 0DTE overnight trading)
+- Regular trading restarts after a five minute break when stocks to dat 8:30 AM CT
+- All charts display Central Time
+- All positions show entry/exit times in Central Time
+- All orders timestamped in Central Time
+- TradeStation signals processed in Central Time
+- ES, NQ, MES, MNQ Futures use Central Time market close (4:00 PM CT)
+- SPX and XSP indexes and stocks use Central Time market close (3:00 PM CT)
+- Option expiry calculations based on Central Time
+═══════════════════════════════════════════════════════════════════════════
 """
 
 # ============================================================================
@@ -31,7 +47,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from enum import Enum
 from collections import defaultdict
-import pytz  # For timezone-aware datetime (Eastern Time)
+import pytz  # For timezone-aware datetime (CENTRAL TIME - America/Chicago ONLY)
 
 
 # ============================================================================
@@ -166,6 +182,18 @@ from ibapi.order import Order
 from ibapi.common import TickerId, TickAttrib
 from ibapi.ticktype import TickType
 logger.info("IBKR API loaded successfully")
+
+# TradeStation GlobalDictionary Integration
+logger.info("Loading TradeStation integration...")
+try:
+    import GlobalDictionary
+    import pythoncom
+    TRADESTATION_AVAILABLE = True
+    logger.info("TradeStation GlobalDictionary loaded successfully")
+except ImportError as e:
+    TRADESTATION_AVAILABLE = False
+    logger.warning(f"TradeStation GlobalDictionary not available: {e}")
+    logger.warning("TradeStation integration will be disabled")
 
 # Charts are now handled by matplotlib/mplfinance
 CHARTS_AVAILABLE = True  # Always available with matplotlib
@@ -705,6 +733,248 @@ class IBKRThread(QThread):
             self.client.run()
         except Exception as e:
             print(f"IBKR thread exception: {e}")
+
+
+# ============================================================================
+# TRADESTATION INTEGRATION - GLOBALDICTIONARY COM INTERFACE
+# ============================================================================
+
+class TradeStationSignals(QObject):
+    """PyQt signals for thread-safe communication from TradeStation COM to GUI"""
+    ts_connected = pyqtSignal(bool)
+    ts_message = pyqtSignal(str)
+    ts_activity = pyqtSignal(str)  # NEW: For Activity Log
+    entry_signal = pyqtSignal(dict)
+    exit_signal = pyqtSignal(dict)
+    signal_update = pyqtSignal(dict)
+    strategy_state_changed = pyqtSignal(str)
+
+
+class TradeStationManager(QObject):
+    """TradeStation GlobalDictionary COM interface - NO THREADING (based on working Demo.py)
+    
+    Uses QTimer to pump COM messages in the main thread - this avoids COM apartment threading issues.
+    The working Demo.py doesn't use threads, it just calls pythoncom.PumpWaitingMessages() in a loop.
+    """
+    
+    def __init__(self, signals):
+        super().__init__()
+        self.signals = signals
+        self.running = False
+        self.gd = None
+        self.dict_name = "IBKR-TRADER"  # Match TradeStation's dictionary name (with hyphen)
+        self.processed_signals = set()
+        self.timer = None  # QTimer for message pump
+        
+    def start(self):
+        """Initialize COM and start message pump (NO THREADING - based on working Demo.py)"""
+        if not TRADESTATION_AVAILABLE:
+            self.signals.ts_message.emit("TradeStation GlobalDictionary not available")
+            return
+            
+        try:
+            # Initialize COM in main thread (like Demo.py)
+            pythoncom.CoInitialize()
+            
+            # Create GlobalDictionary with callbacks (exactly like working Demo.py)
+            self.gd = GlobalDictionary.create(
+                name=self.dict_name,
+                add=self.on_signal_add,
+                remove=self.on_signal_remove,
+                change=self.on_signal_change,
+                clear=self.on_signal_clear
+            )
+            
+            self.running = True
+            self.signals.ts_connected.emit(True)
+            
+            # Prominent connection message
+            logger.info("═══════════════════════════════════════════════════════")
+            logger.info(f"✅ TRADESTATION CONNECTED: GlobalDictionary '{self.dict_name}'")
+            logger.info("📡 Listening for TradeStation signals...")
+            logger.info("═══════════════════════════════════════════════════════")
+            self.signals.ts_message.emit(f"Connected to TradeStation GlobalDictionary: {self.dict_name}")
+            
+            # Send initial status to TradeStation
+            try:
+                self.gd.set("PYTHON_STATUS", "CONNECTED")
+                self.gd.set("LAST_UPDATE", datetime.now().strftime("%H:%M:%S"))
+            except Exception as e:
+                logger.error(f"Error setting initial status: {e}")
+            
+            # Start QTimer to pump COM messages (like Demo.py's while loop but non-blocking)
+            self.timer = QTimer()
+            self.timer.timeout.connect(self.pump_messages)
+            self.timer.start(10)  # Pump every 10ms (like Demo.py's 0.01s sleep)
+                
+        except Exception as e:
+            logger.error(f"TradeStation COM error: {e}", exc_info=True)
+            self.signals.ts_message.emit(f"TradeStation error: {e}")
+            self.running = False
+            self.signals.ts_connected.emit(False)
+    
+    def pump_messages(self):
+        """Pump COM messages (called by QTimer) - exactly like Demo.py's loop"""
+        try:
+            if self.running:
+                pythoncom.PumpWaitingMessages()
+        except Exception as e:
+            logger.error(f"Error pumping messages: {e}")
+            self.stop()
+    
+    def on_signal_add(self, gd, key, value, size):
+        """Called when a new key is added to GlobalDictionary
+        Based on working Demo.py pattern.
+        
+        Parameters (from GlobalDictionary callback):
+            gd: The GlobalDictionary instance (like 'self' in Demo.py)
+            key: The dictionary key that was added
+            value: The value (already decoded by GlobalDictionary)
+            size: Current size of the dictionary
+        """
+        if not self.running:
+            return
+            
+        try:
+            # LOG ALL INCOMING DATA FROM TRADESTATION
+            value_str = str(value)[:200] if value else "None"
+            logger.info(f"[TS→PYTHON] NEW KEY: '{key}' = {value_str} (dict size: {size})")
+            self.signals.ts_message.emit(f"TS ADD: {key} = {value_str}")
+            # NEW: Also send to Activity Log
+            self.signals.ts_activity.emit(f"[ADD] {key} = {value_str}")
+            
+            if key.startswith("ENTRY_"):
+                signal_id = key[6:]
+                if signal_id not in self.processed_signals:
+                    self.processed_signals.add(signal_id)
+                    if isinstance(value, dict):
+                        value_copy = value.copy()  # Make a copy for thread safety
+                        value_copy['signal_id'] = signal_id
+                        self.signals.entry_signal.emit(value_copy)
+                        # Send ACK using the GlobalDictionary instance (like Demo.py: GD["key"] = value)
+                        try:
+                            gd.set(f"ACK_ENTRY_{signal_id}", True)
+                            logger.info(f"[PYTHON→TS] Sent acknowledgment: ACK_ENTRY_{signal_id}")
+                            self.signals.ts_activity.emit(f"[SENT] ACK_ENTRY_{signal_id} = True")
+                        except Exception as ack_err:
+                            logger.error(f"Error sending ACK_ENTRY: {ack_err}")
+            
+            elif key.startswith("EXIT_"):
+                signal_id = key[5:]
+                if signal_id not in self.processed_signals:
+                    self.processed_signals.add(signal_id)
+                    if isinstance(value, dict):
+                        value_copy = value.copy()  # Make a copy for thread safety
+                        value_copy['signal_id'] = signal_id
+                        self.signals.exit_signal.emit(value_copy)
+                        # Send ACK using the GlobalDictionary instance
+                        try:
+                            gd.set(f"ACK_EXIT_{signal_id}", True)
+                            logger.info(f"[PYTHON→TS] Sent acknowledgment: ACK_EXIT_{signal_id}")
+                            self.signals.ts_activity.emit(f"[SENT] ACK_EXIT_{signal_id} = True")
+                        except Exception as ack_err:
+                            logger.error(f"Error sending ACK_EXIT: {ack_err}")
+            
+            elif key == "TS_STRATEGY_STATE":
+                self.signals.strategy_state_changed.emit(str(value))
+                logger.info(f"[TS→PYTHON] Strategy state changed to: {value}")
+                
+        except Exception as e:
+            logger.error(f"Error processing signal add: {e}", exc_info=True)
+    
+    def on_signal_change(self, gd, key, value, size):
+        """Called when a key is changed in GlobalDictionary
+        Based on working Demo.py pattern.
+        
+        Parameters (from GlobalDictionary callback):
+            gd: The GlobalDictionary instance
+            key: The dictionary key that was changed
+            value: The new value (already decoded)
+            size: Current size of the dictionary
+        """
+        if not self.running:
+            return
+            
+        try:
+            # LOG ALL CHANGES FROM TRADESTATION
+            value_str = str(value)[:200] if value else "None"
+            logger.info(f"[TS→PYTHON] CHANGED KEY: '{key}' = {value_str} (dict size: {size})")
+            self.signals.ts_message.emit(f"TS CHANGE: {key} = {value_str}")
+            # NEW: Also send to Activity Log
+            self.signals.ts_activity.emit(f"[CHANGE] {key} = {value_str}")
+            
+            if key == "TS_STRATEGY_STATE":
+                self.signals.strategy_state_changed.emit(str(value))
+                logger.info(f"[TS→PYTHON] Strategy state updated to: {value}")
+        except Exception as e:
+            logger.error(f"Error processing signal change: {e}", exc_info=True)
+    
+    def on_signal_remove(self, gd, key, size):
+        """Called when a key is removed from GlobalDictionary
+        Based on working Demo.py pattern.
+        
+        Parameters (from GlobalDictionary callback):
+            gd: The GlobalDictionary instance
+            key: The dictionary key that was removed
+            size: Current size of the dictionary after removal
+        """
+        if not self.running:
+            return
+            
+        try:
+            # LOG ALL REMOVALS FROM TRADESTATION
+            logger.info(f"[TS→PYTHON] REMOVED KEY: '{key}' (dict size: {size})")
+            self.signals.ts_message.emit(f"TS REMOVE: {key}")
+            # Show the key that was removed in Activity Log
+            self.signals.ts_activity.emit(f"[REMOVE] Key: {key}")
+        except Exception as e:
+            logger.error(f"Error processing signal remove: {e}", exc_info=True)
+    
+    def on_signal_clear(self, gd):
+        """Called when the GlobalDictionary is cleared
+        Based on working Demo.py pattern.
+        
+        Parameters (from GlobalDictionary callback):
+            gd: The GlobalDictionary instance
+        """
+        if not self.running:
+            return
+            
+        try:
+            # LOG CLEAR EVENT FROM TRADESTATION
+            logger.info(f"[TS→PYTHON] DICTIONARY CLEARED")
+            self.signals.ts_message.emit(f"TS CLEAR: Dictionary cleared")
+            self.signals.ts_activity.emit(f"[CLEAR] GlobalDictionary cleared")
+        except Exception as e:
+            logger.error(f"Error processing clear event: {e}", exc_info=True)
+    
+    def update_status(self, status):
+        """Update Python status in GlobalDictionary
+        NOTE: Cannot be called from main thread - COM marshaling issue.
+        Status updates should be sent via the callback thread."""
+        logger.warning("update_status() called - this method is deprecated due to COM threading")
+    
+    def send_trade_confirmation(self, signal_id, result):
+        """Send trade result back to TradeStation
+        NOTE: Cannot be called from main thread - COM marshaling issue.
+        Confirmations are sent directly in the callbacks."""
+        logger.warning("send_trade_confirmation() called - this method is deprecated due to COM threading")
+    
+    def stop(self):
+        """Stop the COM message pump and cleanup"""
+        self.running = False
+        
+        # Stop the timer
+        if self.timer:
+            self.timer.stop()
+            self.timer = None
+        
+        # Cleanup COM
+        if self.gd:
+            try:
+                self.gd.set("PYTHON_STATUS", "DISCONNECTED")
+            except:
+                pass
 
 
 # ============================================================================
@@ -2044,6 +2314,9 @@ class MainWindow(QMainWindow):
         self.trading_instrument = SELECTED_INSTRUMENT
         self.instrument = INSTRUMENT_CONFIG[self.trading_instrument]
         
+        # Set convenient shortcuts to instrument properties
+        self.strike_interval = self.instrument['strike_increment']
+        
         # Set window title based on selected instrument
         self.setWindowTitle(f"{self.instrument['name']} 0DTE Options Trader - PyQt6 Professional Edition")
         self.setGeometry(100, 100, 1600, 900)
@@ -2055,9 +2328,9 @@ class MainWindow(QMainWindow):
         logger.info(f"Tick Sizes: ≥$3.00→${self.instrument['tick_size_above_3']}, <$3.00→${self.instrument['tick_size_below_3']}")
         logger.info(f"═══════════════════════════════════════════════════════")
         
-        # Get local timezone from system (MUST be set before calculate_expiry_date)
-        self.local_tz = datetime.now().astimezone().tzinfo
-        logger.info(f"Detected local timezone: {self.local_tz}")
+        # Set timezone to Central Time (America/Chicago) - ALL TIMES IN THIS APP USE CT
+        self.local_tz = pytz.timezone('America/Chicago')
+        logger.info(f"Application timezone set to: {self.local_tz} (Central Time)")
         self.last_refresh_date = datetime.now(self.local_tz).date()
         
         # Strategy parameters
@@ -2146,6 +2419,20 @@ class MainWindow(QMainWindow):
         self.ibkr_wrapper.set_client(self.ibkr_client)  # Set client reference for market data subscriptions
         self.ibkr_thread = None
         
+        # TradeStation setup
+        self.ts_signals = TradeStationSignals()
+        self.ts_manager = None
+        self.ts_enabled = False
+        self.ts_strategy_state = "FLAT"
+        self.ts_signal_log = []
+        self.ts_0dte_chain_data = {}
+        self.ts_1dte_chain_data = {}
+        self.ts_0dte_expiry = None
+        self.ts_1dte_expiry = None
+        self.ts_active_contract_type = "0DTE"
+        self.ts_last_signal_time = None
+        self.ts_position_count = 0
+        
         # Connect signals
         self.connect_signals()
         
@@ -2195,6 +2482,16 @@ class MainWindow(QMainWindow):
         self.signals.historical_bar.connect(self.on_historical_bar)
         self.signals.historical_complete.connect(self.on_historical_complete)
         self.signals.historical_bar_update.connect(self.on_historical_bar_update)
+        
+        # Connect TradeStation signals
+        if TRADESTATION_AVAILABLE:
+            self.ts_signals.ts_connected.connect(self.on_ts_connected)
+            self.ts_signals.ts_message.connect(self.on_ts_message)
+            self.ts_signals.ts_activity.connect(self.on_ts_activity)  # NEW: Activity Log
+            self.ts_signals.entry_signal.connect(self.on_ts_entry_signal)
+            self.ts_signals.exit_signal.connect(self.on_ts_exit_signal)
+            self.ts_signals.signal_update.connect(self.on_ts_signal_update)
+            self.ts_signals.strategy_state_changed.connect(self.on_ts_strategy_state_changed)
     
     def setup_ui(self):
         """Setup the user interface"""
@@ -2223,6 +2520,11 @@ class MainWindow(QMainWindow):
         # Tab 4: Settings
         self.settings_tab = self.create_settings_tab()
         self.tabs.addTab(self.settings_tab, "Settings")
+        
+        # Tab 5: TradeStation
+        if TRADESTATION_AVAILABLE:
+            self.tradestation_tab = self.create_tradestation_tab()
+            self.tabs.addTab(self.tradestation_tab, "TradeStation")
         
         # Status bar
         self.status_bar = QStatusBar()
@@ -3013,8 +3315,9 @@ class MainWindow(QMainWindow):
             atm_strike = self.round_to_strike(self.underlying_price)
             
             # Create call contract
-            call_contract_key = f"{self.instrument['symbol']}_{atm_strike}_C_{self.current_expiry}"
-            put_contract_key = f"{self.instrument['symbol']}_{atm_strike}_P_{self.current_expiry}"
+            symbol = self.instrument['options_symbol']
+            call_contract_key = f"{symbol}_{atm_strike}_C_{self.current_expiry}"
+            put_contract_key = f"{symbol}_{atm_strike}_P_{self.current_expiry}"
             
             # Request call option data
             if call_contract_key not in self.chart_data:
@@ -3035,15 +3338,15 @@ class MainWindow(QMainWindow):
             from ibapi.contract import Contract
             
             contract = Contract()
-            contract.symbol = self.instrument['symbol']
+            contract.symbol = self.instrument['options_symbol']
             contract.secType = "OPT"
-            contract.exchange = self.instrument['exchange']
+            contract.exchange = "SMART"
             contract.currency = "USD"
             contract.lastTradeDateOrContractMonth = self.current_expiry
             contract.strike = strike
             contract.right = right
             contract.multiplier = str(self.instrument['multiplier'])
-            contract.tradingClass = self.instrument['trading_class']
+            contract.tradingClass = self.instrument['options_trading_class']
             
             req_id = self.app_state['next_req_id']
             self.app_state['next_req_id'] += 1
@@ -5194,14 +5497,9 @@ class MainWindow(QMainWindow):
     def round_to_strike(self, price: float) -> float:
         """Round price to the nearest valid strike price"""
         try:
-            # XSP strikes are in $1 increments, SPX in $5 or $25 increments
-            if self.instrument['symbol'] == 'XSP':
-                return round(price)  # Round to nearest dollar
-            else:  # SPX
-                if price < 2000:
-                    return round(price / 5) * 5  # $5 increments below 2000
-                else:
-                    return round(price / 25) * 25  # $25 increments above 2000
+            # Use strike_increment from instrument config
+            strike_increment = self.instrument['strike_increment']
+            return round(price / strike_increment) * strike_increment
         except Exception as e:
             logger.error(f"Error rounding to strike: {e}")
             return round(price)
@@ -5312,6 +5610,152 @@ class MainWindow(QMainWindow):
         # Fallback (should never hit this)
         logger.error("calculate_expiry_date exceeded max days - returning today")
         return now_local.strftime("%Y%m%d")
+    
+    def create_tradestation_tab(self):
+        """Create the TradeStation integration tab"""
+        tab = QWidget()
+        main_layout = QVBoxLayout(tab)
+        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        
+        # Top row: Strategy Monitor + Connection Controls
+        top_row = QHBoxLayout()
+        
+        # Strategy Monitor Panel
+        monitor_group = QGroupBox("Strategy Monitor")
+        monitor_layout = QGridLayout(monitor_group)
+        
+        monitor_layout.addWidget(QLabel("Strategy State:"), 0, 0)
+        self.ts_state_label = QLabel("FLAT")
+        self.ts_state_label.setStyleSheet("font-weight: bold; font-size: 14px; color: #FFFF00;")
+        monitor_layout.addWidget(self.ts_state_label, 0, 1)
+        
+        monitor_layout.addWidget(QLabel("Position Count:"), 1, 0)
+        self.ts_position_count_label = QLabel("0")
+        monitor_layout.addWidget(self.ts_position_count_label, 1, 1)
+        
+        monitor_layout.addWidget(QLabel("Last Signal:"), 2, 0)
+        self.ts_last_signal_label = QLabel("None")
+        monitor_layout.addWidget(self.ts_last_signal_label, 2, 1)
+        
+        monitor_layout.addWidget(QLabel("Active Contract:"), 3, 0)
+        self.ts_active_contract_label = QLabel("0DTE")
+        monitor_layout.addWidget(self.ts_active_contract_label, 3, 1)
+        
+        top_row.addWidget(monitor_group)
+        
+        # Connection Controls Panel
+        controls_group = QGroupBox("TradeStation Connection")
+        controls_layout = QVBoxLayout(controls_group)
+        
+        btn_layout = QHBoxLayout()
+        self.enable_ts_btn = QPushButton("Enable TS")
+        self.enable_ts_btn.clicked.connect(self.enable_tradestation)
+        btn_layout.addWidget(self.enable_ts_btn)
+        
+        self.disable_ts_btn = QPushButton("Disable TS")
+        self.disable_ts_btn.clicked.connect(self.disable_tradestation)
+        self.disable_ts_btn.setEnabled(False)
+        btn_layout.addWidget(self.disable_ts_btn)
+        
+        self.sync_ts_btn = QPushButton("Sync Strategy")
+        self.sync_ts_btn.clicked.connect(self.sync_with_ts_strategy)
+        self.sync_ts_btn.setEnabled(False)
+        btn_layout.addWidget(self.sync_ts_btn)
+        
+        controls_layout.addLayout(btn_layout)
+        
+        self.ts_status_label = QLabel("Status: Disconnected")
+        self.ts_status_label.setStyleSheet("color: #FF6B6B;")
+        controls_layout.addWidget(self.ts_status_label)
+        
+        top_row.addWidget(controls_group)
+        main_layout.addLayout(top_row)
+        
+        # Option Chains Section (side by side)
+        chains_layout = QHBoxLayout()
+        
+        # 0DTE Chain
+        dte0_group = QGroupBox("0DTE Option Chain")
+        dte0_layout = QVBoxLayout(dte0_group)
+        
+        self.ts_0dte_expiry_label = QLabel("Expiry: Not Set")
+        dte0_layout.addWidget(self.ts_0dte_expiry_label)
+        
+        self.ts_0dte_table = QTableWidget()
+        self.ts_0dte_table.setColumnCount(9)
+        self.ts_0dte_table.setHorizontalHeaderLabels([
+            "Call Δ", "Call Γ", "Call Bid", "Call Ask", "Strike", 
+            "Put Bid", "Put Ask", "Put Γ", "Put Δ"
+        ])
+        self.ts_0dte_table.horizontalHeader().setStretchLastSection(True)
+        self.ts_0dte_table.setAlternatingRowColors(True)
+        self.ts_0dte_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        dte0_layout.addWidget(self.ts_0dte_table)
+        
+        chains_layout.addWidget(dte0_group)
+        
+        # 1DTE Chain
+        dte1_group = QGroupBox("1DTE Option Chain")
+        dte1_layout = QVBoxLayout(dte1_group)
+        
+        self.ts_1dte_expiry_label = QLabel("Expiry: Not Set")
+        dte1_layout.addWidget(self.ts_1dte_expiry_label)
+        
+        self.ts_1dte_table = QTableWidget()
+        self.ts_1dte_table.setColumnCount(9)
+        self.ts_1dte_table.setHorizontalHeaderLabels([
+            "Call Δ", "Call Γ", "Call Bid", "Call Ask", "Strike", 
+            "Put Bid", "Put Ask", "Put Γ", "Put Δ"
+        ])
+        self.ts_1dte_table.horizontalHeader().setStretchLastSection(True)
+        self.ts_1dte_table.setAlternatingRowColors(True)
+        self.ts_1dte_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        dte1_layout.addWidget(self.ts_1dte_table)
+        
+        chains_layout.addWidget(dte1_group)
+        main_layout.addLayout(chains_layout)
+        
+        # Bottom section: Signal History + Activity Log (side by side)
+        bottom_layout = QHBoxLayout()
+        
+        # Signal History Table (left side)
+        history_group = QGroupBox("Signal History")
+        history_layout = QVBoxLayout(history_group)
+        
+        self.ts_signal_table = QTableWidget()
+        self.ts_signal_table.setColumnCount(6)
+        self.ts_signal_table.setHorizontalHeaderLabels([
+            "Time", "Signal Type", "Action", "Contract", "Status", "Fill Price"
+        ])
+        self.ts_signal_table.horizontalHeader().setStretchLastSection(True)
+        self.ts_signal_table.setAlternatingRowColors(True)
+        self.ts_signal_table.setRowCount(0)
+        history_layout.addWidget(self.ts_signal_table)
+        
+        bottom_layout.addWidget(history_group)
+        
+        # Activity Log (right side) - shows all GlobalDictionary messages
+        activity_group = QGroupBox("Activity Log")
+        activity_layout = QVBoxLayout(activity_group)
+        
+        self.ts_activity_log = QTextEdit()
+        self.ts_activity_log.setReadOnly(True)
+        # Note: QTextEdit doesn't have setMaximumBlockCount, we'll manage size in the handler
+        self.ts_activity_log.setStyleSheet("""
+            QTextEdit {
+                background-color: #1e1e1e;
+                color: #d4d4d4;
+                font-family: 'Consolas', 'Courier New', monospace;
+                font-size: 10px;
+            }
+        """)
+        activity_layout.addWidget(self.ts_activity_log)
+        
+        bottom_layout.addWidget(activity_group)
+        main_layout.addLayout(bottom_layout)
+        
+        return tab
     
     def create_option_contract(self, strike: float, right: str, symbol: str = "SPX", 
                               trading_class: str = "SPXW", expiry: Optional[str] = None) -> Contract:
@@ -6446,7 +6890,7 @@ class MainWindow(QMainWindow):
             # Track request
             self.app_state['historical_data_requests'][req_id] = contract_key
             
-            # Request historical data with proper timezone format (US/Eastern for SPX)
+            # Request historical data (IBKR returns in US/Eastern, we convert to Central Time)
             # Use empty string for end_time to get most recent data
             end_time = ""  # Empty string means current time
             
@@ -7712,6 +8156,608 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.log_message(f"Error saving settings: {e}", "ERROR")
             logger.error(f"Error saving settings: {e}", exc_info=True)
+    
+    # ==================== TradeStation Integration Methods ====================
+    
+    def enable_tradestation(self):
+        """Enable TradeStation integration"""
+        if not TRADESTATION_AVAILABLE:
+            self.log_message("TradeStation not available - GlobalDictionary not found", "ERROR")
+            return
+        
+        if self.ts_enabled:
+            self.log_message("TradeStation already enabled", "WARNING")
+            return
+        
+        try:
+            # Start TradeStation manager thread
+            self.ts_manager = TradeStationManager(self.ts_signals)
+            self.ts_manager.start()
+            
+            self.ts_enabled = True
+            self.enable_ts_btn.setEnabled(False)
+            self.disable_ts_btn.setEnabled(True)
+            self.sync_ts_btn.setEnabled(True)
+            
+            self.log_message("TradeStation integration enabled", "SUCCESS")
+            
+            # Update active contract label but DON'T auto-request chains
+            # User can manually click refresh buttons to load chain data
+            self.update_ts_active_contract()
+            logger.info("[TS] TradeStation enabled - chains NOT auto-requested to avoid duplicate req IDs")
+            
+        except Exception as e:
+            self.log_message(f"Error enabling TradeStation: {e}", "ERROR")
+            logger.error(f"Error enabling TradeStation: {e}", exc_info=True)
+    
+    def disable_tradestation(self):
+        """Disable TradeStation integration"""
+        if not self.ts_enabled:
+            return
+        
+        try:
+            if self.ts_manager:
+                self.ts_manager.stop()
+                # No .wait() needed - not a QThread anymore
+                self.ts_manager = None
+            
+            self.ts_enabled = False
+            self.enable_ts_btn.setEnabled(True)
+            self.disable_ts_btn.setEnabled(False)
+            self.sync_ts_btn.setEnabled(False)
+            
+            self.log_message("TradeStation integration disabled", "INFO")
+            
+        except Exception as e:
+            self.log_message(f"Error disabling TradeStation: {e}", "ERROR")
+            logger.error(f"Error disabling TradeStation: {e}", exc_info=True)
+    
+    @pyqtSlot(bool)
+    def on_ts_connected(self, connected: bool):
+        """Handle TradeStation connection status"""
+        if connected:
+            self.ts_status_label.setText("Status: Connected")
+            self.ts_status_label.setStyleSheet("color: #4CAF50;")
+            self.log_message("TradeStation GlobalDictionary connected", "SUCCESS")
+        else:
+            self.ts_status_label.setText("Status: Disconnected")
+            self.ts_status_label.setStyleSheet("color: #FF6B6B;")
+            self.log_message("TradeStation GlobalDictionary disconnected", "WARNING")
+    
+    @pyqtSlot(str)
+    def on_ts_message(self, message: str):
+        """Handle TradeStation log messages"""
+        self.log_message(f"[TS] {message}", "INFO")
+    
+    @pyqtSlot(str)
+    def on_ts_activity(self, message: str):
+        """Handle TradeStation activity log messages (all GD messages)"""
+        try:
+            from datetime import datetime
+            timestamp = datetime.now(self.local_tz).strftime("%H:%M:%S.%f")[:-3]
+            self.ts_activity_log.append(f"{timestamp} {message}")
+            
+            # Manually limit to 500 lines by removing old lines
+            # QTextEdit doesn't have setMaximumBlockCount, so we manage it manually
+            text = self.ts_activity_log.toPlainText()
+            lines = text.split('\n')
+            if len(lines) > 500:
+                # Keep only the last 500 lines
+                self.ts_activity_log.setPlainText('\n'.join(lines[-500:]))
+                # Move cursor to end to show latest
+                cursor = self.ts_activity_log.textCursor()
+                cursor.movePosition(cursor.MoveOperation.End)
+                self.ts_activity_log.setTextCursor(cursor)
+        except Exception as e:
+            logger.error(f"Error adding to activity log: {e}")
+    
+    @pyqtSlot(dict)
+    def on_ts_entry_signal(self, signal_data: dict):
+        """Handle entry signal from TradeStation"""
+        try:
+            action = signal_data.get('action', '')
+            symbol = signal_data.get('symbol', SELECTED_INSTRUMENT)
+            quantity = signal_data.get('quantity', 1)
+            signal_id = signal_data.get('signal_id', '')
+            
+            self.log_message(f"Entry signal received: {action} {quantity}x {symbol}", "INFO")
+            
+            # Determine which contract type to use based on time
+            contract_type = self.get_ts_active_contract_type()
+            self.ts_active_contract_type = contract_type
+            self.ts_active_contract_label.setText(contract_type)
+            
+            # Route to appropriate entry method
+            if action == "BUY_CALL":
+                self.execute_ts_buy_call(symbol, quantity, contract_type, signal_id)
+            elif action == "BUY_PUT":
+                self.execute_ts_buy_put(symbol, quantity, contract_type, signal_id)
+            elif action == "BUY_STRADDLE":
+                self.execute_ts_buy_straddle(symbol, quantity, contract_type, signal_id)
+            else:
+                self.log_message(f"Unknown entry action: {action}", "ERROR")
+                
+            # Update last signal time
+            self.ts_last_signal_time = datetime.now()
+            self.ts_last_signal_label.setText(self.ts_last_signal_time.strftime("%H:%M:%S"))
+            
+        except Exception as e:
+            self.log_message(f"Error processing entry signal: {e}", "ERROR")
+            logger.error(f"Error processing entry signal: {e}", exc_info=True)
+    
+    @pyqtSlot(dict)
+    def on_ts_exit_signal(self, signal_data: dict):
+        """Handle exit signal from TradeStation"""
+        try:
+            action = signal_data.get('action', '')
+            symbol = signal_data.get('symbol', SELECTED_INSTRUMENT)
+            signal_id = signal_data.get('signal_id', '')
+            
+            self.log_message(f"Exit signal received: {action} for {symbol}", "INFO")
+            
+            # Route to appropriate exit method
+            if action == "CLOSE_ALL":
+                self.execute_ts_close_all(symbol, signal_id)
+            elif action == "CLOSE_CALLS":
+                self.execute_ts_close_calls(symbol, signal_id)
+            elif action == "CLOSE_PUTS":
+                self.execute_ts_close_puts(symbol, signal_id)
+            elif action == "CLOSE_POSITION":
+                contract_key = signal_data.get('contract_key')
+                self.execute_ts_close_position(contract_key, signal_id)
+            else:
+                self.log_message(f"Unknown exit action: {action}", "ERROR")
+                
+            # Update last signal time
+            self.ts_last_signal_time = datetime.now()
+            self.ts_last_signal_label.setText(self.ts_last_signal_time.strftime("%H:%M:%S"))
+            
+        except Exception as e:
+            self.log_message(f"Error processing exit signal: {e}", "ERROR")
+            logger.error(f"Error processing exit signal: {e}", exc_info=True)
+    
+    @pyqtSlot(dict)
+    def on_ts_signal_update(self, signal_data: dict):
+        """Handle signal update from TradeStation"""
+        pass  # Reserved for future use
+    
+    @pyqtSlot(str)
+    def on_ts_strategy_state_changed(self, state: str):
+        """Handle strategy state change from TradeStation"""
+        self.ts_strategy_state = state
+        self.ts_state_label.setText(state)
+        
+        # Color code the state
+        if state == "FLAT":
+            self.ts_state_label.setStyleSheet("font-weight: bold; font-size: 14px; color: #FFFF00;")
+        elif state == "LONG":
+            self.ts_state_label.setStyleSheet("font-weight: bold; font-size: 14px; color: #4CAF50;")
+        elif state == "SHORT":
+            self.ts_state_label.setStyleSheet("font-weight: bold; font-size: 14px; color: #FF6B6B;")
+        else:
+            self.ts_state_label.setStyleSheet("font-weight: bold; font-size: 14px; color: #FFFFFF;")
+        
+        self.log_message(f"TS Strategy state changed to: {state}", "INFO")
+    
+    def sync_with_ts_strategy(self):
+        """Manually sync strategy state with TradeStation"""
+        try:
+            if not self.ts_manager or not self.ts_enabled:
+                self.log_message("TradeStation not connected", "WARNING")
+                return
+            
+            # Count current positions
+            position_count = len([p for p in self.app_state.get('positions', {}).values() 
+                                  if p.get('quantity', 0) != 0])
+            self.ts_position_count = position_count
+            self.ts_position_count_label.setText(str(position_count))
+            
+            self.log_message(f"Synced with TS - {position_count} positions", "INFO")
+            
+        except Exception as e:
+            self.log_message(f"Error syncing with TradeStation: {e}", "ERROR")
+            logger.error(f"Error syncing with TradeStation: {e}", exc_info=True)
+    
+    def get_ts_active_contract_type(self) -> str:
+        """Determine which contract type (0DTE or 1DTE) to use based on current time"""
+        try:
+            import pytz
+            from datetime import time as dt_time
+            ct_tz = pytz.timezone('America/Chicago')
+            now_ct = datetime.now(ct_tz)
+            current_time = now_ct.time()
+            
+            # 0DTE: 7:15 PM - 11:00 AM CT
+            # 1DTE: 11:00 AM - 4:00 PM CT
+            time_11am = dt_time(11, 0)
+            time_4pm = dt_time(16, 0)
+            
+            if time_11am <= current_time < time_4pm:
+                return "1DTE"
+            else:
+                return "0DTE"
+                
+        except Exception as e:
+            logger.error(f"Error determining active contract type: {e}", exc_info=True)
+            return "0DTE"  # Default fallback
+    
+    def update_ts_active_contract(self):
+        """Update the active contract type label"""
+        contract_type = self.get_ts_active_contract_type()
+        self.ts_active_contract_type = contract_type
+        self.ts_active_contract_label.setText(contract_type)
+    
+    def request_ts_chain(self, contract_type: str):
+        """Request option chain data for specified contract type (0DTE or 1DTE)"""
+        try:
+            logger.debug(f"[TS CHAIN] === Starting request_ts_chain for {contract_type} ===")
+            
+            # Check IBKR connection
+            logger.debug(f"[TS CHAIN] Connection state: {self.connection_state}")
+            if not self.connection_state == ConnectionState.CONNECTED:
+                self.log_message("IBKR not connected - cannot request chains", "WARNING")
+                logger.warning("[TS CHAIN] IBKR not connected, aborting chain request")
+                return
+            
+            # Calculate expiry
+            logger.debug(f"[TS CHAIN] Calculating expiry for {contract_type}")
+            if contract_type == "0DTE":
+                expiry = self.calculate_expiry_date(0)
+                self.ts_0dte_expiry = expiry
+                self.ts_0dte_expiry_label.setText(f"Expiry: {expiry}")
+                logger.debug(f"[TS CHAIN] 0DTE expiry: {expiry}")
+            else:  # 1DTE
+                expiry = self.calculate_expiry_date(1)
+                self.ts_1dte_expiry = expiry
+                self.ts_1dte_expiry_label.setText(f"Expiry: {expiry}")
+                logger.debug(f"[TS CHAIN] 1DTE expiry: {expiry}")
+            
+            # Get ATM strike
+            logger.debug("[TS CHAIN] Finding ATM strike...")
+            atm_strike = self.find_atm_strike_by_delta()
+            logger.debug(f"[TS CHAIN] ATM strike result: {atm_strike}")
+            if atm_strike is None:
+                self.log_message("Could not determine ATM strike", "WARNING")
+                logger.warning("[TS CHAIN] ATM strike is None, aborting")
+                return
+            
+            # Build chain: 6 above + ATM + 6 below = 13 strikes
+            logger.debug(f"[TS CHAIN] Checking strike_interval attribute...")
+            logger.debug(f"[TS CHAIN] hasattr(self, 'strike_interval'): {hasattr(self, 'strike_interval')}")
+            if hasattr(self, 'strike_interval'):
+                logger.debug(f"[TS CHAIN] self.strike_interval = {self.strike_interval}")
+            else:
+                logger.error("[TS CHAIN] strike_interval attribute does NOT exist!")
+                logger.debug(f"[TS CHAIN] Available attributes: {[a for a in dir(self) if 'strike' in a.lower()]}")
+            
+            strikes = []
+            strike_interval = self.strike_interval
+            logger.debug(f"[TS CHAIN] Using strike_interval: {strike_interval}")
+            
+            for i in range(-6, 7):  # -6 to +6 inclusive
+                strike = atm_strike + (i * strike_interval)
+                strikes.append(strike)
+            
+            logger.debug(f"[TS CHAIN] Built strike list: {strikes}")
+            
+            # Determine trading class
+            trading_class = "SPXW" if SELECTED_INSTRUMENT == "SPX" else "XSP"
+            logger.debug(f"[TS CHAIN] Using trading_class: {trading_class}, symbol: {SELECTED_INSTRUMENT}")
+            
+            # Request market data for each strike
+            logger.debug(f"[TS CHAIN] Requesting market data for {len(strikes)} strikes...")
+            for strike in strikes:
+                # Request call
+                logger.debug(f"[TS CHAIN] Creating call contract for strike {strike}")
+                call_contract = self.create_option_contract(
+                    strike=strike,
+                    right='C',
+                    symbol=SELECTED_INSTRUMENT,
+                    trading_class=trading_class,
+                    expiry=expiry
+                )
+                call_key = f"{SELECTED_INSTRUMENT}_{strike}_C_{expiry}"
+                req_id = self.app_state['next_req_id']
+                logger.debug(f"[TS CHAIN] Requesting call data: reqId={req_id}, key={call_key}")
+                self.ibkr_client.reqMktData(req_id, call_contract, "", False, False, [])
+                self.app_state['market_data_subscriptions'][req_id] = call_key
+                self.app_state['next_req_id'] += 1
+                
+                # Request put
+                logger.debug(f"[TS CHAIN] Creating put contract for strike {strike}")
+                put_contract = self.create_option_contract(
+                    strike=strike,
+                    right='P',
+                    symbol=SELECTED_INSTRUMENT,
+                    trading_class=trading_class,
+                    expiry=expiry
+                )
+                put_key = f"{SELECTED_INSTRUMENT}_{strike}_P_{expiry}"
+                req_id = self.app_state['next_req_id']
+                logger.debug(f"[TS CHAIN] Requesting put data: reqId={req_id}, key={put_key}")
+                self.ibkr_client.reqMktData(req_id, put_contract, "", False, False, [])
+                self.app_state['market_data_subscriptions'][req_id] = put_key
+                self.app_state['next_req_id'] += 1
+            
+            logger.debug(f"[TS CHAIN] === Successfully requested {contract_type} chain: {len(strikes)} strikes ===")
+            self.log_message(f"Requested {contract_type} chain: {len(strikes)} strikes", "INFO")
+            
+        except Exception as e:
+            self.log_message(f"Error requesting {contract_type} chain: {e}", "ERROR")
+            logger.error(f"Error requesting {contract_type} chain: {e}", exc_info=True)
+    
+    def update_ts_chain_table(self, contract_type: str):
+        """Update the option chain table for specified contract type"""
+        try:
+            # Select the appropriate table and data
+            if contract_type == "0DTE":
+                table = self.ts_0dte_table
+                expiry = self.ts_0dte_expiry
+            else:  # 1DTE
+                table = self.ts_1dte_table
+                expiry = self.ts_1dte_expiry
+            
+            if not expiry:
+                return
+            
+            # Get all strikes for this expiry from app_state
+            chain_data = {}
+            for contract_key, data in self.app_state.get('option_chain', {}).items():
+                parts = contract_key.split('_')
+                if len(parts) >= 4 and parts[3] == expiry:
+                    strike = float(parts[1])
+                    if strike not in chain_data:
+                        chain_data[strike] = {'call': {}, 'put': {}}
+                    
+                    if parts[2] == 'C':
+                        chain_data[strike]['call'] = data
+                    else:
+                        chain_data[strike]['put'] = data
+            
+            # Sort strikes
+            sorted_strikes = sorted(chain_data.keys(), reverse=True)
+            
+            # Update table
+            table.setRowCount(len(sorted_strikes))
+            
+            for row, strike in enumerate(sorted_strikes):
+                call_data = chain_data[strike]['call']
+                put_data = chain_data[strike]['put']
+                
+                # Column layout: Call Δ, Call Γ, Call Bid, Call Ask, Strike, Put Bid, Put Ask, Put Γ, Put Δ
+                
+                # Call Delta (column 0)
+                table.setItem(row, 0, QTableWidgetItem(f"{call_data.get('delta', 0.0):.3f}"))
+                
+                # Call Gamma (column 1)
+                table.setItem(row, 1, QTableWidgetItem(f"{call_data.get('gamma', 0.0):.4f}"))
+                
+                # Call Bid (column 2)
+                table.setItem(row, 2, QTableWidgetItem(f"{call_data.get('bid', 0.0):.2f}"))
+                
+                # Call Ask (column 3)
+                table.setItem(row, 3, QTableWidgetItem(f"{call_data.get('ask', 0.0):.2f}"))
+                
+                # Strike (column 4 - center)
+                strike_item = QTableWidgetItem(f"{strike:.2f}")
+                strike_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                strike_item.setBackground(QColor(60, 60, 60))  # Highlight strike column
+                table.setItem(row, 4, strike_item)
+                
+                # Put Bid (column 5)
+                table.setItem(row, 5, QTableWidgetItem(f"{put_data.get('bid', 0.0):.2f}"))
+                
+                # Put Ask (column 6)
+                table.setItem(row, 6, QTableWidgetItem(f"{put_data.get('ask', 0.0):.2f}"))
+                
+                # Put Gamma (column 7)
+                table.setItem(row, 7, QTableWidgetItem(f"{put_data.get('gamma', 0.0):.4f}"))
+                
+                # Put Delta (column 8)
+                table.setItem(row, 8, QTableWidgetItem(f"{put_data.get('delta', 0.0):.3f}"))
+            
+        except Exception as e:
+            logger.error(f"Error updating {contract_type} chain table: {e}", exc_info=True)
+    
+    def execute_ts_buy_call(self, symbol: str, quantity: int, contract_type: str, signal_id: str):
+        """Execute buy call order from TradeStation signal"""
+        try:
+            # Determine expiry based on contract type
+            expiry = self.ts_0dte_expiry if contract_type == "0DTE" else self.ts_1dte_expiry
+            
+            if not expiry:
+                self.log_message(f"No expiry set for {contract_type}", "ERROR")
+                return
+            
+            # Find ATM strike
+            atm_strike = self.find_atm_strike_by_delta()
+            if not atm_strike:
+                self.log_message("Could not determine ATM strike", "ERROR")
+                return
+            
+            # Select 1 strike OTM (for calls, this is above ATM)
+            strike = atm_strike + self.strike_interval
+            
+            # Get mid price for limit order
+            contract_key = f"{symbol}_{strike}_C_{expiry}"
+            option_data = self.app_state.get('option_chain', {}).get(contract_key, {})
+            bid = option_data.get('bid', 0)
+            ask = option_data.get('ask', 0)
+            mid_price = round((bid + ask) / 2, 2) if bid and ask else 0
+            
+            if mid_price == 0:
+                self.log_message(f"No market data for {contract_key}", "ERROR")
+                return
+            
+            # Place order with chasing enabled
+            self.place_order(contract_key, "BUY", quantity, mid_price, True)
+            
+            # Add to signal log
+            self.add_ts_signal_to_log("ENTRY", "BUY_CALL", contract_key, "SUBMITTED", mid_price, f"Signal: {signal_id}")
+            
+        except Exception as e:
+            self.log_message(f"Error executing TS buy call: {e}", "ERROR")
+            logger.error(f"Error executing TS buy call: {e}", exc_info=True)
+    
+    def execute_ts_buy_put(self, symbol: str, quantity: int, contract_type: str, signal_id: str):
+        """Execute buy put order from TradeStation signal"""
+        try:
+            # Determine expiry based on contract type
+            expiry = self.ts_0dte_expiry if contract_type == "0DTE" else self.ts_1dte_expiry
+            
+            if not expiry:
+                self.log_message(f"No expiry set for {contract_type}", "ERROR")
+                return
+            
+            # Find ATM strike
+            atm_strike = self.find_atm_strike_by_delta()
+            if not atm_strike:
+                self.log_message("Could not determine ATM strike", "ERROR")
+                return
+            
+            # Select 1 strike OTM (for puts, this is below ATM)
+            strike = atm_strike - self.strike_interval
+            
+            # Get mid price for limit order
+            contract_key = f"{symbol}_{strike}_P_{expiry}"
+            option_data = self.app_state.get('option_chain', {}).get(contract_key, {})
+            bid = option_data.get('bid', 0)
+            ask = option_data.get('ask', 0)
+            mid_price = round((bid + ask) / 2, 2) if bid and ask else 0
+            
+            if mid_price == 0:
+                self.log_message(f"No market data for {contract_key}", "ERROR")
+                return
+            
+            # Place order with chasing enabled
+            self.place_order(contract_key, "BUY", quantity, mid_price, True)
+            
+            # Add to signal log
+            self.add_ts_signal_to_log("ENTRY", "BUY_PUT", contract_key, "SUBMITTED", mid_price, f"Signal: {signal_id}")
+            
+        except Exception as e:
+            self.log_message(f"Error executing TS buy put: {e}", "ERROR")
+            logger.error(f"Error executing TS buy put: {e}", exc_info=True)
+    
+    def execute_ts_buy_straddle(self, symbol: str, quantity: int, contract_type: str, signal_id: str):
+        """Execute buy straddle (call + put) from TradeStation signal"""
+        try:
+            # Execute both call and put
+            self.execute_ts_buy_call(symbol, quantity, contract_type, f"{signal_id}_CALL")
+            self.execute_ts_buy_put(symbol, quantity, contract_type, f"{signal_id}_PUT")
+            
+        except Exception as e:
+            self.log_message(f"Error executing TS buy straddle: {e}", "ERROR")
+            logger.error(f"Error executing TS buy straddle: {e}", exc_info=True)
+    
+    def execute_ts_close_all(self, symbol: str, signal_id: str):
+        """Close all positions for the symbol"""
+        try:
+            positions = self.app_state.get('positions', {})
+            closed_count = 0
+            
+            for contract_key, pos_data in positions.items():
+                if pos_data.get('symbol') == symbol and pos_data.get('quantity', 0) != 0:
+                    self.close_position_by_key(contract_key)
+                    closed_count += 1
+            
+            self.log_message(f"Closed {closed_count} positions for {symbol}", "INFO")
+            
+            # Add to signal log
+            self.add_ts_signal_to_log("EXIT", "CLOSE_ALL", symbol, "EXECUTED", 0, f"Closed {closed_count} positions")
+            
+        except Exception as e:
+            self.log_message(f"Error closing all positions: {e}", "ERROR")
+            logger.error(f"Error closing all positions: {e}", exc_info=True)
+    
+    def execute_ts_close_calls(self, symbol: str, signal_id: str):
+        """Close all call positions for the symbol"""
+        try:
+            positions = self.app_state.get('positions', {})
+            closed_count = 0
+            
+            for contract_key, pos_data in positions.items():
+                if (pos_data.get('symbol') == symbol and 
+                    pos_data.get('right') == 'C' and 
+                    pos_data.get('quantity', 0) != 0):
+                    self.close_position_by_key(contract_key)
+                    closed_count += 1
+            
+            self.log_message(f"Closed {closed_count} call positions for {symbol}", "INFO")
+            
+            # Add to signal log
+            self.add_ts_signal_to_log("EXIT", "CLOSE_CALLS", symbol, "EXECUTED", 0, f"Closed {closed_count} calls")
+            
+        except Exception as e:
+            self.log_message(f"Error closing call positions: {e}", "ERROR")
+            logger.error(f"Error closing call positions: {e}", exc_info=True)
+    
+    def execute_ts_close_puts(self, symbol: str, signal_id: str):
+        """Close all put positions for the symbol"""
+        try:
+            positions = self.app_state.get('positions', {})
+            closed_count = 0
+            
+            for contract_key, pos_data in positions.items():
+                if (pos_data.get('symbol') == symbol and 
+                    pos_data.get('right') == 'P' and 
+                    pos_data.get('quantity', 0) != 0):
+                    self.close_position_by_key(contract_key)
+                    closed_count += 1
+            
+            self.log_message(f"Closed {closed_count} put positions for {symbol}", "INFO")
+            
+            # Add to signal log
+            self.add_ts_signal_to_log("EXIT", "CLOSE_PUTS", symbol, "EXECUTED", 0, f"Closed {closed_count} puts")
+            
+        except Exception as e:
+            self.log_message(f"Error closing put positions: {e}", "ERROR")
+            logger.error(f"Error closing put positions: {e}", exc_info=True)
+    
+    def execute_ts_close_position(self, contract_key: str, signal_id: str):
+        """Close a specific position by contract key"""
+        try:
+            if not contract_key:
+                self.log_message("No contract key provided for position close", "ERROR")
+                return
+            
+            self.close_position_by_key(contract_key)
+            
+            # Add to signal log
+            self.add_ts_signal_to_log("EXIT", "CLOSE_POSITION", contract_key, "EXECUTED", 0, f"Signal: {signal_id}")
+            
+        except Exception as e:
+            self.log_message(f"Error closing specific position: {e}", "ERROR")
+            logger.error(f"Error closing specific position: {e}", exc_info=True)
+    
+    def add_ts_signal_to_log(self, signal_type: str, action: str, contract: str, 
+                            status: str, fill_price: float, details: str):
+        """Add entry to TradeStation signal history table"""
+        try:
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            
+            row = self.ts_signal_table.rowCount()
+            self.ts_signal_table.insertRow(row)
+            
+            self.ts_signal_table.setItem(row, 0, QTableWidgetItem(timestamp))
+            self.ts_signal_table.setItem(row, 1, QTableWidgetItem(signal_type))
+            self.ts_signal_table.setItem(row, 2, QTableWidgetItem(action))
+            self.ts_signal_table.setItem(row, 3, QTableWidgetItem(contract))
+            self.ts_signal_table.setItem(row, 4, QTableWidgetItem(status))
+            self.ts_signal_table.setItem(row, 5, QTableWidgetItem(f"{fill_price:.2f}" if fill_price else "N/A"))
+            self.ts_signal_table.setItem(row, 6, QTableWidgetItem(details))
+            
+            # Keep log to last 100 entries
+            if self.ts_signal_table.rowCount() > 100:
+                self.ts_signal_table.removeRow(0)
+            
+            # Scroll to bottom
+            self.ts_signal_table.scrollToBottom()
+            
+        except Exception as e:
+            logger.error(f"Error adding signal to log: {e}", exc_info=True)
+    
+    # ==================== End TradeStation Methods ====================
     
     def load_settings(self):
         """Load settings from JSON file"""
