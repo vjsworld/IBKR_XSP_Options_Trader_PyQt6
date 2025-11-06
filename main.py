@@ -509,15 +509,30 @@ class IBKRWrapper(EWrapper):
                              gamma: float, vega: float, theta: float, undPrice: float):
         """Receives option greeks"""
         if reqId in self.app.get('market_data_map', {}):
-            contract_key = self.app['market_data_map'][reqId]
-            greeks = {
-                'delta': delta if delta not in [-2, -1] else 0,
-                'gamma': gamma if gamma not in [-2, -1] else 0,
-                'theta': theta if theta not in [-2, -1] else 0,
-                'vega': vega if vega not in [-2, -1] else 0,
-                'iv': impliedVol if impliedVol not in [-2, -1] else 0
-            }
-            self.signals.greeks_updated.emit(contract_key, greeks)
+            mapping = self.app['market_data_map'][reqId]
+            
+            # Check if this is an ATM scan request
+            if isinstance(mapping, dict) and 'scan_key' in mapping:
+                scan_key = mapping['scan_key']
+                strike = mapping['strike']
+                
+                if scan_key in self.app:
+                    if delta not in [-2, -1]:
+                        self.app[scan_key]['deltas'][strike] = delta
+                        logger.debug(f"[ATM SCAN] Strike {strike}: delta={delta:.3f}")
+                return
+            
+            # Normal greeks update for option chain
+            contract_key = mapping if isinstance(mapping, str) else None
+            if contract_key:
+                greeks = {
+                    'delta': delta if delta not in [-2, -1] else 0,
+                    'gamma': gamma if gamma not in [-2, -1] else 0,
+                    'theta': theta if theta not in [-2, -1] else 0,
+                    'vega': vega if vega not in [-2, -1] else 0,
+                    'iv': impliedVol if impliedVol not in [-2, -1] else 0
+                }
+                self.signals.greeks_updated.emit(contract_key, greeks)
     
     def orderStatus(self, orderId: int, status: str, filled: float,
                    remaining: float, avgFillPrice: float, permId: int,
@@ -6360,6 +6375,154 @@ class MainWindow(QMainWindow):
     
     # ========== TradeStation Chain ATM Detection and Coloring Methods ==========
     
+    def request_atm_scan_for_ts_chain(self, contract_type: str):
+        """
+        Phase 1: Quick scan to find true ATM strike via delta.
+        Requests deltas for ±10 strikes around estimated price, finds closest to 0.5 delta,
+        then triggers Phase 2 to build proper chain centered on true ATM.
+        
+        Args:
+            contract_type: "0DTE" or "1DTE"
+        """
+        try:
+            logger.info(f"[TS {contract_type} ATM SCAN] === Phase 1: Scanning for true ATM ===")
+            
+            # Get expiry
+            if contract_type == "0DTE":
+                expiry = self.calculate_expiry_date(0)
+                self.ts_0dte_expiry = expiry
+            else:
+                expiry_0dte = self.calculate_expiry_date(0)
+                expiry_1dte = self.calculate_expiry_date(1)
+                if expiry_1dte == expiry_0dte:
+                    expiry = self.calculate_expiry_date(2)
+                else:
+                    expiry = expiry_1dte
+                self.ts_1dte_expiry = expiry
+            
+            # Get initial price estimate
+            strike_interval = self.instrument['strike_increment']
+            if (underlying_price := self.app_state.get('underlying_price', 0)) > 0:
+                reference_price = underlying_price
+                logger.info(f"[TS {contract_type} ATM SCAN] Using spot ${reference_price:.2f}")
+            else:
+                reference_price = self.get_adjusted_es_price()
+                if reference_price == 0:
+                    logger.warning(f"[TS {contract_type} ATM SCAN] No price data available")
+                    return
+                logger.info(f"[TS {contract_type} ATM SCAN] Using ES-adjusted ${reference_price:.2f}")
+            
+            # Build scan range: ±10 strikes around reference
+            center_estimate = round(reference_price / strike_interval) * strike_interval
+            scan_strikes = []
+            for i in range(-10, 11):  # -10 to +10 inclusive
+                scan_strikes.append(center_estimate + (i * strike_interval))
+            
+            logger.info(f"[TS {contract_type} ATM SCAN] Scanning {len(scan_strikes)} strikes: {min(scan_strikes):.0f} to {max(scan_strikes):.0f}")
+            
+            # Store scan state
+            scan_state_key = f'ts_{contract_type.lower()}_atm_scan'
+            self.app_state[scan_state_key] = {
+                'expiry': expiry,
+                'contract_type': contract_type,
+                'scan_strikes': scan_strikes,
+                'deltas': {},
+                'scan_complete': False
+            }
+            
+            # Request ONLY deltas (generic tick 13 = model option computation)
+            trading_class = "SPXW" if SELECTED_INSTRUMENT == "SPX" else "XSP"
+            
+            for strike in scan_strikes:
+                # Request call option for delta
+                call_contract = self.create_option_contract(
+                    strike=strike,
+                    right='C',
+                    symbol=SELECTED_INSTRUMENT,
+                    trading_class=trading_class,
+                    expiry=expiry
+                )
+                
+                req_id = self.app_state['next_req_id']
+                # Request generic tick list for option computations (including delta)
+                self.ibkr_client.reqMktData(req_id, call_contract, "106", False, False, [])  # 106 = option greeks
+                
+                # Map request to scan
+                self.app_state['market_data_map'][req_id] = {
+                    'scan_key': scan_state_key,
+                    'strike': strike,
+                    'contract_type': contract_type
+                }
+                self.app_state['next_req_id'] += 1
+            
+            # Set timeout to complete scan and find ATM
+            QTimer.singleShot(3000, lambda: self.complete_atm_scan_and_build_chain(contract_type))
+            
+            logger.info(f"[TS {contract_type} ATM SCAN] Scan requests sent, will analyze in 3 seconds")
+            
+        except Exception as e:
+            logger.error(f"[TS {contract_type} ATM SCAN] Error: {e}", exc_info=True)
+    
+    def complete_atm_scan_and_build_chain(self, contract_type: str):
+        """
+        Phase 2: Analyze scan results, find true ATM, build proper chain.
+        
+        Args:
+            contract_type: "0DTE" or "1DTE"
+        """
+        try:
+            scan_state_key = f'ts_{contract_type.lower()}_atm_scan'
+            scan_state = self.app_state.get(scan_state_key)
+            
+            if not scan_state:
+                logger.warning(f"[TS {contract_type} ATM SCAN] No scan state found")
+                return
+            
+            deltas = scan_state.get('deltas', {})
+            
+            if not deltas:
+                logger.warning(f"[TS {contract_type} ATM SCAN] No deltas received, falling back to price-based center")
+                # Fall back to old method
+                self.request_ts_chain(contract_type)
+                return
+            
+            # Find strike with delta closest to 0.5
+            best_strike = 0
+            best_diff = float('inf')
+            
+            for strike, delta in deltas.items():
+                if delta is not None and 0 < delta < 1:
+                    diff = abs(delta - 0.5)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best_strike = strike
+            
+            if best_strike == 0:
+                logger.warning(f"[TS {contract_type} ATM SCAN] Could not find valid ATM, falling back")
+                self.request_ts_chain(contract_type)
+                return
+            
+            logger.info(f"[TS {contract_type} ATM SCAN] ✅ Found true ATM: {best_strike:.0f} (delta: {deltas[best_strike]:.3f})")
+            logger.info(f"[TS {contract_type} ATM SCAN] === Phase 2: Building chain centered on ATM ===")
+            
+            # Cancel scan subscriptions
+            for req_id, mapping in list(self.app_state['market_data_map'].items()):
+                if isinstance(mapping, dict) and mapping.get('scan_key') == scan_state_key:
+                    try:
+                        self.ibkr_client.cancelMktData(req_id)
+                        del self.app_state['market_data_map'][req_id]
+                    except:
+                        pass
+            
+            # Clear scan state
+            del self.app_state[scan_state_key]
+            
+            # Now build the proper chain centered on true ATM
+            self.request_ts_chain(contract_type, force_center_strike=best_strike)
+            
+        except Exception as e:
+            logger.error(f"[TS {contract_type} ATM SCAN] Error completing scan: {e}", exc_info=True)
+
     def calculate_initial_atm_strike(self, contract_type: str = "0DTE") -> float:
         """
         Calculate initial ATM strike for chain centering using best available method.
@@ -6392,17 +6555,11 @@ class MainWindow(QMainWindow):
             logger.info(f"[Chain Init] ATM estimate: {atm_strike} (at spot for {contract_type})")
             return atm_strike
         
-        # For 1DTE, account for time value effects
-        # Options with time value have ATM (0.5 delta) slightly below spot for calls
-        # This is because of the forward price adjustment and skew
-        
-        # Simple adjustment: For 1DTE, ATM is typically 0.5-1 strike below spot
-        # This is an approximation that will be corrected by delta detection
-        time_adjustment = strike_interval * 0.5  # Half a strike lower
-        adjusted_price = spot_price - time_adjustment
-        
-        atm_strike = round(adjusted_price / strike_interval) * strike_interval
-        logger.info(f"[Chain Init] ATM estimate: {atm_strike} (spot {spot_price:.2f} - time adjustment {time_adjustment:.2f} for {contract_type})")
+        # For 1DTE, options with time value typically have ATM (0.5 delta) at or very close to spot
+        # The time value effect is minimal for just 1 day
+        # Using spot price directly provides better initial centering than trying to adjust
+        atm_strike = round(spot_price / strike_interval) * strike_interval
+        logger.info(f"[Chain Init] ATM estimate: {atm_strike} (at spot for {contract_type} - minimal time adjustment needed)")
         
         return atm_strike
 
@@ -8784,16 +8941,17 @@ class MainWindow(QMainWindow):
             logger.error(f"Error syncing with TradeStation: {e}", exc_info=True)
     
     def refresh_ts_chains(self):
-        """Refresh both 0DTE and 1DTE option chains for TradeStation tab"""
+        """Refresh both 0DTE and 1DTE option chains for TradeStation tab using ATM scan"""
         if self.connection_state != ConnectionState.CONNECTED:
             self.log_message("Cannot refresh chains - not connected to IBKR", "WARNING")
             return
         
         try:
-            # Request both chains
-            self.request_ts_chain("0DTE")
-            self.request_ts_chain("1DTE")
-            self.log_message("Refreshing TradeStation option chains...", "INFO")
+            # Use new two-phase approach: scan for ATM, then build chains
+            self.log_message("Scanning for true ATM strikes...", "INFO")
+            self.request_atm_scan_for_ts_chain("0DTE")
+            # Delay 1DTE scan slightly to avoid overwhelming API
+            QTimer.singleShot(500, lambda: self.request_atm_scan_for_ts_chain("1DTE"))
         except Exception as e:
             self.log_message(f"Error refreshing TS chains: {e}", "ERROR")
             logger.error(f"Error refreshing TS chains: {e}", exc_info=True)
