@@ -6378,6 +6378,52 @@ class MainWindow(QMainWindow):
     
     # ========== TradeStation Chain ATM Detection and Coloring Methods ==========
     
+    def calculate_initial_atm_strike(self, contract_type: str) -> float:
+        """
+        Calculate initial ATM strike for chain centering using best available method.
+        
+        For 0DTE: Use spot price (minimal time value)
+        For 1DTE: Adjust for time value effect on delta curve
+        
+        Args:
+            contract_type: "0DTE" or "1DTE"
+            
+        Returns:
+            float: Estimated ATM strike for initial chain centering
+        """
+        strike_interval = self.instrument['strike_increment']
+        
+        # Get spot price
+        if (underlying_price := self.app_state.get('underlying_price', 0)) > 0:
+            spot_price = underlying_price
+            logger.info(f"[TS {contract_type}] Using {self.instrument['underlying_symbol']} spot price ${spot_price:.2f}")
+        else:
+            # Fallback to ES futures adjusted for cash offset
+            spot_price = self.get_adjusted_es_price()
+            if spot_price == 0:
+                return 0
+            logger.info(f"[TS {contract_type}] Using ES-adjusted spot price ${spot_price:.2f}")
+        
+        # For 0DTE, spot price is good enough (minimal time value)
+        if contract_type == "0DTE":
+            atm_strike = round(spot_price / strike_interval) * strike_interval
+            logger.info(f"[TS 0DTE] Initial ATM estimate: {atm_strike} (at spot)")
+            return atm_strike
+        
+        # For 1DTE, account for time value effects
+        # Options with time value have ATM (0.5 delta) slightly below spot for calls
+        # This is because of the forward price adjustment and skew
+        
+        # Simple adjustment: For 1DTE, ATM is typically 0.5-1 strike below spot
+        # This is an approximation that will be corrected by delta detection
+        time_adjustment = strike_interval * 0.5  # Half a strike lower
+        adjusted_price = spot_price - time_adjustment
+        
+        atm_strike = round(adjusted_price / strike_interval) * strike_interval
+        logger.info(f"[TS 1DTE] Initial ATM estimate: {atm_strike} (spot {spot_price:.2f} - time adjustment {time_adjustment:.2f})")
+        
+        return atm_strike
+
     def find_ts_atm_strike_by_delta(self, contract_type: str) -> float:
         """
         Find ATM strike for TS chains using delta closest to 0.5 (same logic as main chain).
@@ -6439,10 +6485,10 @@ class MainWindow(QMainWindow):
         
         # Prefer call-based ATM
         if atm_call_strike > 0:
-            logger.debug(f"[TS {contract_type}] ATM strike by CALL delta: {atm_call_strike:.0f} (delta: {0.5-min_call_diff:.3f})")
+            logger.debug(f"[TS {contract_type}] ⚡ ATM by delta: {atm_call_strike:.0f} (call delta: {0.5-min_call_diff:.3f})")
             return atm_call_strike
         elif atm_put_strike > 0:
-            logger.debug(f"[TS {contract_type}] ATM strike by PUT delta: {atm_put_strike:.0f} (delta: {0.5-min_put_diff:.3f})")
+            logger.debug(f"[TS {contract_type}] ⚡ ATM by delta: {atm_put_strike:.0f} (put delta: {0.5-min_put_diff:.3f})")
             return atm_put_strike
         else:
             return 0
@@ -6461,7 +6507,10 @@ class MainWindow(QMainWindow):
         if atm_strike == 0:
             return  # No ATM found yet
         
-        logger.debug(f"[TS {contract_type}] 🎨 Coloring strikes around ATM: {atm_strike:.0f}")
+        # Get center strike for comparison
+        center_strike = self.ts_0dte_center_strike if contract_type == "0DTE" else self.ts_1dte_center_strike
+        offset_from_center = atm_strike - center_strike if center_strike > 0 else 0
+        logger.debug(f"[TS {contract_type}] 🎨 Coloring strikes: ATM={atm_strike:.0f}, Chain Center={center_strike:.0f}, Offset={offset_from_center:+.0f}")
         
         # Select appropriate table and label
         if contract_type == "0DTE":
@@ -6547,7 +6596,13 @@ class MainWindow(QMainWindow):
         
         # Check for initial calibration or normal drift
         is_initial_calibration = not calibration_done
-        initial_calibration_threshold = 2
+        
+        # For 1DTE, use more aggressive initial calibration since time value affects initial estimate
+        # For 0DTE, use tighter threshold since spot price should be accurate
+        if contract_type == "1DTE":
+            initial_calibration_threshold = 1  # Recenter if off by even 1 strike
+        else:
+            initial_calibration_threshold = 2  # 0DTE: allow 2 strikes tolerance
         
         should_recenter = False
         reason = ""
@@ -8845,27 +8900,20 @@ class MainWindow(QMainWindow):
                 center_strike = force_center_strike
                 logger.info(f"[TS {contract_type}] FORCED RECENTER to strike {center_strike}")
             else:
-                if (underlying_price := self.app_state.get('underlying_price', 0)) > 0:
-                    reference_price = underlying_price
-                    logger.info(f"[TS {contract_type}] Using {self.instrument['underlying_symbol']} index price ${reference_price:.2f}")
-                else:
-                    # Fallback to ES futures adjusted for cash offset
-                    adjusted_es_price = self.get_adjusted_es_price()
-                    if adjusted_es_price == 0:
-                        self.log_message(f"Waiting for price data for {contract_type} chain...", "INFO")
-                        return
-                    reference_price = adjusted_es_price
-                    logger.warning(f"[TS {contract_type}] Using fallback ES-derived price ${reference_price:.2f}")
-                
-                # Calculate center strike
-                center_strike = round(reference_price / strike_interval) * strike_interval
-                logger.info(f"[TS {contract_type}] Chain centered at strike {center_strike} (Ref: ${reference_price:.2f})")
+                # Use intelligent initial ATM calculation
+                center_strike = self.calculate_initial_atm_strike(contract_type)
+                if center_strike == 0:
+                    self.log_message(f"Waiting for price data for {contract_type} chain...", "INFO")
+                    return
+                logger.info(f"[TS {contract_type}] Chain centered at strike {center_strike} ({self.ts_strikes_below} below, {self.ts_strikes_above} above)")
             
             # Track center strike for drift detection
             if contract_type == "0DTE":
                 self.ts_0dte_center_strike = center_strike
+                logger.info(f"[TS 0DTE] 📍 Tracked center_strike = {center_strike}")
             else:
                 self.ts_1dte_center_strike = center_strike
+                logger.info(f"[TS 1DTE] 📍 Tracked center_strike = {center_strike}")
             
             # Build strike list using TS chain settings
             strikes = []
