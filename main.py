@@ -5998,31 +5998,13 @@ class MainWindow(QMainWindow):
         if force_center_strike is not None:
             reference_price = force_center_strike
             logger.info(f"🎯 RECENTERING on delta-detected ATM strike: ${reference_price:.2f}")
-        # PRIORITY 1: Use actual underlying index price (XSP or SPX)
-        # This is the CORRECT price for ATM strike calculation as it matches TWS
-        elif (underlying_price := self.app_state.get('underlying_price', 0)) > 0:
-            reference_price = underlying_price
-            logger.info(f"Using actual {self.instrument['underlying_symbol']} index price ${reference_price:.2f} for ATM calculation")
         else:
-            # FALLBACK: Use ES futures adjusted for cash offset (after-hours only)
-            # WARNING: This gives approximate ATM and may not match TWS exactly during after-hours
-            es_price = self.app_state['es_price']
-            if es_price == 0:
+            # Use intelligent initial ATM calculation (accounts for spot price and time value)
+            reference_price = self.calculate_initial_atm_strike("0DTE")
+            if reference_price == 0:
                 self.log_message("Waiting for price data (XSP index or ES futures)...", "INFO")
                 QTimer.singleShot(2000, self.request_option_chain)
                 return
-            
-            # Get ES price adjusted for cash offset
-            adjusted_es_price = self.get_adjusted_es_price()
-            if adjusted_es_price == 0:
-                # Fallback to raw ES if adjustment fails
-                adjusted_es_price = es_price / 10.0 if self.instrument['underlying_symbol'] == 'XSP' else es_price
-            
-            reference_price = adjusted_es_price
-            
-            # Log the adjustment being applied
-            logger.warning(f"Using FALLBACK ES-derived price ${reference_price:.2f} (ES: {es_price:.2f}, offset: {self.es_to_cash_offset:+.2f})")
-            logger.warning(f"ATM strike may not match TWS - {self.instrument['underlying_symbol']} index not available")
         
         strike_increment = self.instrument['strike_increment']
         center_strike = round(reference_price / strike_increment) * strike_increment
@@ -6378,7 +6360,7 @@ class MainWindow(QMainWindow):
     
     # ========== TradeStation Chain ATM Detection and Coloring Methods ==========
     
-    def calculate_initial_atm_strike(self, contract_type: str) -> float:
+    def calculate_initial_atm_strike(self, contract_type: str = "0DTE") -> float:
         """
         Calculate initial ATM strike for chain centering using best available method.
         
@@ -6386,7 +6368,7 @@ class MainWindow(QMainWindow):
         For 1DTE: Adjust for time value effect on delta curve
         
         Args:
-            contract_type: "0DTE" or "1DTE"
+            contract_type: "0DTE" or "1DTE" (default: "0DTE" for main chain)
             
         Returns:
             float: Estimated ATM strike for initial chain centering
@@ -6396,18 +6378,18 @@ class MainWindow(QMainWindow):
         # Get spot price
         if (underlying_price := self.app_state.get('underlying_price', 0)) > 0:
             spot_price = underlying_price
-            logger.info(f"[TS {contract_type}] Using {self.instrument['underlying_symbol']} spot price ${spot_price:.2f}")
+            logger.info(f"[Chain Init] Using {self.instrument['underlying_symbol']} spot price ${spot_price:.2f}")
         else:
             # Fallback to ES futures adjusted for cash offset
             spot_price = self.get_adjusted_es_price()
             if spot_price == 0:
                 return 0
-            logger.info(f"[TS {contract_type}] Using ES-adjusted spot price ${spot_price:.2f}")
+            logger.info(f"[Chain Init] Using ES-adjusted spot price ${spot_price:.2f}")
         
-        # For 0DTE, spot price is good enough (minimal time value)
+        # For 0DTE (main chain), spot price is good enough (minimal time value)
         if contract_type == "0DTE":
             atm_strike = round(spot_price / strike_interval) * strike_interval
-            logger.info(f"[TS 0DTE] Initial ATM estimate: {atm_strike} (at spot)")
+            logger.info(f"[Chain Init] ATM estimate: {atm_strike} (at spot for {contract_type})")
             return atm_strike
         
         # For 1DTE, account for time value effects
@@ -6420,7 +6402,7 @@ class MainWindow(QMainWindow):
         adjusted_price = spot_price - time_adjustment
         
         atm_strike = round(adjusted_price / strike_interval) * strike_interval
-        logger.info(f"[TS 1DTE] Initial ATM estimate: {atm_strike} (spot {spot_price:.2f} - time adjustment {time_adjustment:.2f})")
+        logger.info(f"[Chain Init] ATM estimate: {atm_strike} (spot {spot_price:.2f} - time adjustment {time_adjustment:.2f} for {contract_type})")
         
         return atm_strike
 
