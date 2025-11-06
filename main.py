@@ -3371,6 +3371,19 @@ class MainWindow(QMainWindow):
     def request_option_historical_data(self, contract_key: str, right: str, strike: float):
         """Request historical data for a specific option"""
         try:
+            # Validate inputs
+            if not self.current_expiry:
+                logger.warning(f"Cannot request option historical data - no current expiry set")
+                return
+            
+            if strike <= 0:
+                logger.warning(f"Cannot request option historical data - invalid strike {strike}")
+                return
+            
+            if right not in ['C', 'P']:
+                logger.warning(f"Cannot request option historical data - invalid right '{right}'")
+                return
+            
             from ibapi.contract import Contract
             
             contract = Contract()
@@ -3388,6 +3401,11 @@ class MainWindow(QMainWindow):
             self.app_state['next_req_id'] += 1
             
             self.request_id_map[req_id] = f"CHART_{contract_key}"
+            
+            # Track this as a historical data request for error handling
+            if 'historical_data_requests' not in self.app_state:
+                self.app_state['historical_data_requests'] = {}
+            self.app_state['historical_data_requests'][req_id] = contract_key
             
             # Request 1 day of 1-minute data for option charts using MIDPOINT with real-time updates
             self.ibkr_client.reqHistoricalData(
@@ -6387,6 +6405,12 @@ class MainWindow(QMainWindow):
         try:
             logger.info(f"[TS {contract_type} ATM SCAN] === Phase 1: Scanning for true ATM ===")
             
+            # Check IBKR connection
+            if self.connection_state != ConnectionState.CONNECTED:
+                self.log_message("IBKR not connected - cannot scan for ATM", "WARNING")
+                logger.warning(f"[TS {contract_type} ATM SCAN] Connection state is {self.connection_state}, not CONNECTED")
+                return
+            
             # Get expiry
             if contract_type == "0DTE":
                 expiry = self.calculate_expiry_date(0)
@@ -6419,6 +6443,7 @@ class MainWindow(QMainWindow):
                 scan_strikes.append(center_estimate + (i * strike_interval))
             
             logger.info(f"[TS {contract_type} ATM SCAN] Scanning {len(scan_strikes)} strikes: {min(scan_strikes):.0f} to {max(scan_strikes):.0f}")
+            self.log_message(f"Scanning {contract_type} for ATM strike ({min(scan_strikes):.0f}-{max(scan_strikes):.0f})...", "INFO")
             
             # Store scan state
             scan_state_key = f'ts_{contract_type.lower()}_atm_scan'
@@ -6504,6 +6529,7 @@ class MainWindow(QMainWindow):
             
             logger.info(f"[TS {contract_type} ATM SCAN] ✅ Found true ATM: {best_strike:.0f} (delta: {deltas[best_strike]:.3f})")
             logger.info(f"[TS {contract_type} ATM SCAN] === Phase 2: Building chain centered on ATM ===")
+            self.log_message(f"{contract_type} ATM found at {best_strike:.0f} - building chain...", "SUCCESS")
             
             # Cancel scan subscriptions
             for req_id, mapping in list(self.app_state['market_data_map'].items()):
