@@ -6458,6 +6458,7 @@ class MainWindow(QMainWindow):
             # Request ONLY deltas (generic tick 13 = model option computation)
             trading_class = "SPXW" if SELECTED_INSTRUMENT == "SPX" else "XSP"
             
+            req_count = 0
             for strike in scan_strikes:
                 # Request call option for delta
                 call_contract = self.create_option_contract(
@@ -6469,8 +6470,9 @@ class MainWindow(QMainWindow):
                 )
                 
                 req_id = self.app_state['next_req_id']
-                # Request generic tick list for option computations (including delta)
-                self.ibkr_client.reqMktData(req_id, call_contract, "106", False, False, [])  # 106 = option greeks
+                # Request SNAPSHOT (not streaming) with generic tick 106 for option greeks
+                # snapshot=True means we get one update and then auto-cancel
+                self.ibkr_client.reqMktData(req_id, call_contract, "106", True, False, [])  # snapshot=True
                 
                 # Map request to scan
                 self.app_state['market_data_map'][req_id] = {
@@ -6479,11 +6481,17 @@ class MainWindow(QMainWindow):
                     'contract_type': contract_type
                 }
                 self.app_state['next_req_id'] += 1
+                req_count += 1
+                
+                # Small delay every 5 requests to avoid overwhelming API
+                if req_count % 5 == 0:
+                    import time
+                    time.sleep(0.1)
             
-            # Set timeout to complete scan and find ATM
-            QTimer.singleShot(3000, lambda: self.complete_atm_scan_and_build_chain(contract_type))
+            # Set timeout to complete scan and find ATM - increased to 5s for snapshot mode
+            QTimer.singleShot(5000, lambda: self.complete_atm_scan_and_build_chain(contract_type))
             
-            logger.info(f"[TS {contract_type} ATM SCAN] Scan requests sent, will analyze in 3 seconds")
+            logger.info(f"[TS {contract_type} ATM SCAN] Scan requests sent (SNAPSHOT mode), will analyze in 5 seconds")
             
         except Exception as e:
             logger.error(f"[TS {contract_type} ATM SCAN] Error: {e}", exc_info=True)
