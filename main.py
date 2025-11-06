@@ -491,7 +491,15 @@ class IBKRWrapper(EWrapper):
         
         # Option contract prices
         if reqId in self.app.get('market_data_map', {}):
-            contract_key = self.app['market_data_map'][reqId]
+            mapping = self.app['market_data_map'][reqId]
+            
+            # Check if this is a scan request (dict) vs normal request (string)
+            if isinstance(mapping, dict) and 'scan_key' in mapping:
+                # This is an ATM scan request - ignore price ticks, we only need greeks
+                return
+            
+            # Normal option contract
+            contract_key = mapping
             tick_name = {1: 'bid', 2: 'ask', 4: 'last', 9: 'prev_close'}.get(tickType)
             if tick_name:
                 self.signals.market_data_tick.emit(contract_key, tick_name, price)
@@ -499,7 +507,15 @@ class IBKRWrapper(EWrapper):
     def tickSize(self, reqId: TickerId, tickType: TickType, size: int):
         """Receives real-time size updates"""
         if reqId in self.app.get('market_data_map', {}):
-            contract_key = self.app['market_data_map'][reqId]
+            mapping = self.app['market_data_map'][reqId]
+            
+            # Check if this is a scan request (dict) vs normal request (string)
+            if isinstance(mapping, dict) and 'scan_key' in mapping:
+                # This is an ATM scan request - ignore size ticks
+                return
+            
+            # Normal option contract
+            contract_key = mapping
             if tickType == 8:  # VOLUME
                 self.signals.market_data_tick.emit(contract_key, 'volume', float(size))
     
@@ -772,12 +788,13 @@ class TradeStationManager(QObject):
     The working Demo.py doesn't use threads, it just calls pythoncom.PumpWaitingMessages() in a loop.
     """
     
-    def __init__(self, signals):
+    def __init__(self, signals, main_window=None):
         super().__init__()
         self.signals = signals
+        self.main_window = main_window  # Reference to MainWindow for settings access
         self.running = False
         self.gd = None
-        self.dict_name = "IBKR-TRADER"  # Match TradeStation's dictionary name (with hyphen)
+        self.dict_name = "IBKR-TRADER"  # Match TradeStation's dictionary name (with HYPHEN)
         self.processed_signals = set()
         self.timer = None  # QTimer for message pump
         
@@ -855,8 +872,11 @@ class TradeStationManager(QObject):
             value_str = str(value)[:200] if value else "None"
             logger.info(f"[TS→PYTHON] NEW KEY: '{key}' = {value_str} (dict size: {size})")
             self.signals.ts_message.emit(f"TS ADD: {key} = {value_str}")
-            # Show ADD events in Activity Log
-            self.signals.ts_activity.emit(f"[ADD] {key} = {value_str}")
+            
+            # Show raw GD ADD events only when checkbox is enabled
+            show_all = self.main_window.show_all_gd_communications if self.main_window else False
+            if show_all:
+                self.signals.ts_activity.emit(f"[ADD] {key} = {value_str}")
             
             if key.startswith("ENTRY_"):
                 signal_id = key[6:]
@@ -912,17 +932,28 @@ class TradeStationManager(QObject):
             return
             
         try:
-            # LOG ALL CHANGES FROM TRADESTATION (to file only, not Activity Log)
             value_str = str(value)[:200] if value else "None"
-            logger.info(f"[TS→PYTHON] CHANGED KEY: '{key}' = {value_str} (dict size: {size})")
-            self.signals.ts_message.emit(f"TS CHANGE: {key} = {value_str}")
-            # Activity Log: Only log important events (muted routine GD messages)
-            # self.signals.ts_activity.emit(f"[CHANGE] {key} = {value_str}")
+            
+            # Filter out repetitive/noisy messages from logs but allow in Activity Log
+            repetitive_keys = {
+                'StrategyDirection', 'LAST_UPDATE', 'PYTHON_STATUS',
+                'CurrentTime', 'MarketState', 'HeartBeat'
+            }
+            
+            # Only log important changes to file/console, not repetitive status updates
+            if key not in repetitive_keys:
+                logger.info(f"[TS→PYTHON] CHANGED KEY: '{key}' = {value_str} (dict size: {size})")
+                self.signals.ts_message.emit(f"TS CHANGE: {key} = {value_str}")
+            
+            # Show CHANGE events in Activity Log (conditionally based on settings)
+            show_all = self.main_window.show_all_gd_communications if self.main_window else False
+            if show_all:
+                self.signals.ts_activity.emit(f"[CHANGE] {key} = {value_str}")
             
             if key == "TS_STRATEGY_STATE":
                 self.signals.strategy_state_changed.emit(str(value))
                 logger.info(f"[TS→PYTHON] Strategy state updated to: {value}")
-                self.signals.ts_activity.emit(f"[STATE] Strategy: {value}")  # Keep this one
+                self.signals.ts_activity.emit(f"[STATE] Strategy: {value}")  # Always show strategy state changes
         except Exception as e:
             logger.error(f"Error processing signal change: {e}", exc_info=True)
     
@@ -942,8 +973,11 @@ class TradeStationManager(QObject):
             # LOG ALL REMOVALS FROM TRADESTATION
             logger.info(f"[TS→PYTHON] REMOVED KEY: '{key}' (dict size: {size})")
             self.signals.ts_message.emit(f"TS REMOVE: {key}")
-            # Show REMOVE events in Activity Log
-            self.signals.ts_activity.emit(f"[REMOVE] Key: {key}")
+            
+            # Show REMOVE events in Activity Log (conditionally based on settings)
+            show_all = self.main_window.show_all_gd_communications if self.main_window else False
+            if show_all:
+                self.signals.ts_activity.emit(f"[REMOVE] Key: {key}")
         except Exception as e:
             logger.error(f"Error processing signal remove: {e}", exc_info=True)
     
@@ -961,8 +995,11 @@ class TradeStationManager(QObject):
             # LOG CLEAR EVENT FROM TRADESTATION
             logger.info(f"[TS→PYTHON] DICTIONARY CLEARED")
             self.signals.ts_message.emit(f"TS CLEAR: Dictionary cleared")
-            # Show CLEAR events in Activity Log
-            self.signals.ts_activity.emit(f"[CLEAR] GlobalDictionary cleared")
+            
+            # Show CLEAR events in Activity Log (conditionally based on settings)
+            show_all = self.main_window.show_all_gd_communications if self.main_window else False
+            if show_all:
+                self.signals.ts_activity.emit(f"[CLEAR] GlobalDictionary cleared")
         except Exception as e:
             logger.error(f"Error processing clear event: {e}", exc_info=True)
     
@@ -2351,9 +2388,9 @@ class MainWindow(QMainWindow):
         logger.info(f"Application timezone set to: {self.local_tz} (Central Time)")
         self.last_refresh_date = datetime.now(self.local_tz).date()
         
-        # Strategy parameters
-        self.strikes_above = 20
-        self.strikes_below = 20
+        # Strategy parameters - reduced strikes for efficient auto-load under 100 data line limit
+        self.strikes_above = 10  # Reduced from 20 to 10 for streamlined chain loading
+        self.strikes_below = 10  # Reduced from 20 to 10 for streamlined chain loading
         self.current_expiry = self.calculate_expiry_date(0)
         self.chain_refresh_interval = 3600  # Auto-refresh chain every hour (in seconds)
         self.last_chain_center_strike = 0  # Track last center strike for drift detection
@@ -2368,6 +2405,13 @@ class MainWindow(QMainWindow):
         self.ts_0dte_center_strike = 0  # Track center strike for drift detection
         self.ts_1dte_center_strike = 0
         self.ts_chain_drift_threshold = 3  # Drift threshold for TS chains (default: 3)
+        
+        # GlobalDictionary settings
+        self.show_all_gd_communications = False  # Default to False, loaded from settings
+        
+        # Simplified ATM scan variables
+        self.atm_scan_deltas = {}  # contract_key -> delta
+        self.atm_scan_pending = set()  # request IDs pending for ATM scan
         
         # Auto-refresh timer for 4:00 PM ET expiration switch
         self.market_close_timer = QTimer()
@@ -2498,6 +2542,10 @@ class MainWindow(QMainWindow):
         
         # Auto-connect after 2 seconds
         QTimer.singleShot(2000, self.connect_to_ibkr)
+        
+        # Auto-connect to TradeStation after 3 seconds (if available)
+        if TRADESTATION_AVAILABLE:
+            QTimer.singleShot(3000, self.enable_tradestation)
         
         # Initialize real chart data after connection
         QTimer.singleShot(5000, self.request_chart_data)
@@ -4374,6 +4422,18 @@ class MainWindow(QMainWindow):
         
         layout.addWidget(ts_chain_group)
         
+        # TradeStation GlobalDictionary Settings
+        gd_group = QGroupBox("TradeStation GlobalDictionary")
+        gd_layout = QVBoxLayout(gd_group)
+        
+        self.show_all_gd_checkbox = QCheckBox("Show All GD Communications")
+        self.show_all_gd_checkbox.setToolTip("When checked, displays all GlobalDictionary messages in the TS Activity Log.\nOtherwise, only shows explicitly programmed messages.")
+        self.show_all_gd_checkbox.setChecked(getattr(self, 'show_all_gd_communications', False))
+        self.show_all_gd_checkbox.toggled.connect(self.update_gd_communications_setting)
+        gd_layout.addWidget(self.show_all_gd_checkbox)
+        
+        layout.addWidget(gd_group)
+        
         # Save button
         save_btn = QPushButton("Save Settings")
         save_btn.clicked.connect(self.save_settings)
@@ -4382,6 +4442,11 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         
         return tab
+    
+    def update_gd_communications_setting(self):
+        """Update the GlobalDictionary communications setting immediately when checkbox is toggled"""
+        self.show_all_gd_communications = self.show_all_gd_checkbox.isChecked()
+        logger.info(f"GlobalDictionary show all communications setting updated to: {self.show_all_gd_communications}")
     
     def apply_dark_theme(self):
         """Apply IBKR TWS dark color scheme with minimal Bloomberg-style orange accents"""
@@ -4582,6 +4647,14 @@ class MainWindow(QMainWindow):
             self.subscribe_underlying_price()  # Subscribe to underlying instrument (SPX, XSP, etc.) for display
             self.subscribe_es_price()   # ES for strike calculations (23/6 trading)
             self.subscribe_mes_price()  # MES for vega strategy delta hedging
+            
+            # REDUCED main chain auto-load: 10+10 strikes (vs 20+20) to stay under 100 data line limit
+            # After main chain loads, its ATM will be used to auto-load TS chains efficiently
+            main_strikes = f"{self.strikes_above}+{self.strikes_below}"
+            logger.info(f"Auto-loading main chain with normal strikes: {main_strikes}")
+            
+            # Set startup flag to enable cascade loading after this auto-load
+            self._is_startup_auto_load = True
             self.request_option_chain()
             
             # Calculate offset from historical 3pm close if stale
@@ -5662,16 +5735,16 @@ class MainWindow(QMainWindow):
         """
         # Get current time in local timezone
         now_local = datetime.now(self.local_tz)
+        original_offset = offset
         
         # Check if market has closed (4:00 PM local time)
         # NOTE: Market closes at 4:00 PM ET, but we use local time for user convenience
         market_close_hour = 16  # 4:00 PM
         
-        # If after 4:00 PM local and looking for 0DTE (offset=0), skip to tomorrow
-        # because today's options have expired
-        if offset == 0 and now_local.hour >= market_close_hour:
-            logger.info(f"After 4:00 PM local ({now_local.strftime('%I:%M %p')}), switching 0DTE to tomorrow")
-            offset = 1  # Move to next expiration
+        # If after 4:00 PM local, all offsets shift by 1 because today's options have expired
+        if now_local.hour >= market_close_hour:
+            logger.info(f"After 4:00 PM local ({now_local.strftime('%I:%M %p')}), shifting all expirations forward by 1")
+            offset += 1  # Move all expirations forward
         
         # Start from today
         target_date = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -5687,7 +5760,7 @@ class MainWindow(QMainWindow):
             if target_date.weekday() in expiry_days:
                 if expirations_found == offset:
                     result = target_date.strftime("%Y%m%d")
-                    logger.debug(f"calculate_expiry_date(offset={offset}) = {result}")
+                    logger.debug(f"calculate_expiry_date(offset={original_offset}) = {result}")
                     return result
                 expirations_found += 1
             target_date += timedelta(days=1)
@@ -5734,22 +5807,18 @@ class MainWindow(QMainWindow):
         controls_group = QGroupBox("TradeStation Connection")
         controls_layout = QVBoxLayout(controls_group)
         
-        btn_layout = QHBoxLayout()
-        self.enable_ts_btn = QPushButton("Enable TS")
-        self.enable_ts_btn.clicked.connect(self.enable_tradestation)
-        btn_layout.addWidget(self.enable_ts_btn)
-        
-        self.disable_ts_btn = QPushButton("Disable TS")
-        self.disable_ts_btn.clicked.connect(self.disable_tradestation)
-        self.disable_ts_btn.setEnabled(False)
-        btn_layout.addWidget(self.disable_ts_btn)
+        # Connection status (auto-managed - no manual buttons)
+        status_layout = QHBoxLayout()
+        status_layout.addWidget(QLabel("Auto-Connection:"))
+        status_layout.addWidget(QLabel("Enabled"))
+        status_layout.addStretch()
         
         self.sync_ts_btn = QPushButton("Sync Strategy")
         self.sync_ts_btn.clicked.connect(self.sync_with_ts_strategy)
         self.sync_ts_btn.setEnabled(False)
-        btn_layout.addWidget(self.sync_ts_btn)
+        status_layout.addWidget(self.sync_ts_btn)
         
-        controls_layout.addLayout(btn_layout)
+        controls_layout.addLayout(status_layout)
         
         self.ts_status_label = QLabel("Status: Disconnected")
         self.ts_status_label.setStyleSheet("color: #FF6B6B;")
@@ -6135,6 +6204,20 @@ class MainWindow(QMainWindow):
         self.app_state['active_option_req_ids'] = new_req_ids
         self.log_message(f"Subscribed to {len(strikes) * 2} option contracts", "SUCCESS")
         
+        # CASCADE LOADING: Auto-load TS chains after main chain completes (ONLY on auto-startup)
+        # Use main chain's center strike as ATM for TS chains - no complex ATM scanning needed
+        # This only triggers on the very first auto-load from connection, not manual refreshes
+        if (force_center_strike is None and 
+            not hasattr(self, '_main_chain_loaded') and 
+            hasattr(self, '_is_startup_auto_load')):
+            
+            self._main_chain_loaded = True  # Prevent repeated cascade
+            delattr(self, '_is_startup_auto_load')  # Clear startup flag
+            logger.info(f"🔗 Main chain loaded successfully. Cascading to auto-load TS chains using ATM=${center_strike}")
+            
+            # Schedule TS chain loading after small delay to allow main chain data to stabilize
+            QTimer.singleShot(1000, lambda: self.auto_load_ts_chains_from_main_atm(center_strike))
+        
         # Clear recentering flags now that chain is loaded
         self.is_recentering_chain = False
         
@@ -6143,6 +6226,46 @@ class MainWindow(QMainWindow):
         # we want to KEEP delta_calibration_done = True to prevent ES-based recenter from running.
         # The calibration flag is only reset when user manually changes expiry/settings (new chain request).
         # This prevents oscillation: Delta recenter → New chain loads → Flag reset → ES recenter → Loop
+    
+    def auto_load_ts_chains_from_main_atm(self, main_chain_atm_strike: float):
+        """
+        Auto-load both TS chains (0DTE and 1DTE) using the main chain's ATM strike.
+        This eliminates the need for complex two-phase ATM scanning.
+        
+        Args:
+            main_chain_atm_strike: The center strike from the main chain to use as ATM
+        """
+        try:
+            logger.info(f"🚀 CASCADE LOADING: Auto-loading TS chains using main chain ATM=${main_chain_atm_strike}")
+            self.log_message(f"Auto-loading TS chains using main chain ATM strike: ${main_chain_atm_strike}", "INFO")
+            
+            # Load 0DTE TS chain first
+            expiry_0dte = self.calculate_expiry_date(0)
+            if expiry_0dte:
+                logger.info(f"📊 Auto-loading TS 0DTE chain (expiry: {expiry_0dte})")
+                self.request_ts_chain("0DTE", force_center_strike=main_chain_atm_strike)
+                
+            # Small delay between chains to avoid API congestion
+            QTimer.singleShot(500, lambda: self._load_1dte_after_0dte(main_chain_atm_strike))
+            
+        except Exception as e:
+            logger.error(f"Error in cascade TS chain loading: {e}")
+            self.log_message(f"❌ Error auto-loading TS chains: {e}", "WARNING")
+    
+    def _load_1dte_after_0dte(self, main_chain_atm_strike: float):
+        """Load 1DTE TS chain after 0DTE completes"""
+        try:
+            expiry_1dte = self.calculate_expiry_date(1)
+            if expiry_1dte:
+                logger.info(f"📊 Auto-loading TS 1DTE chain (expiry: {expiry_1dte})")
+                self.request_ts_chain("1DTE", force_center_strike=main_chain_atm_strike)
+                self.log_message("✅ TS chain cascade loading complete", "SUCCESS")
+            else:
+                logger.warning("Could not calculate 1DTE expiry for TS chain cascade")
+                
+        except Exception as e:
+            logger.error(f"Error loading 1DTE TS chain in cascade: {e}")
+            self.log_message(f"❌ Error loading 1DTE TS chain: {e}", "WARNING")
         
         # Update recenter timestamp to give chain time to load and deltas to populate
         # before allowing initial calibration check (prevent immediate re-recenter)
@@ -6402,6 +6525,9 @@ class MainWindow(QMainWindow):
         Args:
             contract_type: "0DTE" or "1DTE"
         """
+        logger.info(f"===== request_atm_scan_for_ts_chain() CALLED FOR {contract_type} =====")
+        self.log_message(f"🔍 Entering ATM scan function for {contract_type}", "INFO")
+        
         try:
             logger.info(f"[TS {contract_type} ATM SCAN] === Phase 1: Scanning for true ATM ===")
             
@@ -6455,12 +6581,15 @@ class MainWindow(QMainWindow):
                 'scan_complete': False
             }
             
-            # Request ONLY deltas (generic tick 13 = model option computation)
+            # Request ONLY deltas for ATM scan - send all requests immediately like main chain
+            # NOTE: Cannot use snapshot=True with generic ticks (error 321)
             trading_class = "SPXW" if SELECTED_INSTRUMENT == "SPX" else "XSP"
             
-            req_count = 0
-            for strike in scan_strikes:
-                # Request call option for delta
+            scan_req_ids = []
+            # Use dedicated ID range for TS scans: 2000+ (avoid conflicts with main chain 100-999)
+            base_req_id = 2000 if contract_type == "0DTE" else 2100
+            
+            for i, strike in enumerate(scan_strikes):
                 call_contract = self.create_option_contract(
                     strike=strike,
                     right='C',
@@ -6469,10 +6598,8 @@ class MainWindow(QMainWindow):
                     expiry=expiry
                 )
                 
-                req_id = self.app_state['next_req_id']
-                # Request SNAPSHOT (not streaming) with generic tick 106 for option greeks
-                # snapshot=True means we get one update and then auto-cancel
-                self.ibkr_client.reqMktData(req_id, call_contract, "106", True, False, [])  # snapshot=True
+                req_id = base_req_id + i
+                self.ibkr_client.reqMktData(req_id, call_contract, "", False, False, [])
                 
                 # Map request to scan
                 self.app_state['market_data_map'][req_id] = {
@@ -6480,18 +6607,16 @@ class MainWindow(QMainWindow):
                     'strike': strike,
                     'contract_type': contract_type
                 }
-                self.app_state['next_req_id'] += 1
-                req_count += 1
-                
-                # Small delay every 5 requests to avoid overwhelming API
-                if req_count % 5 == 0:
-                    import time
-                    time.sleep(0.1)
+                scan_req_ids.append(req_id)
             
-            # Set timeout to complete scan and find ATM - increased to 5s for snapshot mode
-            QTimer.singleShot(5000, lambda: self.complete_atm_scan_and_build_chain(contract_type))
+            # Store request IDs
+            self.app_state[scan_state_key]['req_ids'] = scan_req_ids
             
-            logger.info(f"[TS {contract_type} ATM SCAN] Scan requests sent (SNAPSHOT mode), will analyze in 5 seconds")
+            # Set timeout to complete scan and find ATM (5 seconds for 1DTE, 3 for 0DTE)
+            timeout_ms = 5000 if contract_type == "1DTE" else 3000
+            QTimer.singleShot(timeout_ms, lambda: self.complete_atm_scan_and_build_chain(contract_type))
+            
+            logger.info(f"[TS {contract_type} ATM SCAN] Requested greeks for {len(scan_req_ids)} strikes, will analyze in {timeout_ms/1000:.0f} seconds")
             
         except Exception as e:
             logger.error(f"[TS {contract_type} ATM SCAN] Error: {e}", exc_info=True)
@@ -6513,9 +6638,23 @@ class MainWindow(QMainWindow):
             
             deltas = scan_state.get('deltas', {})
             
+            logger.info(f"[TS {contract_type} ATM SCAN] Scan complete - received {len(deltas)} deltas out of 21 strikes")
+            
             if not deltas:
                 logger.warning(f"[TS {contract_type} ATM SCAN] No deltas received, falling back to price-based center")
-                # Fall back to old method
+                # DON'T cancel - causes disconnect. Just clean up mapping.
+                scan_req_ids = scan_state.get('req_ids', [])
+                logger.info(f"[TS {contract_type} ATM SCAN] Cleaning up {len(scan_req_ids)} scan request mappings (fallback path)")
+                
+                for req_id in scan_req_ids:
+                    if req_id in self.app_state['market_data_map']:
+                        del self.app_state['market_data_map'][req_id]
+                
+                # Clear scan state
+                del self.app_state[scan_state_key]
+                
+                # Fall back to price-based chain
+                logger.info(f"[TS {contract_type} ATM SCAN] Falling back to price-based centering")
                 self.request_ts_chain(contract_type)
                 return
             
@@ -6539,24 +6678,26 @@ class MainWindow(QMainWindow):
             logger.info(f"[TS {contract_type} ATM SCAN] === Phase 2: Building chain centered on ATM ===")
             self.log_message(f"{contract_type} ATM found at {best_strike:.0f} - building chain...", "SUCCESS")
             
-            # Cancel scan subscriptions
-            for req_id, mapping in list(self.app_state['market_data_map'].items()):
-                if isinstance(mapping, dict) and mapping.get('scan_key') == scan_state_key:
-                    try:
-                        self.ibkr_client.cancelMktData(req_id)
-                        del self.app_state['market_data_map'][req_id]
-                    except:
-                        pass
+            # DON'T cancel scan subscriptions - causes Error 504 disconnect!
+            # Just clean up the mapping - the scan data will be ignored/overwritten
+            scan_req_ids = scan_state.get('req_ids', [])
+            logger.info(f"[TS {contract_type} ATM SCAN] Cleaning up {len(scan_req_ids)} scan request mappings (not canceling)")
+            
+            for req_id in scan_req_ids:
+                # Just remove from mapping, subscriptions stay active but ignored
+                if req_id in self.app_state['market_data_map']:
+                    del self.app_state['market_data_map'][req_id]
             
             # Clear scan state
             del self.app_state[scan_state_key]
             
-            # Now build the proper chain centered on true ATM
+            # Build the chain immediately - scan subscriptions are harmless background noise now
+            logger.info(f"[TS {contract_type} ATM SCAN] Building chain centered on ATM strike {best_strike}")
             self.request_ts_chain(contract_type, force_center_strike=best_strike)
             
         except Exception as e:
             logger.error(f"[TS {contract_type} ATM SCAN] Error completing scan: {e}", exc_info=True)
-
+    
     def calculate_initial_atm_strike(self, contract_type: str = "0DTE") -> float:
         """
         Calculate initial ATM strike for chain centering using best available method.
@@ -8719,6 +8860,9 @@ class MainWindow(QMainWindow):
             self.ts_strikes_below = self.ts_strikes_below_spin.value()
             self.ts_chain_drift_threshold = self.ts_chain_drift_spin.value()
             
+            # Sync GlobalDictionary settings
+            self.show_all_gd_communications = self.show_all_gd_checkbox.isChecked()
+            
             settings = {
                 # Connection settings
                 'host': self.host_edit.text(),
@@ -8735,6 +8879,9 @@ class MainWindow(QMainWindow):
                 'ts_strikes_above': self.ts_strikes_above,
                 'ts_strikes_below': self.ts_strikes_below,
                 'ts_chain_drift_threshold': self.ts_chain_drift_threshold,
+                
+                # TradeStation GlobalDictionary Settings
+                'show_all_gd_communications': self.show_all_gd_communications,
                 
                 # ES Offset Settings (persistent through restarts)
                 'es_to_cash_offset': self.es_to_cash_offset,
@@ -8772,24 +8919,49 @@ class MainWindow(QMainWindow):
     
     # ==================== TradeStation Integration Methods ====================
     
+    def attempt_ts_reconnection(self):
+        """Attempt to reconnect to TradeStation with retry logic"""
+        try:
+            if not hasattr(self, 'ts_reconnect_attempts'):
+                self.ts_reconnect_attempts = 0
+                
+            self.ts_reconnect_attempts += 1
+            max_attempts = 3
+            
+            if self.ts_reconnect_attempts <= max_attempts:
+                self.log_message(f"TradeStation reconnection attempt {self.ts_reconnect_attempts}/{max_attempts}", "INFO")
+                
+                success = self.enable_tradestation()
+                if success:
+                    self.ts_reconnect_attempts = 0  # Reset counter on success
+                    self.log_message("TradeStation auto-reconnection successful", "SUCCESS")
+                else:
+                    # Schedule next attempt with exponential backoff
+                    retry_delay = 10000 * (2 ** (self.ts_reconnect_attempts - 1))  # 10s, 20s, 40s
+                    self.log_message(f"Reconnection failed. Next attempt in {retry_delay//1000} seconds...", "WARNING")
+                    QTimer.singleShot(retry_delay, self.attempt_ts_reconnection)
+            else:
+                self.log_message("TradeStation auto-reconnection failed after maximum attempts", "ERROR")
+                self.ts_reconnect_attempts = 0  # Reset for future attempts
+        except Exception as e:
+            self.log_message(f"TradeStation reconnection error: {str(e)}", "ERROR")
+
     def enable_tradestation(self):
-        """Enable TradeStation integration"""
+        """Enable TradeStation integration (auto-called on startup)"""
         if not TRADESTATION_AVAILABLE:
             self.log_message("TradeStation not available - GlobalDictionary not found", "ERROR")
-            return
+            return False
         
         if self.ts_enabled:
             self.log_message("TradeStation already enabled", "WARNING")
-            return
+            return True
         
         try:
-            # Start TradeStation manager thread
-            self.ts_manager = TradeStationManager(self.ts_signals)
+            # Start TradeStation manager 
+            self.ts_manager = TradeStationManager(self.ts_signals, self)
             self.ts_manager.start()
             
             self.ts_enabled = True
-            self.enable_ts_btn.setEnabled(False)
-            self.disable_ts_btn.setEnabled(True)
             self.sync_ts_btn.setEnabled(True)
             
             self.log_message("TradeStation integration enabled", "SUCCESS")
@@ -8798,13 +8970,19 @@ class MainWindow(QMainWindow):
             # User can manually click refresh buttons to load chain data
             self.update_ts_active_contract()
             logger.info("[TS] TradeStation enabled - chains NOT auto-requested to avoid duplicate req IDs")
+            return True
+            
+        except Exception as e:
+            self.log_message(f"TradeStation enable error: {e}", "ERROR")
+            logger.error(f"TradeStation enable error: {e}", exc_info=True)
+            return False
             
         except Exception as e:
             self.log_message(f"Error enabling TradeStation: {e}", "ERROR")
             logger.error(f"Error enabling TradeStation: {e}", exc_info=True)
     
     def disable_tradestation(self):
-        """Disable TradeStation integration"""
+        """Disable TradeStation integration (for cleanup only)"""
         if not self.ts_enabled:
             return
         
@@ -8815,8 +8993,6 @@ class MainWindow(QMainWindow):
                 self.ts_manager = None
             
             self.ts_enabled = False
-            self.enable_ts_btn.setEnabled(True)
-            self.disable_ts_btn.setEnabled(False)
             self.sync_ts_btn.setEnabled(False)
             
             self.log_message("TradeStation integration disabled", "INFO")
@@ -8827,7 +9003,7 @@ class MainWindow(QMainWindow):
     
     @pyqtSlot(bool)
     def on_ts_connected(self, connected: bool):
-        """Handle TradeStation connection status"""
+        """Handle TradeStation connection status with auto-reconnection"""
         if connected:
             self.ts_status_label.setText("Status: Connected")
             self.ts_status_label.setStyleSheet("color: #4CAF50;")
@@ -8836,6 +9012,11 @@ class MainWindow(QMainWindow):
             self.ts_status_label.setText("Status: Disconnected")
             self.ts_status_label.setStyleSheet("color: #FF6B6B;")
             self.log_message("TradeStation GlobalDictionary disconnected", "WARNING")
+            
+            # Auto-reconnection logic
+            if TRADESTATION_AVAILABLE:
+                self.log_message("Attempting auto-reconnection in 5 seconds...", "INFO")
+                QTimer.singleShot(5000, self.attempt_ts_reconnection)
     
     @pyqtSlot(str)
     def on_ts_message(self, message: str):
@@ -8975,20 +9156,207 @@ class MainWindow(QMainWindow):
             logger.error(f"Error syncing with TradeStation: {e}", exc_info=True)
     
     def refresh_ts_chains(self):
-        """Refresh both 0DTE and 1DTE option chains for TradeStation tab using ATM scan"""
+        """Simplified refresh: Find ATM once for 0DTE, then use same price for both chains"""
+        logger.info("===== REFRESH OPTION CHAINS BUTTON CLICKED =====")
+        self.log_message("🔄 Refresh Option Chains button clicked", "INFO")
+        
         if self.connection_state != ConnectionState.CONNECTED:
             self.log_message("Cannot refresh chains - not connected to IBKR", "WARNING")
+            logger.warning("Refresh chains blocked - not connected")
             return
         
         try:
-            # Use new two-phase approach: scan for ATM, then build chains
-            self.log_message("Scanning for true ATM strikes...", "INFO")
-            self.request_atm_scan_for_ts_chain("0DTE")
-            # Delay 1DTE scan slightly to avoid overwhelming API
-            QTimer.singleShot(500, lambda: self.request_atm_scan_for_ts_chain("1DTE"))
+            # Simplified approach: Find ATM once, use for both chains
+            logger.info("Starting simplified chain loading: Find ATM once, then load both chains")
+            self.log_message("Finding ATM strike for both chains...", "INFO")
+            
+            # Find ATM strike using 0DTE (this will also set the center for 1DTE)
+            self.find_atm_strike_for_both_chains()
         except Exception as e:
             self.log_message(f"Error refreshing TS chains: {e}", "ERROR")
             logger.error(f"Error refreshing TS chains: {e}", exc_info=True)
+    
+    def find_atm_strike_for_both_chains(self):
+        """Simplified ATM finding: scan 0DTE options to find true ATM, then use that price for both chains"""
+        try:
+            logger.info("===== SIMPLIFIED ATM SCAN FOR BOTH CHAINS =====")
+            
+            # Get 0DTE expiry
+            expiry_0dte = self.calculate_expiry_date(0)
+            self.ts_0dte_expiry = expiry_0dte
+            
+            # Get 1DTE expiry  
+            expiry_1dte = self.calculate_expiry_date(1)
+            if expiry_1dte == expiry_0dte:
+                expiry_1dte = self.calculate_expiry_date(2)
+            self.ts_1dte_expiry = expiry_1dte
+            
+            logger.info(f"0DTE expiry: {expiry_0dte}, 1DTE expiry: {expiry_1dte}")
+            
+            # Get reference price
+            strike_interval = self.instrument['strike_increment']
+            if (underlying_price := self.app_state.get('underlying_price', 0)) > 0:
+                reference_price = underlying_price
+                logger.info(f"Using spot price: ${reference_price:.2f}")
+            else:
+                reference_price = self.get_adjusted_es_price()
+                if reference_price == 0:
+                    logger.warning("No price data available for ATM scan")
+                    return
+                logger.info(f"Using ES-adjusted price: ${reference_price:.2f}")
+            
+            # Quick ATM scan: check 5 strikes around reference price for 0DTE deltas
+            center_estimate = round(reference_price / strike_interval) * strike_interval
+            scan_strikes = []
+            for i in range(-2, 3):  # Only 5 strikes: -2, -1, 0, +1, +2
+                scan_strikes.append(center_estimate + (i * strike_interval))
+            
+            logger.info(f"Quick ATM scan: checking {len(scan_strikes)} strikes around ${center_estimate}")
+            
+            # Clear previous scan results
+            self.atm_scan_deltas = {}
+            self.atm_scan_pending = set()
+            
+            # Request delta data for the 5 strikes (0DTE only)
+            base_req_id = 5000  # Dedicated range for simplified scan
+            for i, strike in enumerate(scan_strikes):
+                contract = self.create_option_contract(
+                    symbol=self.instrument['options_symbol'],
+                    expiry=expiry_0dte,
+                    strike=strike,
+                    right="C",  # Use calls for ATM detection
+                    trading_class=self.instrument['options_trading_class']
+                )
+                
+                req_id = base_req_id + i
+                contract_key = f"{self.instrument['options_symbol']}_{strike}_C_{expiry_0dte}"
+                
+                self.atm_scan_pending.add(req_id)
+                self.app_state['market_data_map'][req_id] = f"ATM_SCAN_{contract_key}"
+                
+                # Request greeks (delta) only
+                self.ibkr_client.reqMktData(req_id, contract, "", False, False, [])
+                logger.info(f"Scanning strike ${strike} for delta (reqId={req_id})")
+            
+            # Set timer to complete the scan and build both chains
+            QTimer.singleShot(3000, self.complete_simplified_atm_scan)  # 3 second timeout
+            
+        except Exception as e:
+            logger.error(f"Error in simplified ATM scan: {e}", exc_info=True)
+            self.log_message(f"ATM scan failed: {e}", "ERROR")
+    
+    def complete_simplified_atm_scan(self):
+        """Complete the simplified ATM scan and load both chains with the found ATM"""
+        try:
+            logger.info("===== COMPLETING SIMPLIFIED ATM SCAN =====")
+            
+            if not self.atm_scan_deltas:
+                logger.warning("No delta data collected during ATM scan")
+                self.log_message("ATM scan failed - no delta data", "WARNING")
+                return
+            
+            # Find strike with delta closest to 0.5
+            best_strike = None
+            best_delta_diff = float('inf')
+            
+            for contract_key, delta in self.atm_scan_deltas.items():
+                if delta and abs(delta - 0.5) < best_delta_diff:
+                    best_delta_diff = abs(delta - 0.5)
+                    # Extract strike from contract_key format: SYMBOL_STRIKE_RIGHT_EXPIRY
+                    best_strike = float(contract_key.split('_')[1])
+            
+            if best_strike is None:
+                logger.warning("Could not determine ATM strike from delta scan")
+                self.log_message("ATM detection failed", "WARNING")
+                return
+            
+            logger.info(f"ATM FOUND: ${best_strike} (delta difference: {best_delta_diff:.3f})")
+            self.log_message(f"ATM found at ${best_strike}", "SUCCESS")
+            
+            # Clean up scan data
+            self.atm_scan_deltas.clear()
+            self.atm_scan_pending.clear()
+            
+            # Now load both chains using this ATM strike as center
+            self.load_both_ts_chains_with_center_strike(best_strike)
+            
+        except Exception as e:
+            logger.error(f"Error completing ATM scan: {e}", exc_info=True)
+            self.log_message(f"ATM scan completion failed: {e}", "ERROR")
+    
+    def load_both_ts_chains_with_center_strike(self, center_strike: float):
+        """Load both 0DTE and 1DTE chains using the specified center strike"""
+        try:
+            logger.info(f"===== LOADING BOTH CHAINS WITH CENTER STRIKE ${center_strike} =====")
+            
+            # Load 0DTE chain first
+            if self.ts_0dte_expiry:
+                self.log_message(f"Loading 0DTE chain centered at ${center_strike}...", "INFO")
+                self.load_single_ts_chain("0DTE", self.ts_0dte_expiry, center_strike)
+            else:
+                self.log_message("Cannot load 0DTE chain - expiry not set", "ERROR")
+            
+            # Load 1DTE chain after a brief delay
+            if self.ts_1dte_expiry:
+                dte1_expiry = self.ts_1dte_expiry  # Capture value to avoid type issues in lambda
+                QTimer.singleShot(1000, lambda: self.load_single_ts_chain_delayed("1DTE", dte1_expiry, center_strike))
+            else:
+                self.log_message("Cannot load 1DTE chain - expiry not set", "ERROR")
+            
+        except Exception as e:
+            logger.error(f"Error loading chains with center strike: {e}", exc_info=True)
+            self.log_message(f"Chain loading failed: {e}", "ERROR")
+    
+    def load_single_ts_chain_delayed(self, contract_type: str, expiry: str, center_strike: float):
+        """Load a single TS chain with delay (for sequential loading)"""
+        self.log_message(f"Loading {contract_type} chain centered at ${center_strike}...", "INFO")
+        self.load_single_ts_chain(contract_type, expiry, center_strike)
+    
+    def load_single_ts_chain(self, contract_type: str, expiry: str, center_strike: float):
+        """Load a single TS chain (0DTE or 1DTE) with the specified center strike"""
+        try:
+            logger.info(f"Loading {contract_type} chain: expiry={expiry}, center=${center_strike}")
+            
+            # Build strike list around center
+            strike_interval = self.instrument['strike_increment']
+            strikes_above = self.ts_strikes_above
+            strikes_below = self.ts_strikes_below
+            
+            strikes = []
+            for i in range(-strikes_below, strikes_above + 1):
+                strikes.append(center_strike + (i * strike_interval))
+            
+            # Choose request ID range
+            base_req_id = 6000 if contract_type == "0DTE" else 7000
+            
+            # Clear existing data for this chain type
+            chain_table = self.ts_0dte_table if contract_type == "0DTE" else self.ts_1dte_table
+            chain_table.setRowCount(0)
+            
+            # Request market data for all strikes (calls and puts)
+            req_id = base_req_id
+            for strike in strikes:
+                for right in ["C", "P"]:
+                    contract = self.create_option_contract(
+                        symbol=self.instrument['options_symbol'],
+                        expiry=expiry,
+                        strike=strike,
+                        right=right,
+                        trading_class=self.instrument['options_trading_class']
+                    )
+                    
+                    contract_key = f"{self.instrument['options_symbol']}_{strike}_{right}_{expiry}"
+                    self.app_state['market_data_map'][req_id] = contract_key
+                    
+                    # Request market data (bid/ask/last, no greeks needed for display)
+                    self.ibkr_client.reqMktData(req_id, contract, "", False, False, [])
+                    req_id += 1
+            
+            logger.info(f"{contract_type} chain loading started with {len(strikes)} strikes")
+            
+        except Exception as e:
+            logger.error(f"Error loading {contract_type} chain: {e}", exc_info=True)
+            self.log_message(f"{contract_type} chain loading failed: {e}", "ERROR")
     
     def get_ts_active_contract_type(self) -> str:
         """Determine which contract type (0DTE or 1DTE) to use based on current time"""
@@ -9103,40 +9471,47 @@ class MainWindow(QMainWindow):
             # Determine trading class
             trading_class = "SPXW" if SELECTED_INSTRUMENT == "SPX" else "XSP"
             
-            # Request market data for each strike
+            # Request market data for each strike - use dedicated ID ranges like main chain
+            # 0DTE TS: 3000-3099, 1DTE TS: 4000-4099 (avoid conflicts)
+            base_req_id = 3000 if contract_type == "0DTE" else 4000
+            req_id = base_req_id
+            
             for strike in strikes:
                 # Request call
                 call_contract = self.create_option_contract(
-                    strike=strike,
-                    right='C',
-                    symbol=SELECTED_INSTRUMENT,
-                    trading_class=trading_class,
-                    expiry=expiry
+                    strike=strike, right='C', symbol=SELECTED_INSTRUMENT,
+                    trading_class=trading_class, expiry=expiry
                 )
                 call_key = f"{SELECTED_INSTRUMENT}_{strike}_C_{expiry}"
-                req_id = self.app_state['next_req_id']
                 self.ibkr_client.reqMktData(req_id, call_contract, "", False, False, [])
                 self.app_state['market_data_map'][req_id] = call_key
-                self.app_state['next_req_id'] += 1
+                req_id += 1
                 
                 # Request put
                 put_contract = self.create_option_contract(
-                    strike=strike,
-                    right='P',
-                    symbol=SELECTED_INSTRUMENT,
-                    trading_class=trading_class,
-                    expiry=expiry
+                    strike=strike, right='P', symbol=SELECTED_INSTRUMENT,
+                    trading_class=trading_class, expiry=expiry
                 )
                 put_key = f"{SELECTED_INSTRUMENT}_{strike}_P_{expiry}"
-                req_id = self.app_state['next_req_id']
                 self.ibkr_client.reqMktData(req_id, put_contract, "", False, False, [])
                 self.app_state['market_data_map'][req_id] = put_key
-                self.app_state['next_req_id'] += 1
+                req_id += 1
             
             logger.info(f"[TS {contract_type}] Chain request complete: {len(strikes)} strikes requested")
             
             # Initialize the table with empty rows for these strikes
             self.initialize_ts_chain_table(contract_type, strikes)
+            
+            # Schedule ATM highlighting update after data has time to arrive
+            QTimer.singleShot(2000, lambda: self.update_ts_strike_backgrounds_by_delta(contract_type))
+            logger.debug(f"[TS {contract_type}] Scheduled ATM highlighting update in 2 seconds")
+            
+            # If this was 0DTE and we need to load 1DTE next, trigger it after short delay
+            if contract_type == "0DTE" and self.app_state.get('load_1dte_after_0dte', False):
+                logger.info("[TS CHAIN] 0DTE complete - triggering 1DTE load in 1 second")
+                self.log_message("Loading 1DTE chain...", "INFO")
+                self.app_state['load_1dte_after_0dte'] = False  # Clear flag
+                QTimer.singleShot(1000, lambda: self.request_atm_scan_for_ts_chain("1DTE"))
             
         except Exception as e:
             logger.error(f"[TS CHAIN] Error requesting {contract_type} chain: {e}", exc_info=True)
@@ -9723,6 +10098,10 @@ class MainWindow(QMainWindow):
     
     def update_ts_positions_display(self):
         """Update TS positions table with real-time P&L and time tracking"""
+        # Safety check: table might not be created yet
+        if not hasattr(self, 'ts_positions_table'):
+            return
+            
         self.ts_positions_table.setRowCount(0)
         total_pnl = 0
         total_cost_basis = 0
@@ -9875,8 +10254,8 @@ class MainWindow(QMainWindow):
                 self.host = settings.get('host', '127.0.0.1')
                 self.port = settings.get('port', 7497)
                 self.client_id = settings.get('client_id', 1)
-                self.strikes_above = settings.get('strikes_above', 20)
-                self.strikes_below = settings.get('strikes_below', 20)
+                self.strikes_above = settings.get('strikes_above', 10)  # Reduced default for efficient auto-load
+                self.strikes_below = settings.get('strikes_below', 10)  # Reduced default for efficient auto-load
                 self.chain_refresh_interval = settings.get('chain_refresh_interval', 3600)
                 self.chain_drift_threshold = settings.get('chain_drift_threshold', 5)
                 
@@ -9884,6 +10263,9 @@ class MainWindow(QMainWindow):
                 self.ts_strikes_above = settings.get('ts_strikes_above', 6)
                 self.ts_strikes_below = settings.get('ts_strikes_below', 6)
                 self.ts_chain_drift_threshold = settings.get('ts_chain_drift_threshold', 3)
+                
+                # GlobalDictionary Settings
+                self.show_all_gd_communications = settings.get('show_all_gd_communications', False)
                 
                 # ES Offset Settings (restore persistent offset from day session)
                 self.es_to_cash_offset = settings.get('es_to_cash_offset', 0.0)
@@ -9936,6 +10318,9 @@ class MainWindow(QMainWindow):
                 self.ts_strikes_above_spin.setValue(self.ts_strikes_above)
                 self.ts_strikes_below_spin.setValue(self.ts_strikes_below)
                 self.ts_chain_drift_spin.setValue(self.ts_chain_drift_threshold)
+                
+                # Update GlobalDictionary settings
+                self.show_all_gd_checkbox.setChecked(self.show_all_gd_communications)
                 
                 # Update Master Settings UI
                 self.vix_threshold_spin.setValue(self.vix_threshold)
