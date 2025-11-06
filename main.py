@@ -6439,10 +6439,10 @@ class MainWindow(QMainWindow):
         
         # Prefer call-based ATM
         if atm_call_strike > 0:
-            logger.info(f"[TS {contract_type}] ATM strike by CALL delta: {atm_call_strike:.0f} (delta: {0.5-min_call_diff:.3f})")
+            logger.debug(f"[TS {contract_type}] ATM strike by CALL delta: {atm_call_strike:.0f} (delta: {0.5-min_call_diff:.3f})")
             return atm_call_strike
         elif atm_put_strike > 0:
-            logger.info(f"[TS {contract_type}] ATM strike by PUT delta: {atm_put_strike:.0f} (delta: {0.5-min_put_diff:.3f})")
+            logger.debug(f"[TS {contract_type}] ATM strike by PUT delta: {atm_put_strike:.0f} (delta: {0.5-min_put_diff:.3f})")
             return atm_put_strike
         else:
             return 0
@@ -6461,7 +6461,7 @@ class MainWindow(QMainWindow):
         if atm_strike == 0:
             return  # No ATM found yet
         
-        logger.info(f"[TS {contract_type}] 🎨 Coloring strikes around ATM: {atm_strike:.0f}")
+        logger.debug(f"[TS {contract_type}] 🎨 Coloring strikes around ATM: {atm_strike:.0f}")
         
         # Select appropriate table and label
         if contract_type == "0DTE":
