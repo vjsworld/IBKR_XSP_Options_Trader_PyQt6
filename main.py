@@ -774,10 +774,10 @@ class TradeStationManager(QObject):
             
         try:
             # Initialize COM in main thread (like Demo.py)
-            pythoncom.CoInitialize()
+            pythoncom.CoInitialize()  # type: ignore[possibly-unbound]
             
             # Create GlobalDictionary with callbacks (exactly like working Demo.py)
-            self.gd = GlobalDictionary.create(
+            self.gd = GlobalDictionary.create(  # type: ignore[possibly-unbound]
                 name=self.dict_name,
                 add=self.on_signal_add,
                 remove=self.on_signal_remove,
@@ -817,7 +817,7 @@ class TradeStationManager(QObject):
         """Pump COM messages (called by QTimer) - exactly like Demo.py's loop"""
         try:
             if self.running:
-                pythoncom.PumpWaitingMessages()
+                pythoncom.PumpWaitingMessages()  # type: ignore[possibly-unbound]
         except Exception as e:
             logger.error(f"Error pumping messages: {e}")
             self.stop()
@@ -836,11 +836,11 @@ class TradeStationManager(QObject):
             return
             
         try:
-            # LOG ALL INCOMING DATA FROM TRADESTATION
+            # LOG ALL INCOMING DATA FROM TRADESTATION (to file only, not Activity Log)
             value_str = str(value)[:200] if value else "None"
             logger.info(f"[TS→PYTHON] NEW KEY: '{key}' = {value_str} (dict size: {size})")
             self.signals.ts_message.emit(f"TS ADD: {key} = {value_str}")
-            # NEW: Also send to Activity Log
+            # Show ADD events in Activity Log
             self.signals.ts_activity.emit(f"[ADD] {key} = {value_str}")
             
             if key.startswith("ENTRY_"):
@@ -878,6 +878,7 @@ class TradeStationManager(QObject):
             elif key == "TS_STRATEGY_STATE":
                 self.signals.strategy_state_changed.emit(str(value))
                 logger.info(f"[TS→PYTHON] Strategy state changed to: {value}")
+                self.signals.ts_activity.emit(f"[STATE] Strategy: {value}")  # Keep this one
                 
         except Exception as e:
             logger.error(f"Error processing signal add: {e}", exc_info=True)
@@ -896,16 +897,17 @@ class TradeStationManager(QObject):
             return
             
         try:
-            # LOG ALL CHANGES FROM TRADESTATION
+            # LOG ALL CHANGES FROM TRADESTATION (to file only, not Activity Log)
             value_str = str(value)[:200] if value else "None"
             logger.info(f"[TS→PYTHON] CHANGED KEY: '{key}' = {value_str} (dict size: {size})")
             self.signals.ts_message.emit(f"TS CHANGE: {key} = {value_str}")
-            # NEW: Also send to Activity Log
-            self.signals.ts_activity.emit(f"[CHANGE] {key} = {value_str}")
+            # Activity Log: Only log important events (muted routine GD messages)
+            # self.signals.ts_activity.emit(f"[CHANGE] {key} = {value_str}")
             
             if key == "TS_STRATEGY_STATE":
                 self.signals.strategy_state_changed.emit(str(value))
                 logger.info(f"[TS→PYTHON] Strategy state updated to: {value}")
+                self.signals.ts_activity.emit(f"[STATE] Strategy: {value}")  # Keep this one
         except Exception as e:
             logger.error(f"Error processing signal change: {e}", exc_info=True)
     
@@ -925,7 +927,7 @@ class TradeStationManager(QObject):
             # LOG ALL REMOVALS FROM TRADESTATION
             logger.info(f"[TS→PYTHON] REMOVED KEY: '{key}' (dict size: {size})")
             self.signals.ts_message.emit(f"TS REMOVE: {key}")
-            # Show the key that was removed in Activity Log
+            # Show REMOVE events in Activity Log
             self.signals.ts_activity.emit(f"[REMOVE] Key: {key}")
         except Exception as e:
             logger.error(f"Error processing signal remove: {e}", exc_info=True)
@@ -944,6 +946,7 @@ class TradeStationManager(QObject):
             # LOG CLEAR EVENT FROM TRADESTATION
             logger.info(f"[TS→PYTHON] DICTIONARY CLEARED")
             self.signals.ts_message.emit(f"TS CLEAR: Dictionary cleared")
+            # Show CLEAR events in Activity Log
             self.signals.ts_activity.emit(f"[CLEAR] GlobalDictionary cleared")
         except Exception as e:
             logger.error(f"Error processing clear event: {e}", exc_info=True)
@@ -2344,6 +2347,13 @@ class MainWindow(QMainWindow):
         self.last_recenter_time = 0  # Timestamp of last recenter to throttle rapid recenters
         self.delta_calibration_done = False  # Track if we've done initial delta-based recenter after chain load
         
+        # TradeStation chain parameters (separate from main chain)
+        self.ts_strikes_above = 6  # Fewer strikes for TS chains (default: 6)
+        self.ts_strikes_below = 6
+        self.ts_0dte_center_strike = 0  # Track center strike for drift detection
+        self.ts_1dte_center_strike = 0
+        self.ts_chain_drift_threshold = 3  # Drift threshold for TS chains (default: 3)
+        
         # Auto-refresh timer for 4:00 PM ET expiration switch
         self.market_close_timer = QTimer()
         self.market_close_timer.timeout.connect(self.check_market_close_refresh)
@@ -2453,6 +2463,7 @@ class MainWindow(QMainWindow):
         # Start position auto-update timer (1-second updates for time tracking and P&L)
         self.position_update_timer = QTimer()
         self.position_update_timer.timeout.connect(self.update_positions_display)
+        self.position_update_timer.timeout.connect(self.update_ts_positions_display)
         self.position_update_timer.start(1000)  # Update every 1000ms (1 second)
         
         # Start position auto-save timer (save every 60 seconds)
@@ -4296,6 +4307,30 @@ class MainWindow(QMainWindow):
         
         layout.addWidget(chain_group)
         
+        # TradeStation Chain Settings
+        ts_chain_group = QGroupBox("TradeStation Chain Settings")
+        ts_chain_layout = QFormLayout(ts_chain_group)
+        
+        self.ts_strikes_above_spin = QSpinBox()
+        self.ts_strikes_above_spin.setRange(3, 20)
+        self.ts_strikes_above_spin.setValue(self.ts_strikes_above)
+        self.ts_strikes_above_spin.setToolTip("Number of strikes above ATM for TS chains")
+        ts_chain_layout.addRow("TS Strikes Above ATM:", self.ts_strikes_above_spin)
+        
+        self.ts_strikes_below_spin = QSpinBox()
+        self.ts_strikes_below_spin.setRange(3, 20)
+        self.ts_strikes_below_spin.setValue(self.ts_strikes_below)
+        self.ts_strikes_below_spin.setToolTip("Number of strikes below ATM for TS chains")
+        ts_chain_layout.addRow("TS Strikes Below ATM:", self.ts_strikes_below_spin)
+        
+        self.ts_chain_drift_spin = QSpinBox()
+        self.ts_chain_drift_spin.setRange(1, 10)
+        self.ts_chain_drift_spin.setValue(self.ts_chain_drift_threshold)
+        self.ts_chain_drift_spin.setToolTip("How many strikes ATM can drift in TS chains before auto-recentering")
+        ts_chain_layout.addRow("TS Drift Threshold (strikes):", self.ts_chain_drift_spin)
+        
+        layout.addWidget(ts_chain_group)
+        
         # Save button
         save_btn = QPushButton("Save Settings")
         save_btn.clicked.connect(self.save_settings)
@@ -4945,6 +4980,9 @@ class MainWindow(QMainWindow):
         
         # Update option chain display immediately
         self.update_option_chain_cell(contract_key)
+        
+        # Also update TS chain tables if this contract belongs to a TS expiry
+        self.update_ts_chain_cell(contract_key)
     
     @pyqtSlot(str, dict)
     def on_greeks_updated(self, contract_key: str, greeks: dict):
@@ -4959,6 +4997,9 @@ class MainWindow(QMainWindow):
         
         # Update option chain display
         self.update_option_chain_cell(contract_key)
+        
+        # Also update TS chain tables if this contract belongs to a TS expiry
+        self.update_ts_chain_cell(contract_key)
         
         # Update strike backgrounds based on delta-identified ATM
         # Throttle this to run at most once per second to avoid excessive recentering checks
@@ -5068,6 +5109,7 @@ class MainWindow(QMainWindow):
             
             # Update orders table
             self.update_orders_display()
+            self.update_ts_orders_display()
         else:
             self.log_message(f"Received status for unknown order #{order_id}: {status_data.get('status')}", "INFO")
     
@@ -5078,6 +5120,7 @@ class MainWindow(QMainWindow):
             logger.info(f"Force-removing order #{order_id} from chasing_orders (order filled/cancelled)")
             del self.chasing_orders[order_id]
             self.update_orders_display()
+            self.update_ts_orders_display()
     
     @pyqtSlot(str)
     def on_position_closed(self, contract_key: str):
@@ -5672,6 +5715,14 @@ class MainWindow(QMainWindow):
         top_row.addWidget(controls_group)
         main_layout.addLayout(top_row)
         
+        # Refresh Chains Button
+        refresh_layout = QHBoxLayout()
+        self.refresh_ts_chains_btn = QPushButton("Refresh Option Chains")
+        self.refresh_ts_chains_btn.clicked.connect(self.refresh_ts_chains)
+        self.refresh_ts_chains_btn.setStyleSheet("font-weight: bold; padding: 8px;")
+        refresh_layout.addWidget(self.refresh_ts_chains_btn)
+        main_layout.addLayout(refresh_layout)
+        
         # Option Chains Section (side by side)
         chains_layout = QHBoxLayout()
         
@@ -5685,10 +5736,13 @@ class MainWindow(QMainWindow):
         self.ts_0dte_table = QTableWidget()
         self.ts_0dte_table.setColumnCount(9)
         self.ts_0dte_table.setHorizontalHeaderLabels([
-            "Call Δ", "Call Γ", "Call Bid", "Call Ask", "Strike", 
-            "Put Bid", "Put Ask", "Put Γ", "Put Δ"
+            "Call Delta", "Call Gamma", "Call Bid", "Call Ask", "Strike", 
+            "Put Bid", "Put Ask", "Put Gamma", "Put Delta"
         ])
-        self.ts_0dte_table.horizontalHeader().setStretchLastSection(True)
+        self.ts_0dte_table.verticalHeader().setVisible(False)  # type: ignore[union-attr]
+        header_0dte = self.ts_0dte_table.horizontalHeader()
+        if header_0dte:
+            header_0dte.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)  # Equal width columns
         self.ts_0dte_table.setAlternatingRowColors(True)
         self.ts_0dte_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         dte0_layout.addWidget(self.ts_0dte_table)
@@ -5705,16 +5759,72 @@ class MainWindow(QMainWindow):
         self.ts_1dte_table = QTableWidget()
         self.ts_1dte_table.setColumnCount(9)
         self.ts_1dte_table.setHorizontalHeaderLabels([
-            "Call Δ", "Call Γ", "Call Bid", "Call Ask", "Strike", 
-            "Put Bid", "Put Ask", "Put Γ", "Put Δ"
+            "Call Delta", "Call Gamma", "Call Bid", "Call Ask", "Strike", 
+            "Put Bid", "Put Ask", "Put Gamma", "Put Delta"
         ])
-        self.ts_1dte_table.horizontalHeader().setStretchLastSection(True)
+        self.ts_1dte_table.verticalHeader().setVisible(False)  # type: ignore[union-attr]
+        header_1dte = self.ts_1dte_table.horizontalHeader()
+        if header_1dte:
+            header_1dte.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)  # Equal width columns
         self.ts_1dte_table.setAlternatingRowColors(True)
         self.ts_1dte_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         dte1_layout.addWidget(self.ts_1dte_table)
         
         chains_layout.addWidget(dte1_group)
         main_layout.addLayout(chains_layout)
+        
+        # Middle section: Positions and Orders (side by side)
+        pos_order_layout = QHBoxLayout()
+        
+        # TS Positions Table (left side)
+        ts_positions_group = QGroupBox("Open Positions")
+        ts_pos_layout = QVBoxLayout(ts_positions_group)
+        
+        self.ts_positions_table = QTableWidget()
+        self.ts_positions_table.setColumnCount(11)
+        self.ts_positions_table.setHorizontalHeaderLabels([
+            "Contract", "Qty", "Entry", "Current", "P&L", "P&L %", "$ Cost Basis", "$ Mkt Value", "EntryTime", "TimeSpan", "Action"
+        ])
+        self.ts_positions_table.verticalHeader().setVisible(False)  # type: ignore[union-attr]
+        self.ts_positions_table.setMaximumHeight(339)
+        self.ts_positions_table.cellClicked.connect(self.on_ts_position_cell_clicked)
+        self.ts_positions_table.setColumnWidth(0, 170)  # Contract column
+        self.ts_positions_table.setStyleSheet("""
+            QTableWidget::item { 
+                height: 18px; 
+            }
+            QHeaderView::section { 
+                height: 18px; 
+            }
+        """)
+        ts_pos_layout.addWidget(self.ts_positions_table)
+        
+        # TS Orders Table (right side)
+        ts_orders_group = QGroupBox("Active Orders")
+        ts_orders_layout = QVBoxLayout(ts_orders_group)
+        
+        self.ts_orders_table = QTableWidget()
+        self.ts_orders_table.setColumnCount(7)
+        self.ts_orders_table.setHorizontalHeaderLabels([
+            "Order ID", "Contract", "Action", "Qty", "Price", "Status", "Action"
+        ])
+        self.ts_orders_table.verticalHeader().setVisible(False)  # type: ignore[union-attr]
+        self.ts_orders_table.setMaximumHeight(339)
+        self.ts_orders_table.cellClicked.connect(self.on_ts_order_cell_clicked)
+        self.ts_orders_table.setColumnWidth(1, 170)  # Contract column
+        self.ts_orders_table.setStyleSheet("""
+            QTableWidget::item { 
+                height: 18px; 
+            }
+            QHeaderView::section { 
+                height: 18px; 
+            }
+        """)
+        ts_orders_layout.addWidget(self.ts_orders_table)
+        
+        pos_order_layout.addWidget(ts_positions_group)
+        pos_order_layout.addWidget(ts_orders_group)
+        main_layout.addLayout(pos_order_layout)
         
         # Bottom section: Signal History + Activity Log (side by side)
         bottom_layout = QHBoxLayout()
@@ -5728,7 +5838,12 @@ class MainWindow(QMainWindow):
         self.ts_signal_table.setHorizontalHeaderLabels([
             "Time", "Signal Type", "Action", "Contract", "Status", "Fill Price"
         ])
-        self.ts_signal_table.horizontalHeader().setStretchLastSection(True)
+        v_header_signal = self.ts_signal_table.verticalHeader()
+        if v_header_signal:
+            v_header_signal.setVisible(False)  # Hide row numbers
+        header_signal = self.ts_signal_table.horizontalHeader()
+        if header_signal:
+            header_signal.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)  # Equal width columns
         self.ts_signal_table.setAlternatingRowColors(True)
         self.ts_signal_table.setRowCount(0)
         history_layout.addWidget(self.ts_signal_table)
@@ -6501,6 +6616,7 @@ class MainWindow(QMainWindow):
             
             # STEP 8: Update UI
             self.update_orders_display()
+            self.update_ts_orders_display()
             
             # STEP 9: Start mid-price chasing if enabled
             if enable_chasing:
@@ -6828,6 +6944,7 @@ class MainWindow(QMainWindow):
                         
                         # Update orders display
                         self.update_orders_display()
+                        self.update_ts_orders_display()
                         
                         logger.info(f"✓ Order #{order_id} updated to ${new_price:.2f} (X_ticks={give_in_ticks})")
                         self.log_message(
@@ -8111,6 +8228,11 @@ class MainWindow(QMainWindow):
             self.chain_refresh_interval = self.chain_refresh_settings_spin.value()
             self.chain_drift_threshold = self.chain_drift_settings_spin.value()
             
+            # Sync TradeStation chain settings
+            self.ts_strikes_above = self.ts_strikes_above_spin.value()
+            self.ts_strikes_below = self.ts_strikes_below_spin.value()
+            self.ts_chain_drift_threshold = self.ts_chain_drift_spin.value()
+            
             settings = {
                 # Connection settings
                 'host': self.host_edit.text(),
@@ -8122,6 +8244,11 @@ class MainWindow(QMainWindow):
                 'strikes_below': self.strikes_below,
                 'chain_refresh_interval': self.chain_refresh_interval,
                 'chain_drift_threshold': self.chain_drift_threshold,
+                
+                # TradeStation Chain Settings
+                'ts_strikes_above': self.ts_strikes_above,
+                'ts_strikes_below': self.ts_strikes_below,
+                'ts_chain_drift_threshold': self.ts_chain_drift_threshold,
                 
                 # ES Offset Settings (persistent through restarts)
                 'es_to_cash_offset': self.es_to_cash_offset,
@@ -8304,7 +8431,10 @@ class MainWindow(QMainWindow):
                 self.execute_ts_close_puts(symbol, signal_id)
             elif action == "CLOSE_POSITION":
                 contract_key = signal_data.get('contract_key')
-                self.execute_ts_close_position(contract_key, signal_id)
+                if contract_key:
+                    self.execute_ts_close_position(contract_key, signal_id)
+                else:
+                    self.log_message("No contract_key provided for CLOSE_POSITION", "ERROR")
             else:
                 self.log_message(f"Unknown exit action: {action}", "ERROR")
                 
@@ -8358,6 +8488,21 @@ class MainWindow(QMainWindow):
             self.log_message(f"Error syncing with TradeStation: {e}", "ERROR")
             logger.error(f"Error syncing with TradeStation: {e}", exc_info=True)
     
+    def refresh_ts_chains(self):
+        """Refresh both 0DTE and 1DTE option chains for TradeStation tab"""
+        if self.connection_state != ConnectionState.CONNECTED:
+            self.log_message("Cannot refresh chains - not connected to IBKR", "WARNING")
+            return
+        
+        try:
+            # Request both chains
+            self.request_ts_chain("0DTE")
+            self.request_ts_chain("1DTE")
+            self.log_message("Refreshing TradeStation option chains...", "INFO")
+        except Exception as e:
+            self.log_message(f"Error refreshing TS chains: {e}", "ERROR")
+            logger.error(f"Error refreshing TS chains: {e}", exc_info=True)
+    
     def get_ts_active_contract_type(self) -> str:
         """Determine which contract type (0DTE or 1DTE) to use based on current time"""
         try:
@@ -8388,67 +8533,80 @@ class MainWindow(QMainWindow):
         self.ts_active_contract_label.setText(contract_type)
     
     def request_ts_chain(self, contract_type: str):
-        """Request option chain data for specified contract type (0DTE or 1DTE)"""
+        """Request option chain data for specified contract type (0DTE or 1DTE) - works like main chain"""
         try:
-            logger.debug(f"[TS CHAIN] === Starting request_ts_chain for {contract_type} ===")
+            logger.info(f"[TS CHAIN] === Starting request_ts_chain for {contract_type} ===")
             
             # Check IBKR connection
-            logger.debug(f"[TS CHAIN] Connection state: {self.connection_state}")
-            if not self.connection_state == ConnectionState.CONNECTED:
+            if self.connection_state != ConnectionState.CONNECTED:
                 self.log_message("IBKR not connected - cannot request chains", "WARNING")
-                logger.warning("[TS CHAIN] IBKR not connected, aborting chain request")
+                logger.warning(f"[TS CHAIN] Connection state is {self.connection_state}, not CONNECTED")
                 return
             
             # Calculate expiry
-            logger.debug(f"[TS CHAIN] Calculating expiry for {contract_type}")
             if contract_type == "0DTE":
-                expiry = self.calculate_expiry_date(0)
+                expiry = self.calculate_expiry_date(0)  # Today's expiration (or tomorrow if after 4PM)
                 self.ts_0dte_expiry = expiry
                 self.ts_0dte_expiry_label.setText(f"Expiry: {expiry}")
-                logger.debug(f"[TS CHAIN] 0DTE expiry: {expiry}")
             else:  # 1DTE
-                expiry = self.calculate_expiry_date(1)
+                # For 1DTE, we want the NEXT trading day after 0DTE
+                # So if 0DTE offset is 0, 1DTE should be offset 1
+                # But we need to ensure they're always different days
+                expiry_0dte = self.calculate_expiry_date(0)
+                expiry_1dte = self.calculate_expiry_date(1)
+                
+                # If both are same (shouldn't happen but safety check), use offset 2
+                if expiry_1dte == expiry_0dte:
+                    expiry = self.calculate_expiry_date(2)
+                    logger.warning(f"[TS CHAIN] 1DTE matched 0DTE ({expiry_0dte}), using offset 2: {expiry}")
+                else:
+                    expiry = expiry_1dte
+                
                 self.ts_1dte_expiry = expiry
                 self.ts_1dte_expiry_label.setText(f"Expiry: {expiry}")
-                logger.debug(f"[TS CHAIN] 1DTE expiry: {expiry}")
             
-            # Get ATM strike
-            logger.debug("[TS CHAIN] Finding ATM strike...")
-            atm_strike = self.find_atm_strike_by_delta()
-            logger.debug(f"[TS CHAIN] ATM strike result: {atm_strike}")
-            if atm_strike is None:
-                self.log_message("Could not determine ATM strike", "WARNING")
-                logger.warning("[TS CHAIN] ATM strike is None, aborting")
-                return
-            
-            # Build chain: 6 above + ATM + 6 below = 13 strikes
-            logger.debug(f"[TS CHAIN] Checking strike_interval attribute...")
-            logger.debug(f"[TS CHAIN] hasattr(self, 'strike_interval'): {hasattr(self, 'strike_interval')}")
-            if hasattr(self, 'strike_interval'):
-                logger.debug(f"[TS CHAIN] self.strike_interval = {self.strike_interval}")
+            # Determine reference price (same logic as main chain)
+            if (underlying_price := self.app_state.get('underlying_price', 0)) > 0:
+                reference_price = underlying_price
+                logger.info(f"[TS {contract_type}] Using {self.instrument['underlying_symbol']} index price ${reference_price:.2f}")
             else:
-                logger.error("[TS CHAIN] strike_interval attribute does NOT exist!")
-                logger.debug(f"[TS CHAIN] Available attributes: {[a for a in dir(self) if 'strike' in a.lower()]}")
+                # Fallback to ES futures adjusted for cash offset
+                adjusted_es_price = self.get_adjusted_es_price()
+                if adjusted_es_price == 0:
+                    self.log_message(f"Waiting for price data for {contract_type} chain...", "INFO")
+                    return
+                reference_price = adjusted_es_price
+                logger.warning(f"[TS {contract_type}] Using fallback ES-derived price ${reference_price:.2f}")
             
+            # Calculate center strike
+            strike_interval = self.instrument['strike_increment']
+            center_strike = round(reference_price / strike_interval) * strike_interval
+            
+            # Track center strike for drift detection
+            if contract_type == "0DTE":
+                self.ts_0dte_center_strike = center_strike
+            else:
+                self.ts_1dte_center_strike = center_strike
+            
+            logger.info(f"[TS {contract_type}] Chain centered at strike {center_strike} (Ref: ${reference_price:.2f})")
+            
+            # Build strike list using TS chain settings
             strikes = []
-            strike_interval = self.strike_interval
-            logger.debug(f"[TS CHAIN] Using strike_interval: {strike_interval}")
+            current_strike = center_strike - (self.ts_strikes_below * strike_interval)
+            end_strike = center_strike + (self.ts_strikes_above * strike_interval)
             
-            for i in range(-6, 7):  # -6 to +6 inclusive
-                strike = atm_strike + (i * strike_interval)
-                strikes.append(strike)
+            while current_strike <= end_strike:
+                strikes.append(current_strike)
+                current_strike += strike_interval
             
-            logger.debug(f"[TS CHAIN] Built strike list: {strikes}")
+            logger.info(f"[TS {contract_type}] Requesting {len(strikes)} strikes from {min(strikes)} to {max(strikes)}")
             
             # Determine trading class
             trading_class = "SPXW" if SELECTED_INSTRUMENT == "SPX" else "XSP"
-            logger.debug(f"[TS CHAIN] Using trading_class: {trading_class}, symbol: {SELECTED_INSTRUMENT}")
             
             # Request market data for each strike
-            logger.debug(f"[TS CHAIN] Requesting market data for {len(strikes)} strikes...")
             for strike in strikes:
                 # Request call
-                logger.debug(f"[TS CHAIN] Creating call contract for strike {strike}")
                 call_contract = self.create_option_contract(
                     strike=strike,
                     right='C',
@@ -8458,13 +8616,11 @@ class MainWindow(QMainWindow):
                 )
                 call_key = f"{SELECTED_INSTRUMENT}_{strike}_C_{expiry}"
                 req_id = self.app_state['next_req_id']
-                logger.debug(f"[TS CHAIN] Requesting call data: reqId={req_id}, key={call_key}")
                 self.ibkr_client.reqMktData(req_id, call_contract, "", False, False, [])
-                self.app_state['market_data_subscriptions'][req_id] = call_key
+                self.app_state['market_data_map'][req_id] = call_key
                 self.app_state['next_req_id'] += 1
                 
                 # Request put
-                logger.debug(f"[TS CHAIN] Creating put contract for strike {strike}")
                 put_contract = self.create_option_contract(
                     strike=strike,
                     right='P',
@@ -8474,17 +8630,120 @@ class MainWindow(QMainWindow):
                 )
                 put_key = f"{SELECTED_INSTRUMENT}_{strike}_P_{expiry}"
                 req_id = self.app_state['next_req_id']
-                logger.debug(f"[TS CHAIN] Requesting put data: reqId={req_id}, key={put_key}")
                 self.ibkr_client.reqMktData(req_id, put_contract, "", False, False, [])
-                self.app_state['market_data_subscriptions'][req_id] = put_key
+                self.app_state['market_data_map'][req_id] = put_key
                 self.app_state['next_req_id'] += 1
             
-            logger.debug(f"[TS CHAIN] === Successfully requested {contract_type} chain: {len(strikes)} strikes ===")
-            self.log_message(f"Requested {contract_type} chain: {len(strikes)} strikes", "INFO")
+            logger.info(f"[TS {contract_type}] Chain request complete: {len(strikes)} strikes requested")
+            
+            # Initialize the table with empty rows for these strikes
+            self.initialize_ts_chain_table(contract_type, strikes)
             
         except Exception as e:
-            self.log_message(f"Error requesting {contract_type} chain: {e}", "ERROR")
-            logger.error(f"Error requesting {contract_type} chain: {e}", exc_info=True)
+            logger.error(f"[TS CHAIN] Error requesting {contract_type} chain: {e}", exc_info=True)
+            self.log_message(f"Error requesting {contract_type} chain: {str(e)}", "ERROR")
+    
+    def initialize_ts_chain_table(self, contract_type: str, strikes: list):
+        """Initialize TS chain table with rows for given strikes"""
+        try:
+            # Select the appropriate table
+            table = self.ts_0dte_table if contract_type == "0DTE" else self.ts_1dte_table
+            
+            # Sort strikes descending (highest first)
+            sorted_strikes = sorted(strikes, reverse=True)
+            
+            # Set row count
+            table.setRowCount(len(sorted_strikes))
+            
+            # Initialize each row with strike and empty cells
+            for row, strike in enumerate(sorted_strikes):
+                # Column layout: Call Delta, Call Gamma, Call Bid, Call Ask, Strike, Put Bid, Put Ask, Put Gamma, Put Delta
+                
+                # Initialize all cells with zeros (centered)
+                for col in range(9):
+                    if col == 4:  # Strike column
+                        strike_item = QTableWidgetItem(f"{strike:.2f}")
+                        strike_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                        strike_item.setBackground(QColor(60, 60, 60))
+                        table.setItem(row, col, strike_item)
+                    else:
+                        item = QTableWidgetItem("0.00")
+                        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                        table.setItem(row, col, item)
+            
+            logger.debug(f"[TS {contract_type}] Initialized table with {len(sorted_strikes)} strikes")
+        except Exception as e:
+            logger.error(f"Error initializing TS chain table: {e}", exc_info=True)
+    
+    def update_ts_chain_cell(self, contract_key: str):
+        """Update a single cell in TS chain tables when market data arrives"""
+        try:
+            # Parse contract key: SYMBOL_STRIKE_RIGHT_EXPIRY
+            parts = contract_key.split('_')
+            if len(parts) < 4:
+                return
+            
+            symbol = parts[0]
+            strike = float(parts[1])
+            right = parts[2]  # 'C' or 'P'
+            expiry = parts[3]
+            
+            # Determine which table(s) to update
+            tables_to_update = []
+            if hasattr(self, 'ts_0dte_expiry') and expiry == self.ts_0dte_expiry:
+                tables_to_update.append(self.ts_0dte_table)
+            if hasattr(self, 'ts_1dte_expiry') and expiry == self.ts_1dte_expiry:
+                tables_to_update.append(self.ts_1dte_table)
+            
+            if not tables_to_update:
+                return  # Not a TS chain expiry
+            
+            # Get market data for this contract
+            data = self.market_data.get(contract_key, {})
+            
+            for table in tables_to_update:
+                # Find the row for this strike
+                for row in range(table.rowCount()):
+                    strike_item = table.item(row, 4)  # Strike is column 4
+                    if strike_item and abs(float(strike_item.text()) - strike) < 0.01:
+                        # Found the row! Now update the appropriate columns
+                        if right == 'C':  # Call option
+                            # Call Delta (column 0)
+                            item = QTableWidgetItem(f"{data.get('delta', 0.0):.3f}")
+                            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                            table.setItem(row, 0, item)
+                            # Call Gamma (column 1)
+                            item = QTableWidgetItem(f"{data.get('gamma', 0.0):.4f}")
+                            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                            table.setItem(row, 1, item)
+                            # Call Bid (column 2)
+                            item = QTableWidgetItem(f"{data.get('bid', 0.0):.2f}")
+                            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                            table.setItem(row, 2, item)
+                            # Call Ask (column 3)
+                            item = QTableWidgetItem(f"{data.get('ask', 0.0):.2f}")
+                            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                            table.setItem(row, 3, item)
+                        else:  # Put option
+                            # Put Bid (column 5)
+                            item = QTableWidgetItem(f"{data.get('bid', 0.0):.2f}")
+                            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                            table.setItem(row, 5, item)
+                            # Put Ask (column 6)
+                            item = QTableWidgetItem(f"{data.get('ask', 0.0):.2f}")
+                            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                            table.setItem(row, 6, item)
+                            # Put Gamma (column 7)
+                            item = QTableWidgetItem(f"{data.get('gamma', 0.0):.4f}")
+                            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                            table.setItem(row, 7, item)
+                            # Put Delta (column 8)
+                            item = QTableWidgetItem(f"{data.get('delta', 0.0):.3f}")
+                            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                            table.setItem(row, 8, item)
+                        break  # Found the row, no need to continue
+        except Exception as e:
+            logger.error(f"Error updating TS chain cell for {contract_key}: {e}", exc_info=True)
     
     def update_ts_chain_table(self, contract_type: str):
         """Update the option chain table for specified contract type"""
@@ -8714,6 +8973,50 @@ class MainWindow(QMainWindow):
             self.log_message(f"Error closing put positions: {e}", "ERROR")
             logger.error(f"Error closing put positions: {e}", exc_info=True)
     
+    def close_position_by_key(self, contract_key: str):
+        """Close a position by contract key (used by TradeStation signal handling)"""
+        try:
+            # Get position info
+            if contract_key not in self.positions:
+                self.log_message(f"Position {contract_key} not found", "WARNING")
+                return
+            
+            pos = self.positions[contract_key]
+            position_size = pos.get('quantity', 0)
+            
+            # Check if position is zero
+            if position_size == 0:
+                self.log_message(f"Position for {contract_key} is zero - nothing to close", "WARNING")
+                return
+            
+            # Determine action based on position direction
+            if position_size > 0:
+                action = "SELL"  # Close long position
+                qty = int(abs(position_size))
+            elif position_size < 0:
+                action = "BUY"   # Close short position
+                qty = int(abs(position_size))
+            else:
+                return
+            
+            # Calculate mid price for exit
+            mid_price = self.calculate_mid_price(contract_key)
+            if mid_price == 0:
+                # Fallback to current price from position
+                mid_price = pos.get('currentPrice', 0)
+                if mid_price == 0:
+                    self.log_message(f"Cannot determine exit price for {contract_key}", "ERROR")
+                    return
+            
+            self.log_message(f"Closing position: {contract_key} - {action} {qty} @ ${mid_price:.2f}", "INFO")
+            
+            # Place exit order with mid-price chasing
+            self.place_manual_order(contract_key, action, qty, mid_price)
+            
+        except Exception as e:
+            self.log_message(f"Error closing position {contract_key}: {e}", "ERROR")
+            logger.error(f"Error closing position {contract_key}: {e}", exc_info=True)
+    
     def execute_ts_close_position(self, contract_key: str, signal_id: str):
         """Close a specific position by contract key"""
         try:
@@ -8757,6 +9060,267 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.error(f"Error adding signal to log: {e}", exc_info=True)
     
+    def on_ts_position_cell_clicked(self, row: int, col: int):
+        """
+        Handle TS position table cell click - Close button functionality
+        Uses same logic as main positions table with mid-price chasing
+        """
+        # DEBUG: Log every click
+        logger.info(f"TS Position cell clicked: row={row}, col={col}")
+        self.log_message(f"TS Position table click: row={row}, col={col}", "INFO")
+        
+        if col != 10:  # Only handle Close button column (column 10)
+            logger.info(f"Click on column {col} - not Close button (column 10), ignoring")
+            return
+        
+        logger.info("TS Close button clicked - starting close position flow")
+        self.log_message("=" * 60, "INFO")
+        self.log_message("TS CLOSE BUTTON CLICKED", "INFO")
+        
+        # Get contract key from first column
+        contract_key_item = self.ts_positions_table.item(row, 0)
+        if not contract_key_item:
+            logger.error("No contract_key item in row 0")
+            self.log_message("Error: No contract key found in position table", "ERROR")
+            return
+        
+        contract_key = contract_key_item.text()
+        logger.info(f"Contract key from table: {contract_key}")
+        self.log_message(f"Contract: {contract_key}", "INFO")
+        
+        # Get position info
+        if contract_key not in self.positions:
+            self.log_message(f"Position {contract_key} not found", "WARNING")
+            return
+        
+        pos = self.positions[contract_key]
+        position_size = pos.get('quantity', 0)
+        
+        # PROTECTION: Check if position is zero (nothing to close)
+        if position_size == 0:
+            self.log_message(f"⚠️ WARNING: Position for {contract_key} is zero - nothing to close!", "WARNING")
+            return
+        
+        # PROTECTION: Check for pending exit orders for this contract
+        pending_exit_orders = []
+        for order_id, order_info in self.chasing_orders.items():
+            if order_info['contract_key'] == contract_key:
+                # Check if this is an exit order (opposite direction of position)
+                is_exit_order = (position_size > 0 and order_info['action'] == "SELL") or \
+                               (position_size < 0 and order_info['action'] == "BUY")
+                if is_exit_order:
+                    pending_exit_orders.append(order_id)
+        
+        if pending_exit_orders:
+            action_type = "SELL" if position_size > 0 else "BUY"
+            self.log_message(f"⚠️ WARNING: Already have {len(pending_exit_orders)} pending {action_type} order(s) for {contract_key}!", "WARNING")
+            self.log_message(f"Order IDs: {', '.join(map(str, pending_exit_orders))} - allowing duplicate for speed", "WARNING")
+            # Continue anyway for maximum speed (user takes responsibility)
+        
+        # Get current P&L for logging
+        current_pnl = pos.get('pnl', 0)
+        
+        # Log close details (no confirmation for speed)
+        self.log_message("=" * 60, "INFO")
+        self.log_message(f"TS MANUAL CLOSE POSITION: {contract_key}", "SUCCESS")
+        self.log_message(f"Quantity: {position_size:.0f}, Current P&L: ${current_pnl:.2f}", "INFO")
+        
+        # Determine action based on position direction
+        if position_size > 0:
+            action = "SELL"  # Close long position
+            qty = int(abs(position_size))
+        elif position_size < 0:
+            action = "BUY"   # Close short position (should never happen with options!)
+            qty = int(abs(position_size))
+            self.log_message("⚠️ WARNING: Closing SHORT position - this should not happen with long-only options!", "WARNING")
+        else:
+            self.log_message("❌ ERROR: Position quantity is zero, nothing to close", "ERROR")
+            return
+        
+        # Calculate mid price for exit (with fallback to last price)
+        mid_price = self.calculate_mid_price(contract_key)
+        if mid_price == 0:
+            # Fallback to current price from position
+            mid_price = pos['currentPrice']
+            self.log_message(f"Using last price ${mid_price:.2f} for exit", "WARNING")
+        
+        self.log_message(f"Exit order: {action} {qty} @ ${mid_price:.2f}", "INFO")
+        
+        # Place exit order with mid-price chasing enabled
+        self.place_manual_order(contract_key, action, qty, mid_price)
+        self.log_message(f"Exit order submitted with mid-price chasing", "SUCCESS")
+        self.log_message("=" * 60, "INFO")
+    
+    def on_ts_order_cell_clicked(self, row: int, col: int):
+        """Handle TS order table cell click - Cancel button"""
+        if col == 6:  # Cancel button
+            # Get order ID from first column
+            order_id_item = self.ts_orders_table.item(row, 0)
+            if not order_id_item:
+                return
+            
+            order_id = int(order_id_item.text())
+            
+            # Get order info
+            if order_id not in self.pending_orders:
+                self.log_message(f"Order #{order_id} not found in pending orders", "WARNING")
+                return
+            
+            order_info = self.pending_orders[order_id]
+            
+            # Log cancel details (no confirmation for speed)
+            self.log_message(f"Cancelling TS order #{order_id}: {order_info['action']} {order_info['quantity']} {order_info['contract_key']}", "INFO")
+            
+            # Cancel order via IBKR API
+            self.ibkr_client.cancelOrder(order_id)
+            self.log_message(f"TS Order #{order_id} cancellation sent", "SUCCESS")
+            
+            # Update order status
+            self.pending_orders[order_id]['status'] = 'Cancelled'
+            self.update_ts_orders_display()
+    
+    def update_ts_positions_display(self):
+        """Update TS positions table with real-time P&L and time tracking"""
+        self.ts_positions_table.setRowCount(0)
+        total_pnl = 0
+        total_cost_basis = 0
+        total_mkt_value = 0
+        
+        for row, (contract_key, pos) in enumerate(self.positions.items()):
+            self.ts_positions_table.insertRow(row)
+            
+            # Update P&L from current market data (mid-price)
+            if contract_key in self.market_data:
+                md = self.market_data[contract_key]
+                bid, ask = md.get('bid', 0), md.get('ask', 0)
+                if bid > 0 and ask > 0:
+                    current_price = (bid + ask) / 2
+                    pos['currentPrice'] = current_price
+                    pos['pnl'] = (current_price - pos['avgCost']) * pos['position'] * 100
+                else:
+                    pos['currentPrice'] = 0.0
+                    pos['pnl'] = (0.0 - pos['avgCost']) * pos['position'] * 100
+            else:
+                pos['currentPrice'] = 0.0
+                pos['pnl'] = (0.0 - pos['avgCost']) * pos['position'] * 100
+            
+            pnl = pos.get('pnl', 0)
+            pnl_pct = (pos['currentPrice'] / pos['avgCost'] - 1) * 100 if pos['avgCost'] > 0 else 0
+            total_pnl += pnl
+            
+            # Calculate time tracking
+            entry_time = pos.get('entryTime', datetime.now())
+            time_span = datetime.now() - entry_time
+            
+            # Format time strings
+            entry_time_str = entry_time.strftime("%H:%M:%S")
+            hours, remainder = divmod(int(time_span.total_seconds()), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            time_span_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+            
+            # Calculate cost basis and market value
+            cost_basis = pos['avgCost'] * abs(pos['position']) * 100
+            market_value = pos['currentPrice'] * abs(pos['position']) * 100
+            total_cost_basis += cost_basis
+            total_mkt_value += market_value
+            
+            # Populate row
+            items = [
+                QTableWidgetItem(contract_key),
+                QTableWidgetItem(f"{pos['position']:.0f}"),
+                QTableWidgetItem(f"${pos['avgCost']:.2f}"),
+                QTableWidgetItem(f"${pos['currentPrice']:.2f}"),
+                QTableWidgetItem(f"${pnl:.2f}"),
+                QTableWidgetItem(f"{pnl_pct:.2f}%"),
+                QTableWidgetItem(f"${cost_basis:.2f}"),
+                QTableWidgetItem(f"${market_value:.2f}"),
+                QTableWidgetItem(entry_time_str),
+                QTableWidgetItem(time_span_str),
+                QTableWidgetItem("Close")
+            ]
+            
+            for col, item in enumerate(items):
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                
+                # Color P&L cells
+                if col == 4 or col == 5:
+                    if pnl > 0:
+                        item.setForeground(QColor("#00ff00"))
+                    elif pnl < 0:
+                        item.setForeground(QColor("#ff0000"))
+                
+                # Close button styling
+                if col == 10:
+                    item.setBackground(QColor("#cc0000"))
+                    item.setForeground(QColor("#ffffff"))
+                
+                self.ts_positions_table.setItem(row, col, item)
+    
+    def update_ts_orders_display(self):
+        """Update TS orders table with active orders and chase status"""
+        self.ts_orders_table.setRowCount(0)
+        
+        for order_id, order_info in list(self.pending_orders.items()):
+            # Skip filled/cancelled orders
+            status = order_info.get('status', 'Working')
+            if status in ['Filled', 'Cancelled', 'Inactive']:
+                continue
+            
+            row = self.ts_orders_table.rowCount()
+            self.ts_orders_table.insertRow(row)
+            
+            # Check if this is a chasing order
+            chasing_info = self.chasing_orders.get(order_id)
+            
+            # Get price string
+            if chasing_info:
+                current_price = chasing_info.get('last_price', chasing_info.get('last_mid', 0))
+                price_str = f"${current_price:.2f}"
+            elif order_info.get('price', 0) == 0:
+                price_str = "MKT"
+            else:
+                price_str = f"${order_info['price']:.2f}"
+            
+            # Get status string
+            if chasing_info:
+                give_in_ticks = chasing_info.get('give_in_count', 0)
+                if give_in_ticks == 0:
+                    status_str = "Chasing Mid"
+                else:
+                    status_str = f"Giving In x{give_in_ticks}"
+            else:
+                status_str = order_info.get('status', 'Working')
+            
+            # Populate row
+            items = [
+                QTableWidgetItem(str(order_id)),
+                QTableWidgetItem(order_info['contract_key']),
+                QTableWidgetItem(order_info['action']),
+                QTableWidgetItem(str(order_info['quantity'])),
+                QTableWidgetItem(price_str),
+                QTableWidgetItem(status_str),
+                QTableWidgetItem("Cancel")
+            ]
+            
+            for col, item in enumerate(items):
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                
+                # Status column - color based on chase status
+                if col == 5:
+                    if chasing_info:
+                        give_in_ticks = chasing_info.get('give_in_count', 0)
+                        if give_in_ticks == 0:
+                            item.setForeground(QColor("#00CED1"))  # Cyan for chasing mid
+                        else:
+                            item.setForeground(QColor("#FFA500"))  # Orange for giving in
+                
+                # Cancel button styling
+                if col == 6:
+                    item.setBackground(QColor("#cc0000"))
+                    item.setForeground(QColor("#ffffff"))
+                
+                self.ts_orders_table.setItem(row, col, item)
+    
     # ==================== End TradeStation Methods ====================
     
     def load_settings(self):
@@ -8773,6 +9337,11 @@ class MainWindow(QMainWindow):
                 self.strikes_below = settings.get('strikes_below', 20)
                 self.chain_refresh_interval = settings.get('chain_refresh_interval', 3600)
                 self.chain_drift_threshold = settings.get('chain_drift_threshold', 5)
+                
+                # TradeStation Chain Settings
+                self.ts_strikes_above = settings.get('ts_strikes_above', 6)
+                self.ts_strikes_below = settings.get('ts_strikes_below', 6)
+                self.ts_chain_drift_threshold = settings.get('ts_chain_drift_threshold', 3)
                 
                 # ES Offset Settings (restore persistent offset from day session)
                 self.es_to_cash_offset = settings.get('es_to_cash_offset', 0.0)
@@ -8820,6 +9389,11 @@ class MainWindow(QMainWindow):
                 self.strikes_below_settings_spin.setValue(self.strikes_below)
                 self.chain_refresh_settings_spin.setValue(self.chain_refresh_interval)
                 self.chain_drift_settings_spin.setValue(self.chain_drift_threshold)
+                
+                # Update Settings tab TradeStation chain settings
+                self.ts_strikes_above_spin.setValue(self.ts_strikes_above)
+                self.ts_strikes_below_spin.setValue(self.ts_strikes_below)
+                self.ts_chain_drift_spin.setValue(self.ts_chain_drift_threshold)
                 
                 # Update Master Settings UI
                 self.vix_threshold_spin.setValue(self.vix_threshold)
