@@ -779,6 +779,7 @@ class TradeStationSignals(QObject):  # type: ignore[misc]
     exit_signal = pyqtSignal(dict)  # type: ignore[possibly-unbound]
     signal_update = pyqtSignal(dict)  # type: ignore[possibly-unbound]
     strategy_state_changed = pyqtSignal(str)  # type: ignore[possibly-unbound]
+    strategy_direction_changed = pyqtSignal(int)  # type: ignore[possibly-unbound]  # 1=Long, -1=Short
 
 
 class TradeStationManager(QObject):
@@ -797,6 +798,7 @@ class TradeStationManager(QObject):
         self.dict_name = "IBKR-TRADER"  # Match TradeStation's dictionary name (with HYPHEN)
         self.processed_signals = set()
         self.timer = None  # QTimer for message pump
+        self.last_strategy_direction = None  # Track last strategy direction to prevent spam
         
     def start(self):
         """Initialize COM and start message pump (NO THREADING - based on working Demo.py)"""
@@ -935,9 +937,9 @@ class TradeStationManager(QObject):
             value_str = str(value)[:200] if value else "None"
             
             # Filter out repetitive/noisy messages from logs but allow in Activity Log
+            # Note: StrategyDirection is now processed separately, not filtered
             repetitive_keys = {
-                'StrategyDirection', 'LAST_UPDATE', 'PYTHON_STATUS',
-                'CurrentTime', 'MarketState', 'HeartBeat'
+                'StrategyDirection', 'LAST_UPDATE', 'PYTHON_STATUS', 'CurrentTime', 'MarketState', 'HeartBeat'
             }
             
             # Only log important changes to file/console, not repetitive status updates
@@ -949,6 +951,21 @@ class TradeStationManager(QObject):
             show_all = self.main_window.show_all_gd_communications if self.main_window else False
             if show_all:
                 self.signals.ts_activity.emit(f"[CHANGE] {key} = {value_str}")
+            
+            # Handle StrategyDirection: 1=Long, -1=Short
+            if key == "StrategyDirection":
+                try:
+                    direction = int(value)
+                    # Only emit signal and log if direction actually changed
+                    if direction != self.last_strategy_direction:
+                        self.last_strategy_direction = direction
+                        self.signals.strategy_direction_changed.emit(direction)
+                        direction_str = "LONG" if direction == 1 else "SHORT" if direction == -1 else "FLAT"
+                        logger.info(f"[TS→PYTHON] Strategy direction changed to: {direction_str} ({direction})")
+                        self.signals.ts_activity.emit(f"[STRATEGY] Direction: {direction_str}")
+                    # Don't log if direction hasn't changed (prevents spam)
+                except (ValueError, TypeError):
+                    logger.warning(f"Invalid StrategyDirection value: {value}")
             
             if key == "TS_STRATEGY_STATE":
                 self.signals.strategy_state_changed.emit(str(value))
@@ -2493,6 +2510,7 @@ class MainWindow(QMainWindow):
         self.ts_manager = None
         self.ts_enabled = False
         self.ts_strategy_state = "FLAT"
+        self.ts_strategy_direction = 0  # 1=Long, -1=Short, 0=Flat
         self.ts_signal_log = []
         self.ts_0dte_chain_data = {}
         self.ts_1dte_chain_data = {}
@@ -2576,6 +2594,7 @@ class MainWindow(QMainWindow):
             self.ts_signals.exit_signal.connect(self.on_ts_exit_signal)
             self.ts_signals.signal_update.connect(self.on_ts_signal_update)
             self.ts_signals.strategy_state_changed.connect(self.on_ts_strategy_state_changed)
+            self.ts_signals.strategy_direction_changed.connect(self.on_ts_strategy_direction_changed)
     
     def setup_ui(self):
         """Setup the user interface"""
@@ -9135,6 +9154,33 @@ class MainWindow(QMainWindow):
             self.ts_state_label.setStyleSheet("font-weight: bold; font-size: 14px; color: #FFFFFF;")
         
         self.log_message(f"TS Strategy state changed to: {state}", "INFO")
+    
+    @pyqtSlot(int)
+    def on_ts_strategy_direction_changed(self, direction: int):
+        """Handle strategy direction change from TradeStation (1=Long, -1=Short)"""
+        # Only process if direction actually changed to prevent spam
+        if direction == self.ts_strategy_direction:
+            return  # No change, skip processing
+            
+        # Convert numeric direction to text
+        if direction == 1:
+            direction_str = "LONG"
+            color = "#4CAF50"  # Green
+        elif direction == -1:
+            direction_str = "SHORT" 
+            color = "#FF6B6B"  # Red
+        else:
+            direction_str = "FLAT"
+            color = "#FFFF00"  # Yellow
+        
+        # Store current strategy direction
+        self.ts_strategy_direction = direction
+        
+        # Update strategy state display to show direction
+        self.on_ts_strategy_state_changed(direction_str)
+        
+        # Only log actual changes, not repetitive updates
+        self.log_message(f"TS Strategy direction changed to: {direction_str} ({direction})", "INFO")
     
     def sync_with_ts_strategy(self):
         """Manually sync strategy state with TradeStation"""
