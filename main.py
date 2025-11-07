@@ -7192,11 +7192,11 @@ class MainWindow(QMainWindow):
         # Check for initial calibration or normal drift
         is_initial_calibration = not calibration_done
         
-        # For 1DTE, use more aggressive initial calibration since time value affects initial estimate
-        # For 0DTE, use tighter threshold since spot price should be accurate
+        # For TS chains: use normal thresholds since cascade-loaded chains are marked as calibration_done
+        # Only manually loaded chains will go through initial calibration
         if contract_type == "1DTE":
             initial_calibration_threshold = 1  # Recenter if off by even 1 strike
-        else:
+        else:  # 0DTE  
             initial_calibration_threshold = 2  # 0DTE: allow 2 strikes tolerance
         
         should_recenter = False
@@ -9719,13 +9719,23 @@ class MainWindow(QMainWindow):
         try:
             logger.info(f"[TS CHAIN] === Starting request_ts_chain for {contract_type} ===")
             
-            # Reset calibration flag if this is a manual/new request (not a forced recenter)
+            # Handle calibration flags based on loading type
             if force_center_strike is None:
+                # Manual/new request: Reset calibration to allow ATM discovery
                 if contract_type == "0DTE":
                     self.ts_0dte_delta_calibration_done = False
                     self.ts_0dte_is_recentering = False
                 else:
                     self.ts_1dte_delta_calibration_done = False
+                    self.ts_1dte_is_recentering = False
+            else:
+                # Forced center (cascade loading): Mark calibration as DONE since main chain found ATM
+                logger.info(f"[TS {contract_type}] CASCADE LOAD: Marking delta calibration as DONE (trusting main chain ATM)")
+                if contract_type == "0DTE":
+                    self.ts_0dte_delta_calibration_done = True
+                    self.ts_0dte_is_recentering = False
+                else:
+                    self.ts_1dte_delta_calibration_done = True
                     self.ts_1dte_is_recentering = False
             
             # Check IBKR connection
