@@ -9106,6 +9106,7 @@ class MainWindow(QMainWindow):
             adjusted_es_price = es_price / 10.0 if self.instrument['underlying_symbol'] == 'XSP' else es_price
         
         # Calculate ATM strike using instrument-specific increment
+        strike_increment = self.instrument['strike_increment']
         atm_strike = round(adjusted_es_price / strike_increment) * strike_increment
         
         self.log_message(f"Manual recentering: Using ES-adjusted price {adjusted_es_price:.2f} → strike {atm_strike:.0f} (Raw ES: {es_price:.2f})", "INFO")
