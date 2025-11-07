@@ -111,6 +111,73 @@ def setup_logging():
     return logger
 
 
+def setup_environment_logging():
+    """
+    Update logging configuration based on environment
+    Called after environment config is loaded
+    """
+    try:
+        # Import here to avoid circular imports
+        from config import config, current_config
+        
+        logger = logging.getLogger("SPXTrader")
+        
+        # Create environment-specific log directory
+        env_log_dir = Path(current_config['log_dir'])
+        env_log_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Environment-specific log filename with prefix
+        log_filename = f"{current_config['log_prefix']}{datetime.now().strftime('%Y-%m-%d')}.log"
+        env_log_path = env_log_dir / log_filename
+        
+        # Update file handler to use environment-specific path
+        for handler in logger.handlers[:]:  # Copy list to avoid modification during iteration
+            if isinstance(handler, RotatingFileHandler):
+                logger.removeHandler(handler)
+                
+        # Add new environment-specific file handler
+        env_file_handler = RotatingFileHandler(
+            env_log_path,
+            maxBytes=10*1024*1024,  # 10MB per file
+            backupCount=30,  # Keep 30 days of logs
+            encoding='utf-8'
+        )
+        
+        # Set log level based on environment
+        log_level = getattr(logging, current_config['log_level'])
+        env_file_handler.setLevel(log_level)
+        
+        # Environment-aware formatter
+        env_prefix = f"[{config.environment.upper()}] "
+        file_formatter = logging.Formatter(
+            f'{env_prefix}%(asctime)s | %(levelname)-8s | %(name)s | %(funcName)s:%(lineno)d | %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        env_file_handler.setFormatter(file_formatter)
+        logger.addHandler(env_file_handler)
+        
+        # Update console handler log level
+        console_level = getattr(logging, current_config['console_log_level'])
+        for handler in logger.handlers:
+            if isinstance(handler, logging.StreamHandler) and not isinstance(handler, RotatingFileHandler):
+                handler.setLevel(console_level)
+                # Update console formatter with environment prefix
+                console_formatter = logging.Formatter(
+                    f'{env_prefix}%(asctime)s | %(levelname)-8s | %(message)s',
+                    datefmt='%H:%M:%S'
+                )
+                handler.setFormatter(console_formatter)
+        
+        logger.info(f"Environment-specific logging configured: {env_log_path}")
+        logger.debug(f"File log level: {current_config['log_level']}")
+        logger.debug(f"Console log level: {current_config['console_log_level']}")
+        
+    except Exception as e:
+        # Fall back to original logging if environment setup fails
+        logger.warning(f"Failed to setup environment logging: {e}")
+        logger.warning("Using default logging configuration")
+
+
 # Initialize logger (will be used throughout the app)
 logger = setup_logging()
 
@@ -182,6 +249,39 @@ from ibapi.order import Order
 from ibapi.common import TickerId, TickAttrib
 from ibapi.ticktype import TickType
 logger.info("IBKR API loaded successfully")
+
+# Environment Configuration - Load FIRST
+logger.info("Loading environment configuration...")
+try:
+    from config import config, current_config, validate_environment, get_environment_info
+    logger.info("Environment configuration loaded successfully")
+    logger.info(f"🔧 Running in {config.environment.upper()} mode")
+    
+    # Validate environment
+    env_issues = validate_environment()
+    if env_issues:
+        logger.warning("Environment validation issues found:")
+        for issue in env_issues:
+            logger.warning(f"   {issue}")
+    else:
+        logger.info("✅ Environment validation passed")
+        
+except ImportError as e:
+    logger.critical(f"Failed to load environment configuration: {e}")
+    logger.critical("Creating default development configuration...")
+    
+    # Fallback configuration
+    class DefaultConfig:
+        environment = 'development'
+        is_production = False
+        is_development = True
+        
+    config = DefaultConfig()
+    current_config = {
+        'client_id_start': 100, 'port': 7497, 'settings_file': 'settings_dev.json',
+        'positions_file': 'positions_dev.json', 'log_level': 'DEBUG',
+        'window_title_prefix': '[DEV-FALLBACK]', 'ts_dict_name': 'IBKR-TRADER-DEV'
+    }
 
 # TradeStation GlobalDictionary Integration
 logger.info("Loading TradeStation integration...")
@@ -795,7 +895,13 @@ class TradeStationManager(QObject):
         self.main_window = main_window  # Reference to MainWindow for settings access
         self.running = False
         self.gd = None
-        self.dict_name = "IBKR-TRADER"  # Match TradeStation's dictionary name (with HYPHEN)
+        
+        # Use environment-specific dictionary name
+        if main_window and hasattr(main_window, 'env_config'):
+            self.dict_name = main_window.env_config.get('tradestation_dict_name', 'IBKR-TRADER')
+        else:
+            self.dict_name = "IBKR-TRADER"  # Fallback for default dictionary name
+            
         self.processed_signals = set()
         self.timer = None  # QTimer for message pump
         self.last_strategy_direction = None  # Track last strategy direction to prevent spam
@@ -2370,12 +2476,15 @@ class MainWindow(QMainWindow):
         # Chart window (popup window for charts)
         self.chart_window = None
         
-        # Connection settings
+        # Environment Configuration Setup
+        self.setup_environment_config()
+        
+        # Connection settings (environment-aware)
         self.host = "127.0.0.1"
-        self.port = 7497  # Paper trading
-        self.client_id = 1
-        self.client_id_iterator = 1  # Current client ID being tried
-        self.max_client_id = 10  # Maximum client ID to try
+        self.port = self.env_config.get('ibkr_port', 7497)  # Use environment-specific port
+        self.client_id = self.env_config.get('client_id_start', 1)
+        self.client_id_iterator = self.env_config.get('client_id_start', 1)  # Start from environment-specific range
+        self.max_client_id = self.env_config.get('client_id_end', 10)  # Use environment-specific max
         self.handling_client_id_error = False  # Flag to prevent double reconnect
         self.connection_state = ConnectionState.DISCONNECTED
         
@@ -2389,9 +2498,14 @@ class MainWindow(QMainWindow):
         # Set convenient shortcuts to instrument properties
         self.strike_interval = self.instrument['strike_increment']
         
-        # Set window title based on selected instrument
-        self.setWindowTitle(f"{self.instrument['name']} 0DTE Options Trader - PyQt6 Professional Edition")
+        # Set window title with environment indicator
+        env_indicator = self.env_config.get('window_title_prefix', '')
+        base_title = f"{self.instrument['name']} 0DTE Options Trader - PyQt6 Professional Edition"
+        self.setWindowTitle(f"{env_indicator}{base_title}")
+        
+        # Set window geometry and styling based on environment
         self.setGeometry(100, 100, 1600, 900)
+        self.setup_environment_styling()
         
         logger.info(f"═══════════════════════════════════════════════════════")
         logger.info(f"TRADING INSTRUMENT: {self.instrument['name']}")
@@ -2567,6 +2681,121 @@ class MainWindow(QMainWindow):
         
         # Initialize real chart data after connection
         QTimer.singleShot(5000, self.request_chart_data)
+    
+    # ========================================================================
+    # ENVIRONMENT CONFIGURATION SETUP
+    # ========================================================================
+    
+    def setup_environment_config(self):
+        """Setup environment-specific configuration"""
+        try:
+            # Load environment configuration
+            from config import config, current_config
+            self.env_config = current_config
+            self.environment_name = config.environment
+            
+            # Setup environment-specific logging
+            setup_environment_logging()
+            
+            logger.info("="*70)
+            logger.info(f"ENVIRONMENT: {self.environment_name.upper()}")
+            logger.info(f"Environment Detection: {config.detection_method}")
+            logger.info(f"Client ID Range: {current_config['client_id_start']}-{current_config['client_id_end']}")
+            logger.info(f"IBKR Port: {current_config['ibkr_port']}")
+            logger.info("="*70)
+            
+            # Environment validation warnings
+            if self.environment_name == 'production':
+                if not current_config.get('production_approved', False):
+                    logger.warning("⚠️  PRODUCTION MODE NOT APPROVED - Set production_approved=True in config after verification")
+                    self.show_production_warning()
+            
+        except Exception as e:
+            # Fallback configuration if environment setup fails
+            logger.error(f"Failed to load environment configuration: {e}")
+            self.env_config = {
+                'window_title_prefix': '[FALLBACK] ',
+                'settings_file': 'settings.json',
+                'positions_file': 'positions.json',
+                'log_dir': 'logs',
+                'log_prefix': '',
+                'log_level': 'DEBUG',
+                'console_log_level': 'INFO',
+                'ibkr_port': 7497,
+                'client_id_start': 1,
+                'client_id_end': 10,
+                'tradestation_dict_name': 'TEST_IBKR_TRADER'
+            }
+            self.environment_name = 'fallback'
+            logger.warning("Using fallback environment configuration")
+    
+    def setup_environment_styling(self):
+        """Apply environment-specific visual styling"""
+        try:
+            # Get environment-specific colors
+            env_colors = self.env_config.get('colors', {})
+            
+            if self.environment_name == 'production':
+                # Production: Red border and indicators
+                border_color = env_colors.get('border', '#ff4444')
+                bg_color = env_colors.get('background', '#2b2b2b')
+            elif self.environment_name == 'development':
+                # Development: Green border and indicators
+                border_color = env_colors.get('border', '#44ff44')
+                bg_color = env_colors.get('background', '#2b2b2b')
+            else:
+                # Fallback: Orange border
+                border_color = '#ffaa44'
+                bg_color = '#2b2b2b'
+            
+            # Apply environment-specific window styling
+            self.setStyleSheet(f"""
+                QMainWindow {{
+                    border: 3px solid {border_color};
+                    background-color: {bg_color};
+                }}
+            """)
+            
+        except Exception as e:
+            logger.warning(f"Failed to apply environment styling: {e}")
+    
+    def show_production_warning(self):
+        """Show production environment warning dialog"""
+        try:
+            from PyQt6.QtWidgets import QMessageBox
+            
+            msg = QMessageBox()
+            msg.setIcon(QMessageBox.Icon.Warning)
+            msg.setWindowTitle("Production Environment Warning")
+            msg.setText("🚨 PRODUCTION TRADING ENVIRONMENT DETECTED 🚨")
+            msg.setInformativeText(
+                "This instance is configured for LIVE TRADING.\n\n"
+                "• Real money and positions at risk\n"
+                "• All orders will be executed in live market\n"
+                "• Verify all settings before trading\n\n"
+                "Ensure this is intentional before proceeding."
+            )
+            msg.setStandardButtons(QMessageBox.StandardButton.Ok)
+            msg.exec()
+            
+        except Exception as e:
+            logger.error(f"Failed to show production warning: {e}")
+    
+    def get_environment_file_path(self, filename):
+        """Get environment-specific file path"""
+        try:
+            if filename == 'settings.json':
+                return self.env_config.get('settings_file', 'settings.json')
+            elif filename == 'positions.json':
+                return self.env_config.get('positions_file', 'positions.json')
+            else:
+                return filename
+        except:
+            return filename
+    
+    # ========================================================================
+    # SIGNAL CONNECTIONS
+    # ========================================================================
     
     def connect_signals(self):
         """Connect IBKR signals to GUI slots"""
@@ -8930,7 +9159,7 @@ class MainWindow(QMainWindow):
                 'trade_z_threshold': self.trade_z_threshold,
             }
             
-            Path('settings.json').write_text(json.dumps(settings, indent=2))
+            Path(self.get_environment_file_path('settings.json')).write_text(json.dumps(settings, indent=2))
             logger.debug("Settings saved successfully")
         except Exception as e:
             self.log_message(f"Error saving settings: {e}", "ERROR")
@@ -10291,15 +10520,18 @@ class MainWindow(QMainWindow):
     # ==================== End TradeStation Methods ====================
     
     def load_settings(self):
-        """Load settings from JSON file"""
+        """Load settings from environment-specific JSON file"""
         try:
-            if Path('settings.json').exists():
-                settings = json.loads(Path('settings.json').read_text())
+            # Get environment-specific settings file
+            settings_file = self.get_environment_file_path('settings.json')
+            
+            if Path(settings_file).exists():
+                settings = json.loads(Path(settings_file).read_text())
                 
-                # Connection settings
+                # Connection settings (use environment config for defaults, allow override)
                 self.host = settings.get('host', '127.0.0.1')
-                self.port = settings.get('port', 7497)
-                self.client_id = settings.get('client_id', 1)
+                self.port = settings.get('port', self.env_config.get('ibkr_port', 7497))
+                self.client_id = settings.get('client_id', self.env_config.get('client_id_start', 1))
                 self.strikes_above = settings.get('strikes_above', 10)  # Reduced default for efficient auto-load
                 self.strikes_below = settings.get('strikes_below', 10)  # Reduced default for efficient auto-load
                 self.chain_refresh_interval = settings.get('chain_refresh_interval', 3600)
@@ -10410,7 +10642,7 @@ class MainWindow(QMainWindow):
     
     def save_positions(self):
         """
-        Save positions to JSON file to persist entryTime across restarts
+        Save positions to environment-specific JSON file to persist entryTime across restarts
         Called periodically and on app close
         """
         try:
@@ -10423,20 +10655,22 @@ class MainWindow(QMainWindow):
                     'entryTime': pos.get('entryTime', datetime.now()).isoformat()
                 }
             
-            Path('positions.json').write_text(json.dumps(positions_data, indent=2))
-            logger.debug(f"Saved {len(positions_data)} positions to positions.json")
+            positions_file = self.get_environment_file_path('positions.json')
+            Path(positions_file).write_text(json.dumps(positions_data, indent=2))
+            logger.debug(f"Saved {len(positions_data)} positions to {positions_file}")
         except Exception as e:
             logger.error(f"Error saving positions: {e}", exc_info=True)
     
     def load_positions(self):
         """
-        Load positions from JSON file on startup
+        Load positions from environment-specific JSON file on startup
         Merges with IBKR positions to preserve entryTime
         """
         try:
-            if Path('positions.json').exists():
-                positions_data = json.loads(Path('positions.json').read_text())
-                logger.info(f"Loaded {len(positions_data)} positions from positions.json")
+            positions_file = self.get_environment_file_path('positions.json')
+            if Path(positions_file).exists():
+                positions_data = json.loads(Path(positions_file).read_text())
+                logger.info(f"Loaded {len(positions_data)} positions from {positions_file}")
                 
                 # Store loaded positions for merging when IBKR positions arrive
                 self.saved_positions = {}
