@@ -2588,6 +2588,16 @@ class MainWindow(QMainWindow):
         self.vega_target = 500  # Target vega exposure
         self.max_delta_threshold = 10  # Maximum allowed delta before rehedge
         self.auto_hedge_enabled = False  # Auto delta hedging OFF by default
+        
+        # TradeStation Automated Trading Settings
+        self.ts_auto_trading_enabled = False  # Master switch: automated trading OFF by default
+        self.ts_auto_long_enabled = True   # Enable long trades (calls) when strategy signals LONG
+        self.ts_auto_short_enabled = True  # Enable short trades (puts) when strategy signals SHORT
+        self.ts_immediate_join = False     # If True: immediately enter based on current TS state
+        self.ts_wait_for_next_entry = True # If True: wait for TS strategy state changes before entering
+        self.ts_last_strategy_state = "FLAT"  # Track last known TS strategy state for change detection
+        self.ts_current_auto_position_contract = None  # Track current automated position contract
+        self.ts_automation_initialized = False  # Track if automation has been initialized
         self.vega_positions = {}  # Track vega strategy positions: {trade_id: position_data}
         self.vega_scan_results = []  # Store scanner results
         self.last_vega_scan_time = None  # Last scan timestamp
@@ -6083,6 +6093,148 @@ class MainWindow(QMainWindow):
         top_row.addWidget(controls_group)
         main_layout.addLayout(top_row)
         
+        # ================================================================
+        # AUTOMATED TRADING CONTROLS
+        # ================================================================
+        # This section creates the comprehensive automated trading system that responds to 
+        # TradeStation strategy signals. The system includes:
+        #
+        # 1. SIDE SELECTION (Long/Short checkboxes):
+        #    - Controls which trading directions are enabled
+        #    - Must have at least one side enabled to activate auto-trading
+        #    - Each side can be independently enabled/disabled
+        #
+        # 2. ENTRY TIMING STRATEGY (Radio-button style mutual exclusivity):
+        #    - Immediate Join: Enter trades immediately based on current TS strategy state
+        #    - Wait for Next Entry: Only enter on new strategy state changes after FLAT
+        #
+        # 3. MASTER ENABLE/DISABLE:
+        #    - Main toggle that activates the entire automation system
+        #    - Validates that at least one side and one timing option is selected
+        #    - Shows clear visual feedback of system status
+        #
+        # 4. POSITION TRACKING:
+        #    - Shows current automated position information
+        #    - Displays which contract type is currently being traded
+        #
+        # 5. SETTINGS PERSISTENCE:
+        #    - All automation settings are automatically saved to settings JSON
+        #    - Settings are restored when the application starts
+        #    - Uses separate boolean variables (ts_auto_long_enabled, etc.) vs UI widgets
+        # ================================================================
+        
+        auto_trading_group = QGroupBox("🤖 Automated Trading Controls")
+        auto_trading_group.setStyleSheet("QGroupBox { font-weight: bold; color: #4CAF50; }")
+        auto_layout = QVBoxLayout(auto_trading_group)
+        
+        # Row 1: Strategy Side Enablement
+        side_row = QHBoxLayout()
+        side_label = QLabel("Strategy Side Enablement:")
+        side_label.setToolTip("Enable which market directions the automation will trade")
+        side_row.addWidget(side_label)
+        
+        self.ts_auto_long_checkbox = QCheckBox("✅ Long")
+        self.ts_auto_long_checkbox.setToolTip(
+            "LONG TRADES: When strategy signals LONG, buy 1st OTM CALL from ATM\n"
+            "• Entry: Buy call 1 strike above ATM using chase give-in logic\n"
+            "• Exit: Sell call immediately when strategy switches to SHORT or FLAT"
+        )
+        side_row.addWidget(self.ts_auto_long_checkbox)
+        
+        self.ts_auto_short_checkbox = QCheckBox("✅ Short") 
+        self.ts_auto_short_checkbox.setToolTip(
+            "SHORT TRADES: When strategy signals SHORT, buy 1st OTM PUT from ATM\n"
+            "• Entry: Buy put 1 strike below ATM using chase give-in logic\n"
+            "• Exit: Sell put immediately when strategy switches to LONG or FLAT"
+        )
+        side_row.addWidget(self.ts_auto_short_checkbox)
+        
+        side_row.addStretch()
+        auto_layout.addLayout(side_row)
+        
+        # Row 2: Entry Timing Strategy
+        timing_row = QHBoxLayout()
+        timing_label = QLabel("Entry Timing Strategy:")
+        timing_label.setToolTip("Control when automation enters trades based on strategy signals")
+        timing_row.addWidget(timing_label)
+        
+        self.ts_immediate_join_checkbox = QCheckBox("⚡ Immediately Join Side")
+        self.ts_immediate_join_checkbox.setToolTip(
+            "IMMEDIATE ENTRY MODE:\n"
+            "• On startup: If strategy shows LONG/SHORT, enter trade immediately\n"
+            "• Uses current strategy state to take position right away\n"
+            "• Good for joining an existing trend\n"
+            "• Risk: May enter at end of a move"
+        )
+        timing_row.addWidget(self.ts_immediate_join_checkbox)
+        
+        self.ts_wait_for_next_entry_checkbox = QCheckBox("⏳ Wait for Next Entry")
+        self.ts_wait_for_next_entry_checkbox.setToolTip(
+            "WAIT FOR SIGNAL CHANGE MODE:\n"
+            "• On startup: Wait and observe, don't trade current state\n"
+            "• Entry: Only when strategy CHANGES from one state to another\n"
+            "• Example: LONG→SHORT or FLAT→LONG triggers new entry\n"
+            "• Good for catching fresh signals\n"
+            "• Lower risk: Avoids stale signals"
+        )
+        timing_row.addWidget(self.ts_wait_for_next_entry_checkbox)
+        
+        timing_row.addStretch()
+        auto_layout.addLayout(timing_row)
+        
+        # Row 3: Master Enable/Status
+        master_row = QHBoxLayout()
+        self.ts_auto_trading_checkbox = QCheckBox("🚀 MASTER: Enable Automated Trading")
+        self.ts_auto_trading_checkbox.setToolTip(
+            "MASTER SWITCH: Enables/disables all automated trading\n"
+            "• When ON: System will place trades based on strategy signals\n"
+            "• When OFF: Only monitors strategy, no trades placed\n"
+            "• Safety: Always check your settings before enabling!"
+        )
+        self.ts_auto_trading_checkbox.setStyleSheet("QCheckBox { font-weight: bold; color: #FF9800; }")
+        master_row.addWidget(self.ts_auto_trading_checkbox)
+        
+        master_row.addStretch()
+        
+        # Trading Status Indicator
+        self.ts_trading_status = QLabel("Status: 🔴 DISABLED")
+        self.ts_trading_status.setStyleSheet("color: #FF5722; font-weight: bold;")
+        master_row.addWidget(self.ts_trading_status)
+        
+        auto_layout.addLayout(master_row)
+        
+        # Row 4: Current Position Info
+        position_info_row = QHBoxLayout()
+        position_info_row.addWidget(QLabel("Current Auto Position:"))
+        
+        self.ts_current_auto_position_label = QLabel("None")
+        self.ts_current_auto_position_label.setStyleSheet("font-weight: bold; color: #2196F3;")
+        position_info_row.addWidget(self.ts_current_auto_position_label)
+        
+        position_info_row.addStretch()
+        auto_layout.addLayout(position_info_row)
+        
+        # Add explanatory note
+        note_label = QLabel(
+            "💡 NOTE: Automation uses 'chase give-in' logic (same as manual trading) to improve fill rates. "
+            "Strategy signals come from TradeStation GlobalDictionary. Ensure strategy is running in TS before enabling."
+        )
+        note_label.setStyleSheet("color: #9E9E9E; font-size: 11px; font-style: italic;")
+        note_label.setWordWrap(True)
+        auto_layout.addWidget(note_label)
+        
+        main_layout.addWidget(auto_trading_group)
+        
+        # Connect checkbox logic (mutual exclusivity for timing)
+        self.ts_auto_long_checkbox.toggled.connect(self.on_auto_long_toggled)
+        self.ts_auto_short_checkbox.toggled.connect(self.on_auto_short_toggled)
+        self.ts_immediate_join_checkbox.toggled.connect(self.on_immediate_join_toggled)
+        self.ts_wait_for_next_entry_checkbox.toggled.connect(self.on_wait_for_entry_toggled)
+        self.ts_auto_trading_checkbox.toggled.connect(self.on_auto_trading_toggled)
+        
+        # Load saved settings into UI controls after creating widgets
+        self.sync_ts_automation_ui_from_settings()
+        
         # Refresh Chains Button
         refresh_layout = QHBoxLayout()
         self.refresh_ts_chains_btn = QPushButton("Refresh Option Chains")
@@ -7192,21 +7344,12 @@ class MainWindow(QMainWindow):
         # Check for initial calibration or normal drift
         is_initial_calibration = not calibration_done
         
-        # DEBUG: Log calibration status for troubleshooting
-        logger.info(f"🔍 [TS {contract_type}] Drift check: ATM={atm_strike:.0f}, Center={center_strike:.0f}, "
-                   f"Drift={drift_strikes:.1f} strikes, InitialCalib={is_initial_calibration}, CalibDone={calibration_done}")
-        
-        # For TS chains: use consistent thresholds since cascade-loaded chains are marked as calibration_done
+        # For TS chains: use normal thresholds since cascade-loaded chains are marked as calibration_done
         # Only manually loaded chains will go through initial calibration
-        # Both 0DTE and 1DTE should behave consistently when cascade-loaded
-        
-        # IMPORTANT: Cascade-loaded chains should have calibration_done=True and should NOT recenter
-        # If we're seeing initial calibration on cascade-loaded chains, there's a timing/setup issue
-        if is_initial_calibration:
-            logger.warning(f"🚨 [TS {contract_type}] WARNING: Initial calibration triggered on TS chain! "
-                          f"This suggests cascade loading didn't properly set calibration_done=True")
-        
-        initial_calibration_threshold = 5  # Conservative: only recenter if 5+ strikes off (likely data error)
+        if contract_type == "1DTE":
+            initial_calibration_threshold = 1  # Recenter if off by even 1 strike
+        else:  # 0DTE  
+            initial_calibration_threshold = 2  # 0DTE: allow 2 strikes tolerance
         
         should_recenter = False
         reason = ""
@@ -9217,6 +9360,21 @@ class MainWindow(QMainWindow):
                 'trade_ema_length': self.trade_ema_length,
                 'trade_z_period': self.trade_z_period,
                 'trade_z_threshold': self.trade_z_threshold,
+                
+                # TradeStation Automated Trading Settings
+                # These boolean settings control the automated trading system behavior:
+                # - ts_auto_trading_enabled: Master enable/disable for entire automation
+                # - ts_auto_long_enabled: Enable automated long (call) trades  
+                # - ts_auto_short_enabled: Enable automated short (put) trades
+                # - ts_immediate_join: Enter trades immediately based on current TS state
+                # - ts_wait_for_next_entry: Wait for TS state changes after FLAT before entering
+                # - ts_last_strategy_state: Track last known TS strategy state (LONG/SHORT/FLAT)
+                'ts_auto_trading_enabled': self.ts_auto_trading_enabled,
+                'ts_auto_long_enabled': self.ts_auto_long_enabled, 
+                'ts_auto_short_enabled': self.ts_auto_short_enabled,
+                'ts_immediate_join': self.ts_immediate_join,
+                'ts_wait_for_next_entry': self.ts_wait_for_next_entry,
+                'ts_last_strategy_state': self.ts_last_strategy_state,
             }
             
             Path(self.get_environment_file_path('settings.json')).write_text(json.dumps(settings, indent=2))
@@ -9717,6 +9875,209 @@ class MainWindow(QMainWindow):
         contract_type = self.get_ts_active_contract_type()
         self.ts_active_contract_type = contract_type
         self.ts_active_contract_label.setText(contract_type)
+    
+    # ========================================
+    # AUTOMATED TRADING CALLBACK METHODS
+    # ========================================
+    
+    # ================================================================
+    # AUTOMATED TRADING CALLBACK METHODS
+    # ================================================================
+    # These methods handle the automation control UI callbacks and implement
+    # the business logic for the automated trading system:
+    #
+    # NAMING CONVENTION:
+    # - Widget objects: ts_auto_long_checkbox, ts_auto_short_checkbox, etc.
+    # - Boolean settings: ts_auto_long_enabled, ts_auto_short_enabled, etc.
+    # - This separation prevents attribute conflicts between PyQt6 widgets and settings
+    #
+    # MUTUAL EXCLUSIVITY:
+    # - Entry timing checkboxes (Immediate Join vs Wait for Entry) are mutually exclusive
+    # - Implemented by unchecking the other when one is checked
+    #
+    # VALIDATION:
+    # - Master auto-trading toggle validates that at least one side is enabled
+    # - Master toggle validates that one entry timing option is selected
+    # - Settings are automatically saved after each change
+    #
+    # SETTINGS PERSISTENCE:
+    # - All boolean settings are saved to environment-specific settings JSON
+    # - UI state is restored on application startup via sync_ts_automation_ui_from_settings()
+    # ================================================================
+    
+    def on_auto_long_toggled(self, checked: bool):
+        """Handle Long side checkbox toggle"""
+        # Update settings value
+        self.ts_auto_long_enabled = checked
+        
+        if checked:
+            self.log_message("✅ Long side automated trading ENABLED", "INFO")
+        else:
+            self.log_message("❌ Long side automated trading DISABLED", "INFO")
+            
+        # Check if master auto-trading needs to be disabled
+        if not (self.ts_auto_long_checkbox.isChecked() or self.ts_auto_short_checkbox.isChecked()):
+            # No sides enabled, disable master
+            self.ts_auto_trading_checkbox.blockSignals(True)
+            self.ts_auto_trading_checkbox.setChecked(False)
+            self.ts_auto_trading_checkbox.blockSignals(False)
+            self.ts_auto_trading_enabled = False
+            self.log_message("🛑 Master auto-trading disabled (no sides enabled)", "INFO")
+            
+        # Save settings
+        self.save_settings()
+    
+    def on_auto_short_toggled(self, checked: bool):
+        """Handle Short side checkbox toggle"""
+        # Update settings value
+        self.ts_auto_short_enabled = checked
+        
+        if checked:
+            self.log_message("✅ Short side automated trading ENABLED", "INFO")
+        else:
+            self.log_message("❌ Short side automated trading DISABLED", "INFO")
+            
+        # Check if master auto-trading needs to be disabled
+        if not (self.ts_auto_long_checkbox.isChecked() or self.ts_auto_short_checkbox.isChecked()):
+            # No sides enabled, disable master
+            self.ts_auto_trading_checkbox.blockSignals(True)
+            self.ts_auto_trading_checkbox.setChecked(False)
+            self.ts_auto_trading_checkbox.blockSignals(False)
+            self.ts_auto_trading_enabled = False
+            self.log_message("🛑 Master auto-trading disabled (no sides enabled)", "INFO")
+            
+        # Save settings
+        self.save_settings()
+
+    def on_immediate_join_toggled(self, checked: bool):
+        """Handle Immediate Join checkbox toggle - mutual exclusivity with Wait for Entry"""
+        if checked:
+            # If immediate join is checked, uncheck wait for entry
+            self.ts_wait_for_next_entry_checkbox.blockSignals(True)
+            self.ts_wait_for_next_entry_checkbox.setChecked(False)
+            self.ts_wait_for_next_entry_checkbox.blockSignals(False)
+            
+            self.log_message("✅ Auto-trading mode: IMMEDIATE JOIN - Will enter trades based on current strategy state", "INFO")
+        
+        # Update settings values 
+        self.ts_immediate_join = checked
+        self.ts_wait_for_next_entry = not checked if checked else self.ts_wait_for_next_entry
+        
+        # Save settings
+        self.save_settings()
+    
+    def on_wait_for_entry_toggled(self, checked: bool):
+        """Handle Wait for Entry checkbox toggle - mutual exclusivity with Immediate Join"""
+        if checked:
+            # If wait for entry is checked, uncheck immediate join
+            self.ts_immediate_join_checkbox.blockSignals(True) 
+            self.ts_immediate_join_checkbox.setChecked(False)
+            self.ts_immediate_join_checkbox.blockSignals(False)
+            
+            self.log_message("⏳ Auto-trading mode: WAIT FOR NEXT ENTRY - Will wait for strategy signal changes", "INFO")
+        
+        # Update settings values
+        self.ts_wait_for_next_entry = checked
+        self.ts_immediate_join = not checked if checked else self.ts_immediate_join
+        
+        # Save settings
+        self.save_settings()
+    
+    def on_auto_trading_toggled(self, checked: bool):
+        """Handle master auto-trading toggle"""
+        if checked:
+            # Validate settings before enabling
+            if not (self.ts_auto_long_checkbox.isChecked() or self.ts_auto_short_checkbox.isChecked()):
+                self.log_message("❌ Cannot enable auto-trading: No sides enabled (Long/Short)", "WARNING")
+                self.ts_auto_trading_checkbox.blockSignals(True)
+                self.ts_auto_trading_checkbox.setChecked(False)
+                self.ts_auto_trading_checkbox.blockSignals(False)
+                return
+            
+            if not (self.ts_immediate_join_checkbox.isChecked() or self.ts_wait_for_next_entry_checkbox.isChecked()):
+                self.log_message("❌ Cannot enable auto-trading: No entry timing selected", "WARNING")
+                self.ts_auto_trading_checkbox.blockSignals(True)
+                self.ts_auto_trading_checkbox.setChecked(False)
+                self.ts_auto_trading_checkbox.blockSignals(False)
+                return
+                
+            # All validations passed
+            self.ts_trading_status.setText("Status: 🟢 ENABLED")
+            self.ts_trading_status.setStyleSheet("color: #4CAF50; font-weight: bold;")
+            self.log_message("🚀 AUTOMATED TRADING ENABLED - System will respond to TS strategy signals", "SUCCESS")
+            
+            # If immediate join is enabled, check current strategy state and enter if needed
+            if self.ts_immediate_join_checkbox.isChecked():
+                QTimer.singleShot(1000, self.check_immediate_entry_on_startup)
+                
+        else:
+            # Disabled
+            self.ts_trading_status.setText("Status: 🔴 DISABLED")
+            self.ts_trading_status.setStyleSheet("color: #FF5722; font-weight: bold;")
+            self.log_message("🛑 Automated trading DISABLED", "INFO")
+        
+        # Update settings value
+        self.ts_auto_trading_enabled = checked
+        
+        # Save settings
+        self.save_settings()
+    
+    def check_immediate_entry_on_startup(self):
+        """Check if we should immediately enter a trade based on current TS strategy state"""
+        try:
+            # This will be implemented when we add the actual TS strategy reading logic
+            self.log_message("🔍 Checking current TS strategy state for immediate entry...", "INFO")
+            
+            # TODO: Implement TS strategy reading and immediate entry logic
+            # For now, just log that the check happened
+            current_strategy_state = "FLAT"  # Placeholder - will read from TS GlobalDictionary
+            self.log_message(f"Current TS strategy state: {current_strategy_state}", "INFO")
+            
+        except Exception as e:
+            logger.error(f"Error checking immediate entry: {e}", exc_info=True)
+            self.log_message(f"Error checking immediate entry: {e}", "ERROR")
+    
+    def sync_ts_automation_ui_from_settings(self):
+        """Sync TradeStation automation UI controls with loaded settings"""
+        try:
+            # Block signals while updating to avoid triggering callbacks during setup
+            self.ts_auto_long_checkbox.blockSignals(True)
+            self.ts_auto_short_checkbox.blockSignals(True)
+            self.ts_immediate_join_checkbox.blockSignals(True)
+            self.ts_wait_for_next_entry_checkbox.blockSignals(True)
+            self.ts_auto_trading_checkbox.blockSignals(True)
+            
+            # Set checkbox states from loaded settings (widget.setChecked(boolean_value))
+            self.ts_auto_long_checkbox.setChecked(self.ts_auto_long_enabled)
+            self.ts_auto_short_checkbox.setChecked(self.ts_auto_short_enabled)
+            self.ts_immediate_join_checkbox.setChecked(self.ts_immediate_join)
+            self.ts_wait_for_next_entry_checkbox.setChecked(self.ts_wait_for_next_entry)
+            self.ts_auto_trading_checkbox.setChecked(self.ts_auto_trading_enabled)
+            
+            # Update status display
+            if self.ts_auto_trading_enabled:
+                self.ts_trading_status.setText("Status: 🟢 ENABLED")
+                self.ts_trading_status.setStyleSheet("color: #4CAF50; font-weight: bold;")
+            else:
+                self.ts_trading_status.setText("Status: 🔴 DISABLED")
+                self.ts_trading_status.setStyleSheet("color: #FF5722; font-weight: bold;")
+                
+            # Update current position display
+            self.ts_current_auto_position_label.setText("None")  # Will be updated by position tracking
+            
+            # Re-enable signals
+            self.ts_auto_long_checkbox.blockSignals(False)
+            self.ts_auto_short_checkbox.blockSignals(False)
+            self.ts_immediate_join_checkbox.blockSignals(False)
+            self.ts_wait_for_next_entry_checkbox.blockSignals(False)
+            self.ts_auto_trading_checkbox.blockSignals(False)
+            
+            logger.info(f"TS automation UI synced: enabled={self.ts_auto_trading_enabled}, "
+                       f"long={self.ts_auto_long_enabled}, short={self.ts_auto_short_enabled}, "
+                       f"immediate={self.ts_immediate_join}, wait={self.ts_wait_for_next_entry}")
+            
+        except Exception as e:
+            logger.error(f"Error syncing TS automation UI: {e}", exc_info=True)
     
     def request_ts_chain(self, contract_type: str, force_center_strike: float | None = None):
         """Request option chain data for specified contract type (0DTE or 1DTE) - works like main chain
@@ -10690,6 +11051,17 @@ class MainWindow(QMainWindow):
                 self.trade_ema_spin.setValue(self.trade_ema_length)
                 self.trade_z_period_spin.setValue(self.trade_z_period)
                 self.trade_z_threshold_spin.setValue(self.trade_z_threshold)
+                
+                # TradeStation Automated Trading Settings
+                self.ts_auto_trading_enabled = settings.get('ts_auto_trading_enabled', False)
+                self.ts_auto_long_enabled = settings.get('ts_auto_long_enabled', True)
+                self.ts_auto_short_enabled = settings.get('ts_auto_short_enabled', True)
+                self.ts_immediate_join = settings.get('ts_immediate_join', False)
+                self.ts_wait_for_next_entry = settings.get('ts_wait_for_next_entry', True)
+                self.ts_last_strategy_state = settings.get('ts_last_strategy_state', 'FLAT')
+                
+                # Update TradeStation Automated Trading UI (will be set after tab creation)
+                # Note: Widget updates are deferred until after TradeStation tab is created
                 
                 # Note: Chart interval/days are NOT restored from settings
                 # All charts default to: 1 min interval, 2 days of data, 12 hours view
