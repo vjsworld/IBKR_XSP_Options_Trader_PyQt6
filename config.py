@@ -68,14 +68,15 @@ ENV_CONFIG = {
     'development': {
         # Connection settings
         'client_id_start': 100,           # Different client IDs to avoid conflicts
-        'port': 7497,                     # Paper trading port
+        'client_id_end': 199,
+        'ibkr_port': 7497,                # Paper trading port
         'host': '127.0.0.1',
         'auto_connect': False,            # Manual connection for safety
         
         # File paths (separate from production)
         'settings_file': 'settings_dev.json',
         'positions_file': 'positions_dev.json',
-        'log_dir': 'logs/dev',
+        'log_dir': 'logs_dev',
         'log_prefix': 'DEV_',
         
         # Logging
@@ -93,7 +94,7 @@ ENV_CONFIG = {
         'theme_accent': '#FF4444',
         
         # TradeStation
-        'ts_dict_name': 'IBKR-TRADER-DEV', # Different dictionary name
+        'tradestation_dict_name': 'IBKR-TRADER',  # Same dictionary name for both environments
         'ts_auto_connect': False,         # Manual TS connection in dev
         
         # Feature flags
@@ -104,14 +105,15 @@ ENV_CONFIG = {
     'production': {
         # Connection settings
         'client_id_start': 1,             # Production client IDs
-        'port': 7497,                     # Usually paper, but configurable
+        'client_id_end': 99,
+        'ibkr_port': 7496,                # Live trading port
         'host': '127.0.0.1',
         'auto_connect': True,             # Auto-connect for trading
         
         # File paths
-        'settings_file': 'settings.json',
-        'positions_file': 'positions.json',
-        'log_dir': 'logs/prod',
+        'settings_file': 'settings_prod.json',
+        'positions_file': 'positions_prod.json',
+        'log_dir': 'logs_prod',
         'log_prefix': 'PROD_',
         
         # Logging
@@ -129,7 +131,7 @@ ENV_CONFIG = {
         'theme_accent': '#00AA00',
         
         # TradeStation
-        'ts_dict_name': 'IBKR-TRADER',    # Production dictionary name
+        'tradestation_dict_name': 'IBKR-TRADER',  # Same dictionary name for both environments
         'ts_auto_connect': True,          # Auto-connect in production
         
         # Feature flags
@@ -207,22 +209,22 @@ def create_environment_marker(env_type: str) -> None:
 
 def get_environment_info() -> str:
     """Get formatted environment information string"""
-    info = [
+    info_lines = [
         f"🔧 Environment: {config.environment.upper()}",
         f"🖥️  Hostname: {socket.gethostname()}",
         f"📁 Settings: {current_config['settings_file']}",
         f"📊 Positions: {current_config['positions_file']}",
-        f"🔌 Port: {current_config['port']}",
+        f"🔌 Port: {current_config['ibkr_port']}",
         f"🆔 Client ID Start: {current_config['client_id_start']}",
-        f"📡 TradeStation Dict: {current_config['ts_dict_name']}",
+        f"📡 TradeStation Dict: {current_config['tradestation_dict_name']}"
     ]
     
     if config.is_production:
-        info.append("🚨 LIVE TRADING ENVIRONMENT")
+        info_lines.append("🚨 LIVE TRADING ENVIRONMENT")
     else:
-        info.append("🧪 DEVELOPMENT ENVIRONMENT")
+        info_lines.append("🧪 DEVELOPMENT ENVIRONMENT")
         
-    return '\n'.join(info)
+    return '\n'.join(info_lines)
 
 
 if __name__ == "__main__":

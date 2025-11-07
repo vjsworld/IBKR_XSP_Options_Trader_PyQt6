@@ -2724,7 +2724,7 @@ class MainWindow(QMainWindow):
                 'ibkr_port': 7497,
                 'client_id_start': 1,
                 'client_id_end': 10,
-                'tradestation_dict_name': 'TEST_IBKR_TRADER'
+                'tradestation_dict_name': 'IBKR-TRADER'
             }
             self.environment_name = 'fallback'
             logger.warning("Using fallback environment configuration")
