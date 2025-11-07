@@ -50,10 +50,11 @@ Successfully implemented a comprehensive environment separation system that allo
 - **File isolation**: Complete separation of settings and positions
 
 ### 📁 File Management
-- **Complete file separation**: No shared files between environments
+- **Smart file separation**: Data files separated, infrastructure shared
 - **Environment-aware persistence**: Settings and positions saved to correct files
 - **Backup integration**: Safe deployment with automatic backups
 - **Log separation**: Different directories and prefixes for easy identification
+- **Shared infrastructure**: One virtual environment and TradeStation dictionary for both environments
 
 ## Files Created/Modified
 
@@ -72,6 +73,16 @@ Successfully implemented a comprehensive environment separation system that allo
    - Visual environment indicators
 
 ## Technical Implementation Details
+
+### Shared Infrastructure Philosophy
+**DESIGN PRINCIPLE**: Separate what affects runtime behavior, share what can be shared safely.
+
+- ✅ **SHARED**: Virtual environment (`.venv/`) - same Python packages for both
+- ✅ **SHARED**: TradeStation GlobalDictionary name - same `'IBKR-TRADER'` key
+- ✅ **SHARED**: Core application code - same functionality, different configuration
+- 🔄 **SEPARATED**: Runtime configuration (ports, client IDs, files)
+- 🔄 **SEPARATED**: Data persistence (settings, positions, logs)
+- 🔄 **SEPARATED**: Trading safety features and approvals
 
 ### Environment Detection Logic
 ```python

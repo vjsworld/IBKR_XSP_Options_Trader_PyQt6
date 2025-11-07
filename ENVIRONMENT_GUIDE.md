@@ -111,12 +111,13 @@ Create these files in the project directory for explicit environment control:
 
 ## File Separation
 
-Each environment maintains completely separate files:
+Each environment maintains completely separate files while sharing common infrastructure:
 
 ```
 Project Directory/
 ├── main.py                 # Main application
 ├── config.py              # Environment configuration
+├── .venv/                 # SHARED: One virtual environment for both environments
 ├── settings_dev.json      # Development settings
 ├── settings_prod.json     # Production settings
 ├── positions_dev.json     # Development positions
@@ -126,6 +127,21 @@ Project Directory/
 ├── .env_dev               # Force development (optional)
 └── .env_prod              # Force production (optional)
 ```
+
+### Shared Infrastructure Philosophy
+
+**SHARED COMPONENTS** (Same for both environments):
+- **Virtual Environment (`.venv/`)**: Both environments use identical Python packages
+- **TradeStation GlobalDictionary**: Both use `'IBKR-TRADER'` dictionary name
+- **Core Application Code**: Same `main.py` and `config.py` files
+
+**SEPARATED COMPONENTS** (Different per environment):
+- **Configuration Files**: Separate settings and positions
+- **Client ID Ranges**: Dev (100-199) vs Prod (1-99) 
+- **IBKR Ports**: Dev (7497 paper) vs Prod (7496 live)
+- **Log Directories**: Separate logging for each environment
+
+This approach provides **clean separation where it matters** (runtime behavior, data isolation) while **sharing infrastructure where it makes sense** (dependencies, core code, TradeStation integration).
 
 ## TradeStation Integration
 

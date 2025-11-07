@@ -63,10 +63,34 @@ The application is almost entirely contained within the monolithic `main.py` fil
 - **Quick Trading**: `Ctrl+Click` on a bid or ask cell in the option chain triggers an immediate trade.
 - **Position Closing**: Clicking the "Close" button on the positions table triggers an immediate exit order, also using the mid-price chasing logic.
 
-## 4. Data Persistence
+## 4. Data Persistence & Environment Separation
 
-- **`settings.json`**: Stores user-configurable settings like connection details, UI preferences, strategy parameters, and the crucial `es_to_cash_offset`. Loaded by `load_settings()` and saved by `save_settings()`.
-- **`positions.json`**: Stores currently open positions. Its primary purpose is to persist the `entryTime` of a position across application restarts, allowing for accurate time-in-trade tracking.
+### Environment-Aware Architecture
+The application supports development/production environment separation with **shared infrastructure philosophy**:
+
+**SHARED COMPONENTS** (Same for both environments):
+- **Virtual Environment (`.venv/`)**: One virtual environment with same Python packages
+- **TradeStation GlobalDictionary**: Both environments use `'IBKR-TRADER'` dictionary name
+- **Core Application Files**: Same `main.py`, `config.py`, and source code
+
+**SEPARATED COMPONENTS** (Different per environment):
+- **Settings Files**: `settings_dev.json` vs `settings_prod.json`
+- **Position Files**: `positions_dev.json` vs `positions_prod.json` 
+- **Log Directories**: `logs_dev/` vs `logs_prod/`
+- **Client ID Ranges**: Development (100-199) vs Production (1-99)
+- **IBKR Ports**: Development (7497 paper) vs Production (7496 live)
+
+### Environment-Specific Files
+- **Settings**: Environment-specific settings files store user-configurable settings like connection details, UI preferences, strategy parameters, and the crucial `es_to_cash_offset`. Loaded by `load_settings()` and saved by `save_settings()` using environment-aware file paths.
+- **Positions**: Environment-specific position files store currently open positions. Their primary purpose is to persist the `entryTime` of a position across application restarts, allowing for accurate time-in-trade tracking per environment.
+
+### CRITICAL: Maintain Shared Infrastructure Philosophy
+When making changes, always respect the shared infrastructure approach:
+- ✅ **DO**: Keep one `.venv/` virtual environment for both dev/prod
+- ✅ **DO**: Use same `'IBKR-TRADER'` TradeStation GlobalDictionary name for both
+- ✅ **DO**: Separate data files (settings, positions, logs) by environment
+- ❌ **DON'T**: Create separate virtual environments or TradeStation dictionaries
+- ❌ **DON'T**: Mix development and production data in same files
 
 ## 5. How to Make Changes
 

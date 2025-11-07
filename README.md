@@ -270,6 +270,33 @@ IBKR XSP Option Trader1 (PyQt6)/
 - Understand options expiration mechanics
 - Have a clear exit strategy
 
+## Environment Separation
+
+### Development vs Production
+The application supports automatic environment detection for safe development and live trading:
+
+**🔧 SHARED INFRASTRUCTURE** (Optimal approach):
+- **Virtual Environment**: One `.venv/` for both environments (same dependencies)
+- **TradeStation Dictionary**: Both use `'IBKR-TRADER'` (no strategy changes needed)
+- **Core Code**: Same application files with environment-aware configuration
+
+**🔄 SEPARATED COMPONENTS** (Safety isolation):
+- **Client IDs**: Dev (100-199) vs Prod (1-99) - zero conflicts
+- **Ports**: Dev (7497 paper) vs Prod (7496 live) 
+- **Files**: `settings_dev.json` vs `settings_prod.json`
+- **Logs**: `logs_dev/` vs `logs_prod/` directories
+
+### Quick Environment Commands
+```bash
+# Check current environment
+python config.py info
+
+# Deploy to production (when ready)
+python deploy_production.py
+```
+
+**📚 Complete Guide**: See `ENVIRONMENT_GUIDE.md` for detailed setup instructions.
+
 ## Support
 
 ### Resources
@@ -277,6 +304,8 @@ IBKR XSP Option Trader1 (PyQt6)/
 - **PyQt6 Docs**: https://doc.qt.io/qtforpython-6/
 - **matplotlib**: https://matplotlib.org/
 - **mplfinance**: https://github.com/matplotlib/mplfinance
+- **Environment Guide**: See `ENVIRONMENT_GUIDE.md`
+- **Architecture Decisions**: See `ADR_SHARED_INFRASTRUCTURE.md`
 - **Copilot Instructions**: See `copilot-instructions.md`
 
 ### Common Questions
