@@ -7192,12 +7192,21 @@ class MainWindow(QMainWindow):
         # Check for initial calibration or normal drift
         is_initial_calibration = not calibration_done
         
-        # For TS chains: use normal thresholds since cascade-loaded chains are marked as calibration_done
+        # DEBUG: Log calibration status for troubleshooting
+        logger.info(f"🔍 [TS {contract_type}] Drift check: ATM={atm_strike:.0f}, Center={center_strike:.0f}, "
+                   f"Drift={drift_strikes:.1f} strikes, InitialCalib={is_initial_calibration}, CalibDone={calibration_done}")
+        
+        # For TS chains: use consistent thresholds since cascade-loaded chains are marked as calibration_done
         # Only manually loaded chains will go through initial calibration
-        if contract_type == "1DTE":
-            initial_calibration_threshold = 1  # Recenter if off by even 1 strike
-        else:  # 0DTE  
-            initial_calibration_threshold = 2  # 0DTE: allow 2 strikes tolerance
+        # Both 0DTE and 1DTE should behave consistently when cascade-loaded
+        
+        # IMPORTANT: Cascade-loaded chains should have calibration_done=True and should NOT recenter
+        # If we're seeing initial calibration on cascade-loaded chains, there's a timing/setup issue
+        if is_initial_calibration:
+            logger.warning(f"🚨 [TS {contract_type}] WARNING: Initial calibration triggered on TS chain! "
+                          f"This suggests cascade loading didn't properly set calibration_done=True")
+        
+        initial_calibration_threshold = 5  # Conservative: only recenter if 5+ strikes off (likely data error)
         
         should_recenter = False
         reason = ""
