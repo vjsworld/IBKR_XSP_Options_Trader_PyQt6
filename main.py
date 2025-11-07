@@ -116,6 +116,11 @@ def setup_environment_logging():
     Update logging configuration based on environment
     Called after environment config is loaded
     """
+    import logging
+    from logging.handlers import RotatingFileHandler
+    from pathlib import Path
+    from datetime import datetime
+    
     try:
         # Import here to avoid circular imports
         from config import config, current_config
@@ -174,10 +179,9 @@ def setup_environment_logging():
         
     except Exception as e:
         # Fall back to original logging if environment setup fails
+        logger = logging.getLogger("SPXTrader")
         logger.warning(f"Failed to setup environment logging: {e}")
         logger.warning("Using default logging configuration")
-
-
 # Initialize logger (will be used throughout the app)
 logger = setup_logging()
 
@@ -2699,7 +2703,7 @@ class MainWindow(QMainWindow):
             
             logger.info("="*70)
             logger.info(f"ENVIRONMENT: {self.environment_name.upper()}")
-            logger.info(f"Environment Detection: {config.detection_method}")
+            logger.info(f"Environment Detection: Auto-detected via hostname/files/env vars")
             logger.info(f"Client ID Range: {current_config['client_id_start']}-{current_config['client_id_end']}")
             logger.info(f"IBKR Port: {current_config['ibkr_port']}")
             logger.info("="*70)
@@ -9224,10 +9228,6 @@ class MainWindow(QMainWindow):
             self.log_message(f"TradeStation enable error: {e}", "ERROR")
             logger.error(f"TradeStation enable error: {e}", exc_info=True)
             return False
-            
-        except Exception as e:
-            self.log_message(f"Error enabling TradeStation: {e}", "ERROR")
-            logger.error(f"Error enabling TradeStation: {e}", exc_info=True)
     
     def disable_tradestation(self):
         """Disable TradeStation integration (for cleanup only)"""

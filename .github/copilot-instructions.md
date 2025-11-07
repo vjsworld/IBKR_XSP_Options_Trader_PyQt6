@@ -6,6 +6,13 @@ This document provides instructions for AI coding assistants to effectively cont
 
 This is a specialized trading application for SPX and XSP options on the Interactive Brokers (IBKR) platform. It is built with Python and uses the PyQt6 framework for the graphical user interface. The application focuses on providing tools for 0DTE (zero days to expiration) option trading, including a real-time option chain, charting, and both manual and automated trading capabilities.
 
+### Key Technologies
+- **PyQt6**: Modern GUI framework with native performance and thread safety
+- **IBKR API** (`ibapi`): Professional-grade market data and order execution
+- **matplotlib/mplfinance**: Industry-standard financial charting
+- **TradeStation GlobalDictionary**: COM interface for strategy integration
+- **Environment Separation**: Development/production isolation with shared infrastructure
+
 ## 2. Core Architecture
 
 The application is almost entirely contained within the monolithic `main.py` file. Understanding its structure is key to making any changes.
@@ -92,17 +99,83 @@ When making changes, always respect the shared infrastructure approach:
 - ❌ **DON'T**: Create separate virtual environments or TradeStation dictionaries
 - ❌ **DON'T**: Mix development and production data in same files
 
-## 5. How to Make Changes
+## 4.5. TradeStation Integration
 
-1.  **Identify the Logic**: Since most code is in `main.py`, use text search to find the relevant methods or variables.
-2.  **Respect the Threading Model**:
-    - If you are adding a new piece of data from the IBKR API (i.e., from a callback in `IBKRWrapper`), you **must** add a new `pyqtSignal` to `IBKRSignals`.
-    - Emit this signal from the `IBKRWrapper` method.
-    - Create a new slot (a method decorated with `@pyqtSlot(...)`) in `MainWindow` to receive the signal and update the UI or `self.app_state`.
-    - **Never directly call a UI update method from `IBKRWrapper` or `IBKRThread`.**
-3.  **Use the Central State**: Read from and write to `self.app_state` for managing application state.
-4.  **Use the Logging Functions**: Use `self.log_message()` to print status updates to the in-app log. Use the `logger` object for more detailed, file-based logging.
-5.  **Follow Naming Conventions**:
-    - IBKR callback handlers in `IBKRWrapper` are named `on_*` (e.g., `on_position_update`).
-    - `MainWindow` slots that handle signals are also often named `on_*` (e.g., `on_market_data_tick`).
-    - Contract keys are strings formatted as `{SYMBOL}_{STRIKE}_{RIGHT}_{EXPIRY}` (e.g., `XSP_535_P_20251103`).
+**Optional External Dependency**: The application integrates with TradeStation via COM interface:
+
+**Key Integration Points:**
+- **GlobalDictionary Module**: `import GlobalDictionary` (COM interface to TradeStation)  
+- **Dictionary Name**: Both environments use `'IBKR-TRADER'` (shared infrastructure)
+- **Graceful Degradation**: Application works fully without TradeStation installed
+- **Error Handling**: `TRADESTATION_AVAILABLE` flag controls integration features
+
+**TradeStation Integration Files:**
+- `GlobalDictionary.py` - COM wrapper for TradeStation communication
+- `TradeStation_Example_Indicator.txt` - Example TradeStation strategy code
+- `TS to Python/` directory - TradeStation integration examples and documentation
+
+**If TradeStation is not available**: Application logs warning and disables TradeStation features but continues normal operation.
+
+## 5. Critical Development Workflows
+
+### 5.1. Environment Management
+**ALWAYS check current environment before making changes:**
+```powershell
+python config.py info  # Check current environment and configuration
+```
+
+**Primary Environment Control**: Edit the `ENVIRONMENT_OVERRIDE` variable at the top of `config.py`:
+- Development directory: `ENVIRONMENT_OVERRIDE = 'development'` 
+- Production directory: `ENVIRONMENT_OVERRIDE = 'production'`
+
+**Additional environment commands:**
+- `python config.py set dev` - Force development environment (secondary method)
+- `python config.py set prod` - Force production environment (secondary method) 
+- `python deploy_production.py` - Full production deployment with safety checks
+
+### 5.2. Running the Application
+**Development (Recommended):**
+```powershell
+.\.venv\Scripts\Activate.ps1  # Activate virtual environment
+python main.py               # Run in development mode
+```
+**Prerequisites check:** Ensure IBKR TWS/Gateway is running on correct port (7497 for dev, 7496 for prod)
+
+### 5.3. Debugging and Logging
+- **Live application logs**: Check in-app Activity Log panel
+- **Detailed logs**: Check `logs_dev/` or `logs_prod/` directories  
+- **Log format**: Daily rotation with pattern `YYYY-MM-DD.log`
+- **Timezone**: All timestamps use Central Time (America/Chicago)
+
+## 6. How to Make Changes
+
+### 6.1. Code Location and Search
+1.  **Identify the Logic**: Since most code is in `main.py` (~11,800 lines), use text search to find the relevant methods or variables.
+2.  **Key search patterns**:
+    - `def method_name` - Find specific functions
+    - `class ClassName` - Find class definitions
+    - `contract_key` - Find option contract handling
+    - `@pyqtSlot` - Find signal handler methods
+
+### 6.2. Threading Model (CRITICAL)
+**All IBKR API callbacks run in background thread - GUI updates MUST use signals:**
+1.  Add new `pyqtSignal` to `IBKRSignals` class for any new data from IBKR
+2.  Emit the signal from `IBKRWrapper` method (background thread)
+3.  Create `@pyqtSlot(...)` decorated method in `MainWindow` to receive signal (GUI thread)
+4.  **NEVER directly call UI methods from `IBKRWrapper` or `IBKRThread`**
+
+### 6.3. State Management and Conventions
+- **Central State**: Read from and write to `self.app_state` dictionary in `MainWindow`
+- **Logging**: Use `self.log_message()` for in-app log, `logger` object for file logs
+- **Contract Keys**: Format as `{SYMBOL}_{STRIKE}_{RIGHT}_{EXPIRY}` (e.g., `XSP_535_P_20251103`)
+- **Method Naming**: 
+  - IBKR callbacks: `on_*` (e.g., `on_position_update`)
+  - Signal handlers: `on_*` (e.g., `on_market_data_tick`)
+  - Helper methods: descriptive names (e.g., `find_atm_strike_by_delta`)
+
+### 6.4. Instrument Configuration
+**CRITICAL**: Change `SELECTED_INSTRUMENT` at top of `main.py` to switch between instruments:
+```python
+SELECTED_INSTRUMENT = 'XSP'  # Change to 'SPX' for full-size trading
+```
+This controls all instrument-specific settings, option chains, and trading parameters.

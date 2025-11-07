@@ -1,10 +1,40 @@
 """
 Environment Configuration for IBKR XSP Options Trader
-Automatically detects and configures development vs production environments
+
+🏗️ SHARED INFRASTRUCTURE PHILOSOPHY:
+- Virtual Environment: One .venv/ for both dev/prod (same dependencies)
+- TradeStation Dictionary: Same 'IBKR-TRADER' name (no strategy changes needed)  
+- Core Application: Same code files with environment-aware configuration
+
+🔄 SMART SEPARATION:
+- Data Files: settings_dev.json vs settings_prod.json
+- Client IDs: Dev (100-199) vs Prod (1-99) ranges
+- Ports: Dev (7497 paper) vs Prod (7496 live)
+- Logs: logs_dev/ vs logs_prod/ directories
+
+⚠️ RECOMMENDED DEPLOYMENT:
+For best results, use machine-specific local folders instead of shared Dropbox:
+- Dev Machine: C:\Trading\IBKR_XSP_Trader_DEV\ (local copy)
+- Prod Machine: C:\Trading\IBKR_XSP_Trader_PROD\ (local copy)
+- Code Sharing: Git repo or Dropbox for source code only
+See MIGRATION_TO_LOCAL_FOLDERS.md for complete setup instructions.
 
 Author: Van Gothreaux
 Date: November 2025
 """
+
+# ============================================================================
+# 🔧 ENVIRONMENT OVERRIDE - SET THIS MANUALLY FOR EACH DIRECTORY
+# ============================================================================
+# Set this to 'development' or 'production' to override automatic detection
+# This is the primary method for determining environment
+# 
+# WORKFLOW: Use Git to manage separate dev/prod directories:
+# - Development directory: Set to 'development' (this directory)
+# - Production directory: Set to 'production' 
+# - Use Git to sync code changes between directories
+ENVIRONMENT_OVERRIDE = 'development'  # Change to 'production' in prod directory
+# ============================================================================
 
 import os
 import socket
@@ -13,24 +43,28 @@ from typing import Dict, Any
 
 
 class Config:
-    """Environment configuration class"""
+    """
+    Environment configuration implementing shared infrastructure philosophy
+    
+    Automatically detects environment and provides appropriate configuration
+    while maintaining shared virtual environment and TradeStation dictionary.
+    """
     
     def __init__(self):
         self.environment = self.detect_environment()
         
     def detect_environment(self) -> str:
         """
-        Detect environment based on multiple methods:
-        1. Environment file (.env_prod)
-        2. Computer hostname
-        3. Environment variable
+        Detect environment based on multiple methods (priority order):
+        1. ENVIRONMENT_OVERRIDE variable at top of this file (primary method)
+        2. Environment variable (TRADING_ENV=production|development)
+        3. Computer hostname keywords (prod, dev, trading, test, etc.)
+        4. Default to development (safe fallback)
         """
-        
-        # Method 1: Check for environment file (highest priority)
-        if Path('.env_prod').exists():
-            return 'production'
-        if Path('.env_dev').exists():
-            return 'development'
+            
+        # Method 1: Check ENVIRONMENT_OVERRIDE variable (primary)
+        if ENVIRONMENT_OVERRIDE:
+            return ENVIRONMENT_OVERRIDE.lower()
             
         # Method 2: Check environment variable
         env_override = os.getenv('TRADING_ENV')
@@ -66,17 +100,17 @@ class Config:
 # Environment-specific configurations
 ENV_CONFIG = {
     'development': {
-        # Connection settings
-        'client_id_start': 100,           # Different client IDs to avoid conflicts
+        # Connection settings (SEPARATED: Different ranges/ports per environment)
+        'client_id_start': 100,           # Dev range: 100-199 (no conflicts with prod)
         'client_id_end': 199,
-        'ibkr_port': 7497,                # Paper trading port
+        'ibkr_port': 7497,                # Paper trading port (dev safety)
         'host': '127.0.0.1',
-        'auto_connect': False,            # Manual connection for safety
+        'auto_connect': False,            # Manual connection for development safety
         
-        # File paths (separate from production)
-        'settings_file': 'settings_dev.json',
-        'positions_file': 'positions_dev.json',
-        'log_dir': 'logs_dev',
+        # File paths (SEPARATED: Environment-specific data files)
+        'settings_file': 'settings_dev.json',    # Dev-only settings
+        'positions_file': 'positions_dev.json',  # Dev-only positions
+        'log_dir': 'logs_dev',                   # Dev-only logs
         'log_prefix': 'DEV_',
         
         # Logging
@@ -93,8 +127,8 @@ ENV_CONFIG = {
         'border_color': '#FF0000',        # Red border for dev
         'theme_accent': '#FF4444',
         
-        # TradeStation
-        'tradestation_dict_name': 'IBKR-TRADER',  # Same dictionary name for both environments
+        # TradeStation (SHARED: Same dictionary name for both environments)
+        'tradestation_dict_name': 'IBKR-TRADER',  # SHARED: No strategy changes needed!
         'ts_auto_connect': False,         # Manual TS connection in dev
         
         # Feature flags
@@ -103,17 +137,17 @@ ENV_CONFIG = {
         'show_debug_info': True,
     },
     'production': {
-        # Connection settings
-        'client_id_start': 1,             # Production client IDs
+        # Connection settings (SEPARATED: Different ranges/ports per environment)
+        'client_id_start': 1,             # Prod range: 1-99 (no conflicts with dev)
         'client_id_end': 99,
-        'ibkr_port': 7496,                # Live trading port
+        'ibkr_port': 7496,                # Live trading port (production)
         'host': '127.0.0.1',
-        'auto_connect': True,             # Auto-connect for trading
+        'auto_connect': True,             # Auto-connect for live trading
         
-        # File paths
-        'settings_file': 'settings_prod.json',
-        'positions_file': 'positions_prod.json',
-        'log_dir': 'logs_prod',
+        # File paths (SEPARATED: Environment-specific data files)  
+        'settings_file': 'settings_prod.json',   # Prod-only settings
+        'positions_file': 'positions_prod.json', # Prod-only positions
+        'log_dir': 'logs_prod',                  # Prod-only logs
         'log_prefix': 'PROD_',
         
         # Logging
@@ -130,8 +164,8 @@ ENV_CONFIG = {
         'border_color': '#00FF00',        # Green border for prod
         'theme_accent': '#00AA00',
         
-        # TradeStation
-        'tradestation_dict_name': 'IBKR-TRADER',  # Same dictionary name for both environments
+        # TradeStation (SHARED: Same dictionary name for both environments)
+        'tradestation_dict_name': 'IBKR-TRADER',  # SHARED: No strategy changes needed!
         'ts_auto_connect': True,          # Auto-connect in production
         
         # Feature flags
@@ -140,6 +174,14 @@ ENV_CONFIG = {
         'show_debug_info': False,
     }
 }
+
+# 🏗️ SHARED INFRASTRUCTURE NOTES:
+# - Virtual Environment (.venv/): SHARED between both environments
+# - TradeStation Dictionary: SHARED name 'IBKR-TRADER' (no strategy changes)
+# - Core Application Code: SHARED with environment-aware configuration
+# - Data Files: SEPARATED per environment (settings, positions, logs)
+# - Client IDs: SEPARATED ranges to prevent conflicts
+# - This approach provides optimal separation with minimal complexity
 
 # Global configuration instance
 config = Config()
@@ -160,7 +202,7 @@ def validate_environment() -> list[str]:
         if not Path('trading_approved.flag').exists():
             issues.append("❌ Missing trading_approved.flag file - create this file to confirm production trading approval")
             
-        # Check for conflicting development processes
+        # Check for conflicting development processes (optional - requires psutil)
         try:
             import psutil
             current_pid = os.getpid()
@@ -173,9 +215,8 @@ def validate_environment() -> list[str]:
                             issues.append(f"❌ Another trading instance is running (PID: {proc.info['pid']})")
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
-                    
         except ImportError:
-            issues.append("⚠️  psutil not available - cannot check for conflicting processes")
+            issues.append("⚠️ psutil not installed - cannot check for conflicting processes (optional feature)")
             
         # Check for development files in production environment
         dev_files = ['.env_dev', 'settings_dev.json', 'positions_dev.json']
@@ -192,25 +233,42 @@ def validate_environment() -> list[str]:
             if Path(prod_file).exists():
                 issues.append(f"⚠️  Production file {prod_file} found in development environment")
     
+    # Check for shared folder deployment (affects both environments)
+    current_path = Path.cwd().as_posix().lower()
+    shared_folder_indicators = ['dropbox', 'onedrive', 'googledrive', 'icloud', 'sync']
+    
+    if any(indicator in current_path for indicator in shared_folder_indicators):
+        issues.append("⚠️  Running from shared/cloud folder - consider using machine-specific local folders")
+        issues.append("   📖 See MIGRATION_TO_LOCAL_FOLDERS.md for recommended setup")
+        issues.append(f"   📂 Current path: {Path.cwd()}")
+    
     return issues
 
 
 def create_environment_marker(env_type: str) -> None:
-    """Create environment marker file"""
+    """
+    Create environment marker file
+    NOTE: With ENVIRONMENT_OVERRIDE variable, this is less needed but kept for compatibility
+    """
     if env_type == 'production':
         Path('.env_prod').touch()
         if Path('.env_dev').exists():
             Path('.env_dev').unlink()
+        print(f"⚠️  Note: ENVIRONMENT_OVERRIDE variable is set to '{ENVIRONMENT_OVERRIDE}'")
+        print("   Update the variable at the top of config.py for primary control")
     elif env_type == 'development':
         Path('.env_dev').touch()
         if Path('.env_prod').exists():
             Path('.env_prod').unlink()
+        print(f"⚠️  Note: ENVIRONMENT_OVERRIDE variable is set to '{ENVIRONMENT_OVERRIDE}'")
+        print("   Update the variable at the top of config.py for primary control")
 
 
 def get_environment_info() -> str:
     """Get formatted environment information string"""
     info_lines = [
         f"🔧 Environment: {config.environment.upper()}",
+        f"⚙️  Override Variable: {ENVIRONMENT_OVERRIDE}",
         f"🖥️  Hostname: {socket.gethostname()}",
         f"📁 Settings: {current_config['settings_file']}",
         f"📊 Positions: {current_config['positions_file']}",
