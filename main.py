@@ -5184,10 +5184,10 @@ class MainWindow(QMainWindow):
         
         # Prefer call-based ATM, fallback to put-based ATM
         if atm_call_strike > 0:
-            logger.debug(f"ATM strike identified by CALL delta: {atm_call_strike} (delta diff: {min_call_diff:.4f})")
+            logger.info(f"✅ ATM strike identified by CALL delta: {atm_call_strike} (delta diff: {min_call_diff:.4f})")
             return atm_call_strike
         elif atm_put_strike > 0:
-            logger.debug(f"ATM strike identified by PUT delta: {atm_put_strike} (delta diff: {min_put_diff:.4f})")
+            logger.info(f"✅ ATM strike identified by PUT delta: {atm_put_strike} (delta diff: {min_put_diff:.4f})")
             return atm_put_strike
         else:
             logger.debug("No ATM strike found by delta - waiting for greeks data")
@@ -5367,7 +5367,11 @@ class MainWindow(QMainWindow):
         self.update_option_chain_cell(contract_key)
         
         # Also update TS chain tables if this contract belongs to a TS expiry
-        self.update_ts_chain_cell(contract_key)
+        try:
+            self.update_ts_chain_cell(contract_key)
+        except Exception as e:
+            logger.debug(f"Error updating TS chain cell for {contract_key}: {e}")
+            # Don't let TS errors block the main chain ATM calculation
         
         # Update strike backgrounds based on delta-identified ATM
         # Throttle this to run at most once per second to avoid excessive recentering checks
@@ -6315,6 +6319,26 @@ class MainWindow(QMainWindow):
         self.log_message("Refreshing option chain...", "INFO")
         self.request_option_chain()
     
+    def recenter_chain_on_atm(self):
+        """Manually recenter the option chain on the current ATM strike"""
+        atm_strike = self.find_atm_strike_by_delta()
+        if atm_strike > 0:
+            self.log_message(f"Manual recentering: ATM detected at {atm_strike:.0f}", "INFO")
+            self.request_option_chain(force_center_strike=atm_strike)
+        else:
+            # Use current underlying price as fallback
+            current_price = self.app_state.get('underlying_price', 0)
+            if current_price == 0:
+                current_price = self.get_adjusted_es_price()
+            
+            if current_price > 0:
+                strike_increment = self.instrument['strike_increment']
+                center_strike = round(current_price / strike_increment) * strike_increment
+                self.log_message(f"Manual recentering: Using current price {current_price:.2f} → strike {center_strike:.0f}", "INFO")
+                self.request_option_chain(force_center_strike=center_strike)
+            else:
+                self.log_message("Cannot recenter: No ATM or price data available", "WARNING")
+    
     def request_option_chain(self, force_center_strike=None):
         """
         Build and subscribe to option chain
@@ -6366,6 +6390,7 @@ class MainWindow(QMainWindow):
         # Track center strike for drift detection
         self.last_chain_center_strike = center_strike
         logger.info(f"Chain centered at strike {center_strike} (Reference: ${reference_price:.2f})")
+        self.log_message(f"Option chain centered at strike {center_strike:.0f}", "INFO")
         
         strikes = []
         current_strike = center_strike - (self.strikes_below * strike_increment)
@@ -6712,10 +6737,10 @@ class MainWindow(QMainWindow):
         drift_strikes = abs(atm_strike - self.last_chain_center_strike) / strike_increment
         
         # Check if this is initial calibration (first ATM detection after chain load)
-        # Initial calibration: If we just loaded chain and ATM is off by 2+ strikes, recenter immediately
+        # Initial calibration: If we just loaded chain and ATM is off by 1+ strikes, recenter immediately
         # This handles cases where ES offset approximation is significantly wrong (e.g., big overnight moves)
         is_initial_calibration = not self.delta_calibration_done
-        initial_calibration_threshold = 2  # Recenter immediately if off by 2+ strikes on initial detection
+        initial_calibration_threshold = 1  # Recenter immediately if off by 1+ strikes on initial detection (more aggressive)
         
         should_recenter = False
         reason = ""
@@ -6728,6 +6753,10 @@ class MainWindow(QMainWindow):
                 f"🎯 Initial ATM calibration: True ATM at {atm_strike:.0f}, "
                 f"chain centered at {self.last_chain_center_strike:.0f} "
                 f"({drift_strikes:.1f} strikes off) - RECENTERING IMMEDIATELY"
+            )
+            self.log_message(
+                f"🎯 ATM detected at {atm_strike:.0f}, recentering chain (was {self.last_chain_center_strike:.0f})", 
+                "INFO"
             )
             # Mark calibration as done (will be reset on next chain load)
             self.delta_calibration_done = True
@@ -9040,33 +9069,50 @@ class MainWindow(QMainWindow):
     
     def recenter_option_chain(self):
         """
-        Recenter option chain around current ES futures price.
+        Manually recenter the option chain on the current ATM strike.
         
-        Uses ES futures price (23/6 trading) to calculate ATM strike, then
-        creates a new chain with strikes_above and strikes_below around ATM.
+        Priority:
+        1. Delta-based ATM (most accurate during market hours)
+        2. Current underlying price (if available)
+        3. ES futures price adjusted for cash offset (fallback)
         """
-        es_price = self.app_state['es_price']
+        # First, try delta-based ATM detection
+        atm_strike = self.find_atm_strike_by_delta()
         
-        if es_price <= 0:
-            self.log_message("Cannot recenter - ES futures price not available", "WARNING")
+        if atm_strike > 0:
+            self.log_message(f"Manual recentering: ATM detected at {atm_strike:.0f} (delta-based)", "INFO")
+            self.request_option_chain(force_center_strike=atm_strike)
             return
         
-        # Get ES price adjusted for cash offset (same as in request_option_chain)
+        # Second, try underlying price
+        underlying_price = self.app_state.get('underlying_price', 0)
+        if underlying_price > 0:
+            strike_increment = self.instrument['strike_increment']
+            center_strike = round(underlying_price / strike_increment) * strike_increment
+            self.log_message(f"Manual recentering: Using {self.instrument['underlying_symbol']} price {underlying_price:.2f} → strike {center_strike:.0f}", "INFO")
+            self.request_option_chain(force_center_strike=center_strike)
+            return
+        
+        # Finally, fallback to ES price
+        es_price = self.app_state.get('es_price', 0)
+        if es_price <= 0:
+            self.log_message("Cannot recenter - No price data available (ATM, underlying, or ES)", "WARNING")
+            return
+        
+        # Get ES price adjusted for cash offset
         adjusted_es_price = self.get_adjusted_es_price()
         if adjusted_es_price == 0:
             # Fallback to raw ES if adjustment fails
             adjusted_es_price = es_price / 10.0 if self.instrument['underlying_symbol'] == 'XSP' else es_price
         
         # Calculate ATM strike using instrument-specific increment
-        strike_increment = self.instrument['strike_increment']
         atm_strike = round(adjusted_es_price / strike_increment) * strike_increment
         
-        symbol = self.instrument['underlying_symbol']
-        self.log_message(f"Recentering option chain around ATM strike: {atm_strike} (Adjusted ES: {adjusted_es_price:.2f}, Raw ES: {es_price:.2f})", "INFO")
+        self.log_message(f"Manual recentering: Using ES-adjusted price {adjusted_es_price:.2f} → strike {atm_strike:.0f} (Raw ES: {es_price:.2f})", "INFO")
         
-        # Refresh option chain (will use current strikes_above/strikes_below settings)
+        # Recenter on the calculated ATM strike
         if self.connection_state == ConnectionState.CONNECTED:
-            self.request_option_chain()
+            self.request_option_chain(force_center_strike=atm_strike)
         else:
             self.log_message("Cannot recenter - not connected to IBKR", "WARNING")
     
@@ -9841,10 +9887,12 @@ class MainWindow(QMainWindow):
             # Determine which table(s) to update and which contract type(s)
             tables_to_update = []
             contract_types = []
-            if hasattr(self, 'ts_0dte_expiry') and expiry == self.ts_0dte_expiry:
+            if (hasattr(self, 'ts_0dte_expiry') and hasattr(self, 'ts_0dte_table') and 
+                expiry == self.ts_0dte_expiry):
                 tables_to_update.append(self.ts_0dte_table)
                 contract_types.append("0DTE")
-            if hasattr(self, 'ts_1dte_expiry') and expiry == self.ts_1dte_expiry:
+            if (hasattr(self, 'ts_1dte_expiry') and hasattr(self, 'ts_1dte_table') and 
+                expiry == self.ts_1dte_expiry):
                 tables_to_update.append(self.ts_1dte_table)
                 contract_types.append("1DTE")
             
