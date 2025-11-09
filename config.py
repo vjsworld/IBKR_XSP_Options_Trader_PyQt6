@@ -1,5 +1,5 @@
 """
-Environment Configuration for IBKR XSP Options Trader
+Environment Configuration for IBKR Options Trader
 
 🏗️ SHARED INFRASTRUCTURE PHILOSOPHY:
 - Virtual Environment: One .venv/ for both dev/prod (same dependencies)
@@ -11,6 +11,10 @@ Environment Configuration for IBKR XSP Options Trader
 - Client IDs: Dev (100-199) vs Prod (1-99) ranges
 - Ports: Dev (7497 paper) vs Prod (7496 live)
 - Logs: logs_dev/ vs logs_prod/ directories
+
+⚙️ TRADING CONFIGURATION:
+- Instrument Selection: Set SELECTED_INSTRUMENT to 'XSP' or 'SPX'
+- Environment Control: Set ENVIRONMENT_OVERRIDE to 'development' or 'production'
 
 ⚠️ RECOMMENDED DEPLOYMENT:
 For best results, use machine-specific local folders instead of shared Dropbox:
@@ -34,6 +38,14 @@ Date: November 2025
 # - Production directory: Set to 'production' 
 # - Use Git to sync code changes between directories
 ENVIRONMENT_OVERRIDE = 'development'  # Change to 'production' in prod directory
+# ============================================================================
+
+# ============================================================================
+# ⚙️ TRADING INSTRUMENT SELECTION - CONFIGURE THE TRADING INSTRUMENT
+# ============================================================================
+# Set this to either 'SPX' (full-size S&P 500) or 'XSP' (mini 1/10 size)
+# This controls which instrument the application will trade
+SELECTED_INSTRUMENT = 'XSP'  # Change to 'SPX' for full-size S&P 500 trading
 # ============================================================================
 
 import os
@@ -264,10 +276,16 @@ def create_environment_marker(env_type: str) -> None:
         print("   Update the variable at the top of config.py for primary control")
 
 
+def get_selected_instrument() -> str:
+    """Get the currently selected trading instrument"""
+    return SELECTED_INSTRUMENT
+
+
 def get_environment_info() -> str:
     """Get formatted environment information string"""
     info_lines = [
         f"🔧 Environment: {config.environment.upper()}",
+        f"📈 Instrument: {SELECTED_INSTRUMENT}",
         f"⚙️  Override Variable: {ENVIRONMENT_OVERRIDE}",
         f"🖥️  Hostname: {socket.gethostname()}",
         f"📁 Settings: {current_config['settings_file']}",

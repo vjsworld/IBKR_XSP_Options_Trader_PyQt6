@@ -27,14 +27,6 @@ CRITICAL TIMEZONE CONFIGURATION:
 ═══════════════════════════════════════════════════════════════════════════
 """
 
-# ============================================================================
-# ⚙️ TRADING INSTRUMENT SELECTION - CHANGE THIS TO SWITCH INSTRUMENTS
-# ============================================================================
-# Set this to either 'SPX' (full-size S&P 500) or 'XSP' (mini 1/10 size)
-# This controls which instrument the application will trade
-SELECTED_INSTRUMENT = 'XSP'  # Change to 'XSP' for mini-SPX trading
-# ============================================================================
-
 import sys
 import json
 import math
@@ -257,7 +249,7 @@ logger.info("IBKR API loaded successfully")
 # Environment Configuration - Load FIRST
 logger.info("Loading environment configuration...")
 try:
-    from config import config, current_config, validate_environment, get_environment_info
+    from config import config, current_config, validate_environment, get_environment_info, SELECTED_INSTRUMENT
     logger.info("Environment configuration loaded successfully")
     logger.info(f"🔧 Running in {config.environment.upper()} mode")
     
@@ -2491,6 +2483,7 @@ class MainWindow(QMainWindow):
         self.max_client_id = self.env_config.get('client_id_end', 10)  # Use environment-specific max
         self.handling_client_id_error = False  # Flag to prevent double reconnect
         self.connection_state = ConnectionState.DISCONNECTED
+        self._chains_initialized = False  # Flag to prevent multiple chain initializations
         
         # ========================================================================
         # INSTRUMENT SELECTION - Uses global variable from top of file
@@ -4910,14 +4903,14 @@ class MainWindow(QMainWindow):
             self.subscribe_es_price()   # ES for strike calculations (23/6 trading)
             self.subscribe_mes_price()  # MES for vega strategy delta hedging
             
-            # REDUCED main chain auto-load: 10+10 strikes (vs 20+20) to stay under 100 data line limit
-            # After main chain loads, its ATM will be used to auto-load TS chains efficiently
+            # SIMPLIFIED CHAIN INITIALIZATION  
+            # Step 1: Build ONLY main chain first, wait for underlying price
             main_strikes = f"{self.strikes_above}+{self.strikes_below}"
-            logger.info(f"Auto-loading main chain with normal strikes: {main_strikes}")
+            logger.info(f"🏗️ PHASE 1: Building main chain only (waiting for underlying price): {main_strikes}")
             
-            # Set startup flag to enable cascade loading after this auto-load
+            # Start with main chain only - TS chains will be built after main chain completes
             self._is_startup_auto_load = True
-            self.request_option_chain()
+            self.build_main_chain_only()
             
             # Calculate offset from historical 3pm close if stale
             if self.is_offset_stale() and not self.is_market_hours():
@@ -5117,6 +5110,172 @@ class MainWindow(QMainWindow):
             
             self.es_offset_label.setStyleSheet(f"font-size: 12pt; color: {color};")
     
+    def calculate_master_atm_strike(self):
+        """
+        ULTRA-SIMPLE ATM CALCULATION: ONLY use actual underlying price
+        
+        NO ES FALLBACK EVER - we'll wait for the real underlying price.
+        This eliminates all the complex ES offset calculations that were causing wrong strikes.
+        
+        Returns:
+            float: ATM strike price (closest strike to underlying), or 0 if no data
+        """
+        strike_increment = self.instrument['strike_increment']
+        
+        # Get underlying price - ONLY from underlying, no ES fallback
+        underlying_price = self.app_state.get('underlying_price', 0)
+        
+        logger.info(f"🔍 ATM DEBUG: app_state['underlying_price'] = {underlying_price}")
+        logger.info(f"🔍 ATM DEBUG: strike_increment = {strike_increment}")
+        
+        # If no underlying price, always wait (no ES fallback to avoid wrong calculations)
+        if underlying_price <= 0:
+            logger.info("� No underlying price available - waiting for real data (NO ES FALLBACK)")
+            return 0  # Force retry until we get the actual underlying price
+        
+        # Round to nearest strike increment - that's the ATM!
+        atm_strike = round(underlying_price / strike_increment) * strike_increment
+        
+        logger.info(f"💎 Master ATM calculation: Price ${underlying_price:.2f} (underlying) → Strike ${atm_strike:.0f}")
+        logger.info(f"💎 ATM DEBUG: Calculation: round({underlying_price:.4f} / {strike_increment}) * {strike_increment} = {atm_strike:.0f}")
+        
+        # CRITICAL: If we get 662 instead of 671, log an alert
+        if underlying_price > 671.0 and atm_strike < 665:
+            logger.error(f"🚨 PRICE MISMATCH ALERT: Underlying {underlying_price:.2f} should give ~671 strike, got {atm_strike:.0f}!")
+            self.log_message(f"🚨 ATM CALCULATION ERROR: Price {underlying_price:.2f} → Strike {atm_strike:.0f} (Expected ~671)", "ERROR")
+        elif underlying_price < 665.0 and atm_strike > 670:
+            logger.error(f"🚨 PRICE MISMATCH ALERT: Underlying {underlying_price:.2f} should give ~665 strike, got {atm_strike:.0f}!")
+            self.log_message(f"🚨 ATM CALCULATION ERROR: Price {underlying_price:.2f} → Strike {atm_strike:.0f} (Expected ~665)", "ERROR")
+        
+        return atm_strike
+
+    def parse_contract_key(self, contract_key: str):
+        """
+        Parse contract key handling both normal and ATM_SCAN prefixed formats.
+        
+        Args:
+            contract_key: Either "SYMBOL_STRIKE_RIGHT_EXPIRY" or "ATM_SCAN_SYMBOL_STRIKE_RIGHT_EXPIRY"
+            
+        Returns:
+            tuple: (symbol, strike, right, expiry) or (None, None, None, None) if parsing fails
+        """
+        try:
+            if contract_key.startswith('ATM_SCAN_'):
+                # ATM_SCAN_SYMBOL_STRIKE_RIGHT_EXPIRY format
+                parts = contract_key.split('_')
+                if len(parts) != 6:
+                    return (None, None, None, None)
+                return (parts[2], float(parts[3]), parts[4], parts[5])
+            else:
+                # Normal SYMBOL_STRIKE_RIGHT_EXPIRY format
+                parts = contract_key.split('_')
+                if len(parts) != 4:
+                    return (None, None, None, None)
+                return (parts[0], float(parts[1]), parts[2], parts[3])
+        except (ValueError, IndexError):
+            return (None, None, None, None)
+
+    def build_main_chain_only(self):
+        """
+        SIMPLIFIED PHASE 1: Build ONLY the main option chain
+        
+        Wait for underlying price to be available, then build the main chain.
+        TS chains will be built in Phase 2 after main chain completes.
+        
+        This eliminates race conditions and ensures proper sequencing.
+        """
+        # Check if underlying price is available
+        underlying_price = self.app_state.get('underlying_price', 0)
+        
+        if underlying_price <= 0:
+            logger.info("🕐 PHASE 1: Waiting for underlying price before building main chain...")
+            self.log_message("Waiting for underlying price data...", "INFO")
+            
+            # Add retry counter to avoid infinite loops
+            if not hasattr(self, '_main_chain_retry_count'):
+                self._main_chain_retry_count = 0
+            
+            self._main_chain_retry_count += 1
+            
+            if self._main_chain_retry_count < 15:  # Max 15 retries (30 seconds)
+                self.log_message(f"Retry #{self._main_chain_retry_count}: Waiting for underlying price...", "DEBUG")
+                QTimer.singleShot(2000, self.build_main_chain_only)
+            else:
+                self.log_message("⚠️ Main chain initialization timeout - check data connection", "WARNING")
+                logger.warning("Main chain initialization timed out after 15 retries")
+            return
+        
+        # Calculate ATM from underlying price
+        atm_strike = self.calculate_master_atm_strike()
+        
+        if atm_strike <= 0:
+            logger.warning("� PHASE 1: Master ATM calculation failed despite underlying price available")
+            self.log_message("ATM calculation failed - retrying...", "WARNING")
+            QTimer.singleShot(2000, self.build_main_chain_only)
+            return
+        
+        logger.info(f"🏗️ PHASE 1: Building main chain with ATM strike: {atm_strike} (underlying: {underlying_price:.2f})")
+        self.log_message(f"✅ Building main chain centered at strike: {atm_strike:.0f}", "INFO")
+        
+        # Reset retry counter on successful initialization
+        self._main_chain_retry_count = 0
+        
+        # Build ONLY the main chain - set flag to trigger Phase 2 when complete
+        self._main_chain_building = True
+        self._phase_2_pending = True
+        self.request_option_chain(force_center_strike=atm_strike)
+        
+    def build_ts_chains_after_main_complete(self, main_atm_strike: float):
+        """
+        SIMPLIFIED PHASE 2: Build TS chains after main chain is complete
+        
+        Use the same ATM strike from the main chain to ensure consistency.
+        This runs only after the main chain has been successfully built.
+        """
+        if not hasattr(self, '_phase_2_pending') or not self._phase_2_pending:
+            return  # Phase 2 not needed or already completed
+        
+        logger.info(f"🏗️ PHASE 2: Building TS chains with main chain ATM: {main_atm_strike}")
+        self.log_message(f"Building TS chains centered at strike: {main_atm_strike:.0f}", "INFO")
+        
+        try:
+            # Calculate expiry dates
+            ts_0dte_expiry = self.calculate_expiry_date(0)
+            ts_1dte_expiry = self.calculate_expiry_date(1)
+            
+            # Ensure 1DTE is different from 0DTE
+            if ts_1dte_expiry == ts_0dte_expiry:
+                ts_1dte_expiry = self.calculate_expiry_date(2)
+                logger.info(f"🔄 1DTE matched 0DTE, using offset 2: {ts_1dte_expiry}")
+            
+            # Set expiry attributes and labels
+            self.ts_0dte_expiry = ts_0dte_expiry
+            self.ts_1dte_expiry = ts_1dte_expiry
+            
+            # Update labels only if they exist (UI might not be fully initialized yet)
+            if hasattr(self, 'ts_0dte_expiry_label') and self.ts_0dte_expiry_label:
+                self.ts_0dte_expiry_label.setText(f"Expiry: {ts_0dte_expiry}")
+            if hasattr(self, 'ts_1dte_expiry_label') and self.ts_1dte_expiry_label:
+                self.ts_1dte_expiry_label.setText(f"Expiry: {ts_1dte_expiry}")
+            
+            # Build TS chains sequentially with delay to avoid overwhelming IBKR
+            logger.info(f"🎯 Building TS 0DTE chain (expiry: {ts_0dte_expiry}) with ATM: {main_atm_strike}")
+            self.request_ts_chain("0DTE", force_center_strike=main_atm_strike)
+            
+            # Delay 1DTE chain by 2 seconds to avoid request conflicts
+            def build_1dte_delayed():
+                logger.info(f"🎯 Building TS 1DTE chain (expiry: {ts_1dte_expiry}) with ATM: {main_atm_strike}")
+                self.request_ts_chain("1DTE", force_center_strike=main_atm_strike)
+                self._phase_2_pending = False  # Mark Phase 2 complete
+                logger.info("✅ PHASE 2 COMPLETE: All chains built successfully")
+            
+            QTimer.singleShot(2000, build_1dte_delayed)
+            
+        except Exception as e:
+            logger.error(f"Error in Phase 2 TS chain building: {e}", exc_info=True)
+            self.log_message(f"Error building TS chains: {str(e)}", "WARNING")
+            self._phase_2_pending = False  # Mark failed but don't retry
+
     def get_adjusted_es_price(self):
         """
         Get ES price adjusted for the cash offset for strike calculations.
@@ -5166,42 +5325,35 @@ class MainWindow(QMainWindow):
             if delta is None or delta == 0:
                 continue
             
-            # Parse strike from contract_key: "XSP_589_C_20251029"
-            try:
-                parts = contract_key.split('_')
-                if len(parts) != 4:
-                    continue
-                strike = float(parts[1])
-                
-                if '_C_' in contract_key:
-                    # Call delta should be between 0 and 1, target 0.5
-                    if 0 < delta < 1:
-                        diff = abs(delta - 0.5)
-                        if diff < min_call_diff:
-                            min_call_diff = diff
-                            atm_call_strike = strike
-                
-                elif '_P_' in contract_key:
-                    # Put delta should be between -1 and 0, target -0.5
-                    if -1 < delta < 0:
-                        diff = abs(abs(delta) - 0.5)
-                        if diff < min_put_diff:
-                            min_put_diff = diff
-                            atm_put_strike = strike
-            
-            except (ValueError, IndexError):
+            # Parse strike from contract_key using helper function
+            symbol, strike, right_parsed, expiry = self.parse_contract_key(contract_key)
+            if strike is None:
                 continue
+            
+            if '_C_' in contract_key:
+                # Call delta should be between 0 and 1, target 0.5
+                if 0 < delta < 1:
+                    diff = abs(delta - 0.5)
+                    if diff < min_call_diff:
+                        min_call_diff = diff
+                        atm_call_strike = strike
+            
+            elif '_P_' in contract_key:
+                # Put delta should be between -1 and 0, target -0.5
+                if -1 < delta < 0:
+                    diff = abs(abs(delta) - 0.5)
+                    if diff < min_put_diff:
+                        min_put_diff = diff
+                        atm_put_strike = strike
         
-        # Prefer call-based ATM, fallback to put-based ATM
+        # Return best delta-based ATM, or fallback to price-based ATM
         if atm_call_strike > 0:
-            logger.info(f"✅ ATM strike identified by CALL delta: {atm_call_strike} (delta diff: {min_call_diff:.4f})")
             return atm_call_strike
         elif atm_put_strike > 0:
-            logger.info(f"✅ ATM strike identified by PUT delta: {atm_put_strike} (delta diff: {min_put_diff:.4f})")
             return atm_put_strike
         else:
-            logger.debug("No ATM strike found by delta - waiting for greeks data")
-            return 0
+            # No delta data yet - fallback to simple price-based ATM
+            return self.calculate_master_atm_strike()
     
     def get_es_front_month(self):
         """
@@ -6467,29 +6619,28 @@ class MainWindow(QMainWindow):
         self.refresh_option_chain()
     
     def refresh_option_chain(self):
-        """Refresh option chain"""
-        self.log_message("Refreshing option chain...", "INFO")
+        """Refresh main option chain only (manual refresh)"""
+        self.log_message("Refreshing main option chain...", "INFO")
         self.request_option_chain()
     
     def recenter_chain_on_atm(self):
         """Manually recenter the option chain on the current ATM strike"""
+        # First try delta-based ATM
         atm_strike = self.find_atm_strike_by_delta()
         if atm_strike > 0:
             self.log_message(f"Manual recentering: ATM detected at {atm_strike:.0f}", "INFO")
             self.request_option_chain(force_center_strike=atm_strike)
         else:
-            # Use current underlying price as fallback
+            # Use ONLY underlying price - NO ES fallback to avoid wrong calculations
             current_price = self.app_state.get('underlying_price', 0)
-            if current_price == 0:
-                current_price = self.get_adjusted_es_price()
             
             if current_price > 0:
                 strike_increment = self.instrument['strike_increment']
                 center_strike = round(current_price / strike_increment) * strike_increment
-                self.log_message(f"Manual recentering: Using current price {current_price:.2f} → strike {center_strike:.0f}", "INFO")
+                self.log_message(f"🎯 Manual recentering: Using underlying price {current_price:.2f} → strike {center_strike:.0f}", "INFO")
                 self.request_option_chain(force_center_strike=center_strike)
             else:
-                self.log_message("Cannot recenter: No ATM or price data available", "WARNING")
+                self.log_message("❌ Cannot recenter: No underlying price available (ES fallback disabled)", "WARNING")
     
     def request_option_chain(self, force_center_strike=None):
         """
@@ -6528,13 +6679,17 @@ class MainWindow(QMainWindow):
         if force_center_strike is not None:
             reference_price = force_center_strike
             logger.info(f"🎯 RECENTERING on delta-detected ATM strike: ${reference_price:.2f}")
+            logger.info(f"🎯 RECENTER DEBUG: This is a FORCED recenter, bypassing master ATM calculation")
         else:
-            # Use intelligent initial ATM calculation (accounts for spot price and time value)
-            reference_price = self.calculate_initial_atm_strike("0DTE")
+            # Use streamlined master ATM calculation
+            logger.info(f"📊 CHAIN BUILD: Initial chain request - calling master ATM calculation")
+            reference_price = self.calculate_master_atm_strike()
             if reference_price == 0:
-                self.log_message("Waiting for price data (XSP index or ES futures)...", "INFO")
+                logger.info(f"📊 CHAIN BUILD: Master ATM returned 0 - scheduling retry in 2 seconds")
+                self.log_message("Waiting for price data (index or ES futures)...", "INFO")
                 QTimer.singleShot(2000, self.request_option_chain)
                 return
+            logger.info(f"📊 CHAIN BUILD: Master ATM calculation complete - using reference_price: ${reference_price:.2f}")
         
         strike_increment = self.instrument['strike_increment']
         center_strike = round(reference_price / strike_increment) * strike_increment
@@ -6633,19 +6788,17 @@ class MainWindow(QMainWindow):
         self.app_state['active_option_req_ids'] = new_req_ids
         self.log_message(f"Subscribed to {len(strikes) * 2} option contracts", "SUCCESS")
         
-        # CASCADE LOADING: Auto-load TS chains after main chain completes (ONLY on auto-startup)
-        # Use main chain's center strike as ATM for TS chains - no complex ATM scanning needed
-        # This only triggers on the very first auto-load from connection, not manual refreshes
-        if (force_center_strike is None and 
-            not hasattr(self, '_main_chain_loaded') and 
-            hasattr(self, '_is_startup_auto_load')):
+        # PHASE 2 TRIGGER: Build TS chains after main chain completes (ONLY on startup)
+        # This triggers Phase 2 of the simplified chain building process
+        if (hasattr(self, '_main_chain_building') and self._main_chain_building and
+            hasattr(self, '_phase_2_pending') and self._phase_2_pending):
             
-            self._main_chain_loaded = True  # Prevent repeated cascade
-            delattr(self, '_is_startup_auto_load')  # Clear startup flag
-            logger.info(f"🔗 Main chain loaded successfully. Cascading to auto-load TS chains using ATM=${center_strike}")
+            self._main_chain_building = False  # Main chain building complete
+            logger.info(f"✅ PHASE 1 COMPLETE: Main chain built at strike {center_strike}")
+            logger.info(f"🔗 PHASE 2 TRIGGER: Building TS chains with same ATM strike")
             
-            # Schedule TS chain loading after small delay to allow main chain data to stabilize
-            QTimer.singleShot(1000, lambda: self.auto_load_ts_chains_from_main_atm(center_strike))
+            # Schedule Phase 2 after small delay to allow main chain data to stabilize
+            QTimer.singleShot(1000, lambda: self.build_ts_chains_after_main_complete(center_strike))
         
         # Clear recentering flags now that chain is loaded
         self.is_recentering_chain = False
@@ -6949,26 +7102,10 @@ class MainWindow(QMainWindow):
     
     # ========== TradeStation Chain ATM Detection and Coloring Methods ==========
     
-    def request_atm_scan_for_ts_chain(self, contract_type: str):
-        """
-        Phase 1: Quick scan to find true ATM strike via delta.
-        Requests deltas for ±10 strikes around estimated price, finds closest to 0.5 delta,
-        then triggers Phase 2 to build proper chain centered on true ATM.
-        
-        Args:
-            contract_type: "0DTE" or "1DTE"
-        """
-        logger.info(f"===== request_atm_scan_for_ts_chain() CALLED FOR {contract_type} =====")
-        self.log_message(f"🔍 Entering ATM scan function for {contract_type}", "INFO")
-        
-        try:
-            logger.info(f"[TS {contract_type} ATM SCAN] === Phase 1: Scanning for true ATM ===")
-            
-            # Check IBKR connection
-            if self.connection_state != ConnectionState.CONNECTED:
-                self.log_message("IBKR not connected - cannot scan for ATM", "WARNING")
-                logger.warning(f"[TS {contract_type} ATM SCAN] Connection state is {self.connection_state}, not CONNECTED")
-                return
+    # ===== COMPLEX ATM SCANNING FUNCTIONS REMOVED =====
+    # The request_atm_scan_for_ts_chain() function has been deleted as part of simplification.
+    # TS chains now use the same master ATM calculation as main chain for consistent chain building.
+
             
             # Get expiry
             if contract_type == "0DTE":
@@ -6983,17 +7120,13 @@ class MainWindow(QMainWindow):
                     expiry = expiry_1dte
                 self.ts_1dte_expiry = expiry
             
-            # Get initial price estimate
+            # Use master ATM calculation for consistency
             strike_interval = self.instrument['strike_increment']
-            if (underlying_price := self.app_state.get('underlying_price', 0)) > 0:
-                reference_price = underlying_price
-                logger.info(f"[TS {contract_type} ATM SCAN] Using spot ${reference_price:.2f}")
-            else:
-                reference_price = self.get_adjusted_es_price()
-                if reference_price == 0:
-                    logger.warning(f"[TS {contract_type} ATM SCAN] No price data available")
-                    return
-                logger.info(f"[TS {contract_type} ATM SCAN] Using ES-adjusted ${reference_price:.2f}")
+            reference_price = self.calculate_master_atm_strike()
+            if reference_price == 0:
+                logger.warning(f"[TS {contract_type} ATM SCAN] No underlying price available - waiting for data")
+                return
+            logger.info(f"[TS {contract_type} ATM SCAN] Using master ATM calculation: ${reference_price:.2f}")
             
             # Build scan range: ±10 strikes around reference
             center_estimate = round(reference_price / strike_interval) * strike_interval
@@ -7046,13 +7179,8 @@ class MainWindow(QMainWindow):
             self.app_state[scan_state_key]['req_ids'] = scan_req_ids
             
             # Set timeout to complete scan and find ATM (5 seconds for 1DTE, 3 for 0DTE)
-            timeout_ms = 5000 if contract_type == "1DTE" else 3000
-            QTimer.singleShot(timeout_ms, lambda: self.complete_atm_scan_and_build_chain(contract_type))
-            
-            logger.info(f"[TS {contract_type} ATM SCAN] Requested greeks for {len(scan_req_ids)} strikes, will analyze in {timeout_ms/1000:.0f} seconds")
-            
-        except Exception as e:
-            logger.error(f"[TS {contract_type} ATM SCAN] Error: {e}", exc_info=True)
+    # ===== ORPHANED CODE REMOVED =====
+    # Removed leftover code from complex ATM scanning function
     
     def complete_atm_scan_and_build_chain(self, contract_type: str):
         """
@@ -7147,15 +7275,12 @@ class MainWindow(QMainWindow):
         strike_interval = self.instrument['strike_increment']
         
         # Get spot price
-        if (underlying_price := self.app_state.get('underlying_price', 0)) > 0:
-            spot_price = underlying_price
-            logger.info(f"[Chain Init] Using {self.instrument['underlying_symbol']} spot price ${spot_price:.2f}")
-        else:
-            # Fallback to ES futures adjusted for cash offset
-            spot_price = self.get_adjusted_es_price()
-            if spot_price == 0:
-                return 0
-            logger.info(f"[Chain Init] Using ES-adjusted spot price ${spot_price:.2f}")
+        # Use master ATM calculation for consistency
+        spot_price = self.calculate_master_atm_strike()
+        if spot_price == 0:
+            logger.info(f"[Chain Init] No underlying price available - waiting for data")
+            return 0
+        logger.info(f"[Chain Init] Using master ATM calculation: ${spot_price:.2f}")
         
         # For 0DTE (main chain), spot price is good enough (minimal time value)
         if contract_type == "0DTE":
@@ -7238,6 +7363,11 @@ class MainWindow(QMainWindow):
             logger.debug(f"[TS {contract_type}] ⚡ ATM by delta: {atm_put_strike:.0f} (put delta: {0.5-min_put_diff:.3f})")
             return atm_put_strike
         else:
+            # Fallback: Use price-based ATM when no delta data available
+            price_based_atm = self.calculate_master_atm_strike()
+            if price_based_atm > 0:
+                logger.debug(f"[TS {contract_type}] 📍 ATM by price (fallback): {price_based_atm:.0f}")
+                return price_based_atm
             return 0
     
     def update_ts_strike_backgrounds_by_delta(self, contract_type: str):
@@ -7259,19 +7389,24 @@ class MainWindow(QMainWindow):
         offset_from_center = atm_strike - center_strike if center_strike > 0 else 0
         logger.debug(f"[TS {contract_type}] 🎨 Coloring strikes: ATM={atm_strike:.0f}, Chain Center={center_strike:.0f}, Offset={offset_from_center:+.0f}")
         
-        # Select appropriate table and label
+        # Select appropriate table and label (check if they exist first)
         if contract_type == "0DTE":
+            if not hasattr(self, 'ts_0dte_table') or self.ts_0dte_table is None:
+                return  # Table not ready yet
             table = self.ts_0dte_table
-            label = self.ts_0dte_expiry_label
+            label = getattr(self, 'ts_0dte_expiry_label', None)
             current_expiry = self.ts_0dte_expiry
         else:
+            if not hasattr(self, 'ts_1dte_table') or self.ts_1dte_table is None:
+                return  # Table not ready yet
             table = self.ts_1dte_table
-            label = self.ts_1dte_expiry_label
+            label = getattr(self, 'ts_1dte_expiry_label', None)
             current_expiry = self.ts_1dte_expiry
         
-        # Update ATM label
-        label.setText(f"Expiry: {current_expiry} | ATM: {atm_strike:.0f}")
-        label.setStyleSheet("font-weight: bold; color: #FFD700;")
+        # Update ATM label if it exists
+        if label:
+            label.setText(f"Expiry: {current_expiry} | ATM: {atm_strike:.0f}")
+            label.setStyleSheet("font-weight: bold; color: #FFD700;")
         
         # Check for drift and auto-recenter
         self.check_ts_chain_drift_and_recenter(contract_type, atm_strike)
@@ -8964,13 +9099,11 @@ class MainWindow(QMainWindow):
             
             es_price = self.app_state.get('es_price', 0)
             if es_price > 0 and self.last_chain_center_strike > 0:
-                # Use adjusted ES price (same as in request_option_chain)
-                adjusted_es_price = self.get_adjusted_es_price()
-                if adjusted_es_price == 0:
-                    # Fallback to raw ES if adjustment fails
-                    adjusted_es_price = es_price / 10.0 if self.instrument['underlying_symbol'] == 'XSP' else es_price
-                
-                reference_price = adjusted_es_price
+                # Use master ATM calculation for consistency
+                reference_price = self.calculate_master_atm_strike()
+                if reference_price == 0:
+                    logger.debug("No underlying price available for drift calculation - skipping")
+                    return
                 strike_increment = self.instrument['strike_increment']
                 current_center = round(reference_price / strike_increment) * strike_increment
                 drift = abs(current_center - self.last_chain_center_strike)
@@ -9682,17 +9815,13 @@ class MainWindow(QMainWindow):
             
             logger.info(f"0DTE expiry: {expiry_0dte}, 1DTE expiry: {expiry_1dte}")
             
-            # Get reference price
+            # Use master ATM calculation for consistency
             strike_interval = self.instrument['strike_increment']
-            if (underlying_price := self.app_state.get('underlying_price', 0)) > 0:
-                reference_price = underlying_price
-                logger.info(f"Using spot price: ${reference_price:.2f}")
-            else:
-                reference_price = self.get_adjusted_es_price()
-                if reference_price == 0:
-                    logger.warning("No price data available for ATM scan")
-                    return
-                logger.info(f"Using ES-adjusted price: ${reference_price:.2f}")
+            reference_price = self.calculate_master_atm_strike()
+            if reference_price == 0:
+                logger.warning("No underlying price available for ATM scan - waiting for data")
+                return
+            logger.info(f"Using master ATM calculation: ${reference_price:.2f}")
             
             # Quick ATM scan: check 5 strikes around reference price for 0DTE deltas
             center_estimate = round(reference_price / strike_interval) * strike_interval
@@ -9751,8 +9880,10 @@ class MainWindow(QMainWindow):
             for contract_key, delta in self.atm_scan_deltas.items():
                 if delta and abs(delta - 0.5) < best_delta_diff:
                     best_delta_diff = abs(delta - 0.5)
-                    # Extract strike from contract_key format: SYMBOL_STRIKE_RIGHT_EXPIRY
-                    best_strike = float(contract_key.split('_')[1])
+                    # Extract strike using helper function
+                    symbol, strike, right, expiry = self.parse_contract_key(contract_key)
+                    if strike is not None:
+                        best_strike = strike
             
             if best_strike is None:
                 logger.warning("Could not determine ATM strike from delta scan")
@@ -10118,7 +10249,8 @@ class MainWindow(QMainWindow):
             if contract_type == "0DTE":
                 expiry = self.calculate_expiry_date(0)  # Today's expiration (or tomorrow if after 4PM)
                 self.ts_0dte_expiry = expiry
-                self.ts_0dte_expiry_label.setText(f"Expiry: {expiry}")
+                if hasattr(self, 'ts_0dte_expiry_label') and self.ts_0dte_expiry_label:
+                    self.ts_0dte_expiry_label.setText(f"Expiry: {expiry}")
             else:  # 1DTE
                 # For 1DTE, we want the NEXT trading day after 0DTE
                 # So if 0DTE offset is 0, 1DTE should be offset 1
@@ -10134,7 +10266,8 @@ class MainWindow(QMainWindow):
                     expiry = expiry_1dte
                 
                 self.ts_1dte_expiry = expiry
-                self.ts_1dte_expiry_label.setText(f"Expiry: {expiry}")
+                if hasattr(self, 'ts_1dte_expiry_label') and self.ts_1dte_expiry_label:
+                    self.ts_1dte_expiry_label.setText(f"Expiry: {expiry}")
             
             # Determine reference price (same logic as main chain)
             # If force_center_strike is provided, use it directly (for recentering)
@@ -10144,8 +10277,8 @@ class MainWindow(QMainWindow):
                 center_strike = force_center_strike
                 logger.info(f"[TS {contract_type}] FORCED RECENTER to strike {center_strike}")
             else:
-                # Use intelligent initial ATM calculation
-                center_strike = self.calculate_initial_atm_strike(contract_type)
+                # Use streamlined master ATM calculation (same for all chains)
+                center_strike = self.calculate_master_atm_strike()
                 if center_strike == 0:
                     self.log_message(f"Waiting for price data for {contract_type} chain...", "INFO")
                     return
@@ -10213,7 +10346,8 @@ class MainWindow(QMainWindow):
                 logger.info("[TS CHAIN] 0DTE complete - triggering 1DTE load in 1 second")
                 self.log_message("Loading 1DTE chain...", "INFO")
                 self.app_state['load_1dte_after_0dte'] = False  # Clear flag
-                QTimer.singleShot(1000, lambda: self.request_atm_scan_for_ts_chain("1DTE"))
+                # Simplified: Use master ATM calculation directly
+                QTimer.singleShot(1000, lambda: self.request_ts_chain("1DTE", force_center_strike=self.calculate_master_atm_strike()))
             
         except Exception as e:
             logger.error(f"[TS CHAIN] Error requesting {contract_type} chain: {e}", exc_info=True)
@@ -10222,8 +10356,17 @@ class MainWindow(QMainWindow):
     def initialize_ts_chain_table(self, contract_type: str, strikes: list):
         """Initialize TS chain table with rows for given strikes"""
         try:
-            # Select the appropriate table
-            table = self.ts_0dte_table if contract_type == "0DTE" else self.ts_1dte_table
+            # Check if tables exist first (UI might not be fully initialized)
+            if contract_type == "0DTE":
+                if not hasattr(self, 'ts_0dte_table') or self.ts_0dte_table is None:
+                    logger.debug(f"[TS {contract_type}] Table not ready yet, skipping initialization")
+                    return
+                table = self.ts_0dte_table
+            else:
+                if not hasattr(self, 'ts_1dte_table') or self.ts_1dte_table is None:
+                    logger.debug(f"[TS {contract_type}] Table not ready yet, skipping initialization")
+                    return
+                table = self.ts_1dte_table
             
             # Sort strikes descending (highest first)
             sorted_strikes = sorted(strikes, reverse=True)
@@ -10255,15 +10398,10 @@ class MainWindow(QMainWindow):
         """Update a single cell in TS chain tables when market data arrives.
         Also triggers ATM detection and strike coloring after updating."""
         try:
-            # Parse contract key: SYMBOL_STRIKE_RIGHT_EXPIRY
-            parts = contract_key.split('_')
-            if len(parts) < 4:
+            # Parse contract key using helper function
+            symbol, strike, right, expiry = self.parse_contract_key(contract_key)
+            if strike is None:
                 return
-            
-            symbol = parts[0]
-            strike = float(parts[1])
-            right = parts[2]  # 'C' or 'P'
-            expiry = parts[3]
             
             # Determine which table(s) to update and which contract type(s)
             tables_to_update = []
@@ -10280,8 +10418,16 @@ class MainWindow(QMainWindow):
             if not tables_to_update:
                 return  # Not a TS chain expiry
             
-            # Get market data for this contract
+            # Get market data for this contract - handle both regular and ATM_SCAN prefixed keys
             data = self.market_data.get(contract_key, {})
+            if not data and contract_key.startswith('ATM_SCAN_'):
+                # If no data found with ATM_SCAN prefix, try without prefix
+                actual_key = contract_key[9:]
+                data = self.market_data.get(actual_key, {})
+            elif not data and not contract_key.startswith('ATM_SCAN_'):
+                # If no data found without prefix, try with ATM_SCAN prefix
+                scan_key = f"ATM_SCAN_{contract_key}"
+                data = self.market_data.get(scan_key, {})
             
             # Track if we should trigger ATM update (for call options with delta data)
             should_update_atm = (right == 'C' and data.get('delta') is not None)
@@ -11269,15 +11415,15 @@ class MainWindow(QMainWindow):
             self.vega_scan_results.clear()
             self.vega_scanner_table.setRowCount(0)
             
-            # Get current ATM strike using delta method
+            # Get current ATM strike using delta method first, then master calculation
             atm_strike = self.find_atm_strike_by_delta()
             
             if not atm_strike or atm_strike == 0:
-                # Fallback to ES-adjusted price
-                atm_strike = self.get_adjusted_es_price()
+                # Use master ATM calculation for consistency
+                atm_strike = self.calculate_master_atm_strike()
             
             if not atm_strike or atm_strike == 0:
-                self.log_message("Cannot determine ATM strike for scan", "ERROR")
+                self.log_message("Cannot determine ATM strike for scan - waiting for price data", "WARNING")
                 return
             
             # Scan logic: Look for strangles around ATM
