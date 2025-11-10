@@ -18,8 +18,8 @@ Environment Configuration for IBKR Options Trader
 
 ⚠️ RECOMMENDED DEPLOYMENT:
 For best results, use machine-specific local folders instead of shared Dropbox:
-- Dev Machine: C:\Trading\IBKR_XSP_Trader_DEV\ (local copy)
-- Prod Machine: C:\Trading\IBKR_XSP_Trader_PROD\ (local copy)
+- Dev Machine: C:\\Trading\\IBKR_XSP_Trader_DEV\\ (local copy)
+- Prod Machine: C:\\Trading\\IBKR_XSP_Trader_PROD\\ (local copy)
 - Code Sharing: Git repo or Dropbox for source code only
 See MIGRATION_TO_LOCAL_FOLDERS.md for complete setup instructions.
 

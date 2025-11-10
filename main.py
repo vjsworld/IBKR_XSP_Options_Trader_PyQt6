@@ -2486,10 +2486,10 @@ class MainWindow(QMainWindow):
         self._chains_initialized = False  # Flag to prevent multiple chain initializations
         
         # ========================================================================
-        # INSTRUMENT SELECTION - Uses global variable from top of file
+        # INSTRUMENT SELECTION - Uses configuration from config.py
         # ========================================================================
-        # The instrument is now controlled by SELECTED_INSTRUMENT at the top of this file
-        self.trading_instrument = SELECTED_INSTRUMENT
+        # The instrument is now controlled by SELECTED_INSTRUMENT in config.py
+        self.trading_instrument = self.selected_instrument
         self.instrument = INSTRUMENT_CONFIG[self.trading_instrument]
         
         # Set convenient shortcuts to instrument properties
@@ -2515,6 +2515,25 @@ class MainWindow(QMainWindow):
         self.local_tz = pytz.timezone('America/Chicago')
         logger.info(f"Application timezone set to: {self.local_tz} (Central Time)")
         self.last_refresh_date = datetime.now(self.local_tz).date()
+        
+        # ========================================================================
+        # REQUEST ID MANAGEMENT - Centralized tracking to prevent duplicates
+        # ========================================================================
+        # Request ID Ranges:
+        # 1-999: Underlying/ES market data
+        # 1000-1999: Main option chain
+        # 2000-2999: TradeStation 0DTE chain
+        # 3000-3999: TradeStation 1DTE chain
+        # 5000+: Orders, historical data, other requests
+        self.next_main_req_id = 1000
+        self.next_ts_0dte_req_id = 2000
+        self.next_ts_1dte_req_id = 3000
+        self.active_req_ids = {
+            'main': [],
+            'ts_0dte': [],
+            'ts_1dte': []
+        }
+        logger.info("✓ Request ID tracking initialized (ranges: main=1000-1999, ts_0dte=2000-2999, ts_1dte=3000-3999)")
         
         # Strategy parameters - reduced strikes for efficient auto-load under 100 data line limit
         self.strikes_above = 10  # Reduced from 20 to 10 for streamlined chain loading
@@ -2696,10 +2715,13 @@ class MainWindow(QMainWindow):
     def setup_environment_config(self):
         """Setup environment-specific configuration"""
         try:
-            # Load environment configuration
-            from config import config, current_config
+            # Load environment configuration and instrument selection
+            from config import config, current_config, SELECTED_INSTRUMENT
             self.env_config = current_config
             self.environment_name = config.environment
+            
+            # Store selected instrument as instance variable for reliable access
+            self.selected_instrument = SELECTED_INSTRUMENT
             
             # Setup environment-specific logging
             setup_environment_logging()
@@ -4903,16 +4925,25 @@ class MainWindow(QMainWindow):
             self.subscribe_es_price()   # ES for strike calculations (23/6 trading)
             self.subscribe_mes_price()  # MES for vega strategy delta hedging
             
-            # SIMPLIFIED CHAIN INITIALIZATION  
-            # Step 1: Build ONLY main chain first, wait for underlying price
-            main_strikes = f"{self.strikes_above}+{self.strikes_below}"
-            logger.info(f"🏗️ PHASE 1: Building main chain only (waiting for underlying price): {main_strikes}")
+            # ================================================================
+            # SIMPLIFIED SEQUENTIAL CHAIN LOADING - November 10, 2025
+            # ================================================================
+            # Wait for underlying price → main chain → TS 0DTE → TS 1DTE
+            # No complex ES adjustments or delta scanning
+            logger.info(f"🏗️ Starting simplified sequential chain loading")
+            logger.info(f"  Main chain: {self.strikes_above}+{self.strikes_below} strikes")
+            logger.info(f"  TS chains: {self.ts_strikes_above}+{self.ts_strikes_below} strikes")
             
-            # Start with main chain only - TS chains will be built after main chain completes
-            self._is_startup_auto_load = True
-            self.build_main_chain_only()
+            self.load_all_chains_sequential()
             
-            # Calculate offset from historical 3pm close if stale
+            # Start drift monitoring timer
+            if not hasattr(self, 'drift_monitor_timer'):
+                self.drift_monitor_timer = QTimer()
+                self.drift_monitor_timer.timeout.connect(self.monitor_chain_drift)
+                self.drift_monitor_timer.start(5000)  # Check every 5 seconds
+                logger.info("✓ Chain drift monitoring started (5 second interval)")
+            
+            # Calculate offset from historical 3pm close if stale (ES tracking only)
             if self.is_offset_stale() and not self.is_market_hours():
                 if self.es_to_cash_offset == 0:
                     self.log_message("No saved offset found and connected after market hours - calculating from historical 3pm close", "INFO")
@@ -5161,21 +5192,348 @@ class MainWindow(QMainWindow):
         """
         try:
             if contract_key.startswith('ATM_SCAN_'):
-                # ATM_SCAN_SYMBOL_STRIKE_RIGHT_EXPIRY format
-                parts = contract_key.split('_')
-                if len(parts) != 6:
-                    return (None, None, None, None)
-                return (parts[2], float(parts[3]), parts[4], parts[5])
-            else:
-                # Normal SYMBOL_STRIKE_RIGHT_EXPIRY format
-                parts = contract_key.split('_')
-                if len(parts) != 4:
-                    return (None, None, None, None)
-                return (parts[0], float(parts[1]), parts[2], parts[3])
-        except (ValueError, IndexError):
-            return (None, None, None, None)
+                return (None, None, None, None)  # Skip ATM scan keys
+            
+            parts = contract_key.split('_')
+            if len(parts) >= 4:
+                symbol = parts[0]
+                strike = float(parts[1])
+                right = parts[2]
+                expiry = parts[3]
+                return (symbol, strike, right, expiry)
+        except Exception as e:
+            logger.debug(f"Failed to parse contract key '{contract_key}': {e}")
+        
+        return (None, None, None, None)
 
-    def build_main_chain_only(self):
+    # ============================================================================
+    # SIMPLIFIED CHAIN LOADING SYSTEM - November 10, 2025
+    # ============================================================================
+    # Single source of truth: underlying price → ATM strike → sequential chain loading
+    # No ES adjustments, no delta scanning, no complex fallbacks
+    # ============================================================================
+
+    def get_next_request_id(self, chain_type: str) -> int:
+        """
+        Get next available request ID for specified chain type.
+        Prevents duplicate IDs by tracking usage.
+        
+        Args:
+            chain_type: 'main', 'ts_0dte', or 'ts_1dte'
+        
+        Returns:
+            Next available request ID in the appropriate range
+        """
+        if chain_type == 'main':
+            req_id = self.next_main_req_id
+            self.next_main_req_id += 1
+            if self.next_main_req_id > 1999:
+                self.next_main_req_id = 1000
+            return req_id
+        elif chain_type == 'ts_0dte':
+            req_id = self.next_ts_0dte_req_id
+            self.next_ts_0dte_req_id += 1
+            if self.next_ts_0dte_req_id > 2999:
+                self.next_ts_0dte_req_id = 2000
+            return req_id
+        elif chain_type == 'ts_1dte':
+            req_id = self.next_ts_1dte_req_id
+            self.next_ts_1dte_req_id += 1
+            if self.next_ts_1dte_req_id > 3999:
+                self.next_ts_1dte_req_id = 3000
+            return req_id
+        else:
+            raise ValueError(f"Unknown chain type: {chain_type}")
+
+    def cancel_chain_subscriptions(self, chain_type: str):
+        """Cancel all active subscriptions for a chain type"""
+        if chain_type not in self.active_req_ids:
+            return
+        
+        req_ids = self.active_req_ids[chain_type]
+        if req_ids:
+            logger.info(f"Canceling {len(req_ids)} subscriptions for {chain_type} chain")
+            for req_id in req_ids:
+                try:
+                    self.ibkr_client.cancelMktData(req_id)
+                    # Remove from market_data_map
+                    if req_id in self.app_state.get('market_data_map', {}):
+                        del self.app_state['market_data_map'][req_id]
+                except Exception as e:
+                    logger.debug(f"Error canceling reqId {req_id}: {e}")
+            self.active_req_ids[chain_type] = []
+
+    def calculate_atm_strike(self) -> float:
+        """
+        Calculate ATM strike using ONLY the underlying price.
+        No ES adjustments, no delta scanning, no fallbacks.
+        
+        Returns:
+            ATM strike rounded to nearest strike interval, or 0 if price not available
+        """
+        # Delegate to existing calculate_master_atm_strike which already does this correctly
+        return self.calculate_master_atm_strike()
+
+    def load_all_chains_sequential(self):
+        """
+        Load all chains sequentially to prevent race conditions.
+        
+        Flow:
+        1. Wait for underlying price (with timeout)
+        2. Load main chain
+        3. Wait for main chain to populate
+        4. Load TS 0DTE chain
+        5. Wait for TS 0DTE to populate
+        6. Load TS 1DTE chain
+        
+        This is called once on connection and again when recentering.
+        """
+        if not hasattr(self, '_chain_load_retry_count'):
+            self._chain_load_retry_count = 0
+        
+        # Step 1: Check for underlying price
+        atm_strike = self.calculate_atm_strike()
+        
+        if atm_strike <= 0:
+            self._chain_load_retry_count += 1
+            if self._chain_load_retry_count < 20:  # 40 seconds max wait
+                self.log_message(f"Waiting for underlying price... (attempt {self._chain_load_retry_count})", "INFO")
+                QTimer.singleShot(2000, self.load_all_chains_sequential)
+                return
+            else:
+                self.log_message("⚠️ Timeout waiting for underlying price", "ERROR")
+                logger.error("Chain loading aborted - no underlying price after 40 seconds")
+                return
+        
+        # Reset retry counter
+        self._chain_load_retry_count = 0
+        
+        # Step 2: Load main chain
+        logger.info(f"═══ SEQUENTIAL CHAIN LOADING START ═══")
+        logger.info(f"Step 1/3: Loading MAIN chain at ATM strike {atm_strike:.0f}")
+        self.log_message(f"Loading option chains at strike {atm_strike:.0f}...", "INFO")
+        
+        self.build_single_chain('main', atm_strike, self.strikes_above, self.strikes_below)
+        
+        # Step 3: Schedule TS chains after a delay
+        QTimer.singleShot(3000, lambda: self._load_ts_0dte_chain(atm_strike))
+
+    def _load_ts_0dte_chain(self, atm_strike: float):
+        """Step 2 of sequential loading: Load TS 0DTE chain"""
+        logger.info(f"Step 2/3: Loading TS 0DTE chain at ATM strike {atm_strike:.0f}")
+        self.build_single_chain('ts_0dte', atm_strike, self.ts_strikes_above, self.ts_strikes_below)
+        
+        # Schedule TS 1DTE chain
+        QTimer.singleShot(3000, lambda: self._load_ts_1dte_chain(atm_strike))
+
+    def _load_ts_1dte_chain(self, atm_strike: float):
+        """Step 3 of sequential loading: Load TS 1DTE chain"""
+        logger.info(f"Step 3/3: Loading TS 1DTE chain at ATM strike {atm_strike:.0f}")
+        self.build_single_chain('ts_1dte', atm_strike, self.ts_strikes_above, self.ts_strikes_below)
+        
+        logger.info(f"═══ SEQUENTIAL CHAIN LOADING COMPLETE ═══")
+        self.log_message("✅ All option chains loaded successfully", "SUCCESS")
+
+    def build_single_chain(self, chain_type: str, atm_strike: float, 
+                           strikes_above: int, strikes_below: int):
+        """
+        Build a single option chain (main, TS 0DTE, or TS 1DTE).
+        
+        This is the ONE unified function that builds any chain type.
+        No duplication, no complex logic, just straightforward chain building.
+        
+        Args:
+            chain_type: 'main', 'ts_0dte', or 'ts_1dte'
+            atm_strike: The ATM strike to center the chain on
+            strikes_above: Number of strikes above ATM (from UI settings)
+            strikes_below: Number of strikes below ATM (from UI settings)
+        """
+        if self.connection_state != ConnectionState.CONNECTED:
+            logger.warning(f"Cannot build {chain_type} chain - not connected")
+            return
+        
+        # Cancel existing subscriptions for this chain
+        self.cancel_chain_subscriptions(chain_type)
+        
+        # Determine expiry and instrument details based on chain type
+        if chain_type == 'main':
+            expiry = self.current_expiry
+            symbol = self.instrument['options_symbol']
+            trading_class = self.instrument['options_trading_class']
+            table = self.option_table
+            strike_col = 10  # Strike column position in main table
+        elif chain_type == 'ts_0dte':
+            expiry = self.calculate_expiry_date(0)
+            self.ts_0dte_expiry = expiry
+            symbol = self.instrument['options_symbol']
+            trading_class = self.instrument['options_trading_class']
+            # Check if TS table exists
+            if not hasattr(self, 'ts_0dte_table'):
+                logger.warning(f"TS 0DTE table not found - skipping {chain_type} chain build")
+                return
+            table = self.ts_0dte_table
+            strike_col = 5  # Strike column position in TS table
+        elif chain_type == 'ts_1dte':
+            # Calculate 1DTE expiry (skip to next different date)
+            expiry_0dte = self.calculate_expiry_date(0)
+            expiry_1dte = self.calculate_expiry_date(1)
+            if expiry_1dte == expiry_0dte:
+                expiry = self.calculate_expiry_date(2)
+            else:
+                expiry = expiry_1dte
+            self.ts_1dte_expiry = expiry
+            symbol = self.instrument['options_symbol']
+            trading_class = self.instrument['options_trading_class']
+            # Check if TS table exists
+            if not hasattr(self, 'ts_1dte_table'):
+                logger.warning(f"TS 1DTE table not found - skipping {chain_type} chain build")
+                return
+            table = self.ts_1dte_table
+            strike_col = 5  # Strike column position in TS table
+        else:
+            raise ValueError(f"Unknown chain type: {chain_type}")
+        
+        # Build strike list
+        strike_increment = self.instrument['strike_increment']
+        center_strike = round(atm_strike / strike_increment) * strike_increment
+        
+        # Track center strike for drift detection
+        if chain_type == 'main':
+            self.last_chain_center_strike = center_strike
+        elif chain_type == 'ts_0dte':
+            self.ts_0dte_center_strike = center_strike
+        elif chain_type == 'ts_1dte':
+            self.ts_1dte_center_strike = center_strike
+        
+        strikes = []
+        current_strike = center_strike - (strikes_below * strike_increment)
+        end_strike = center_strike + (strikes_above * strike_increment)
+        
+        while current_strike <= end_strike:
+            strikes.append(current_strike)
+            current_strike += strike_increment
+        
+        logger.info(f"Building {chain_type} chain: {len(strikes)} strikes from {min(strikes):.0f} to {max(strikes):.0f}")
+        logger.info(f"  Expiry: {expiry}, Symbol: {symbol}, TradingClass: {trading_class}, Center: {center_strike:.0f}")
+        
+        # Clear and setup table
+        table.setRowCount(0)
+        table.setRowCount(len(strikes))
+        
+        # Request live market data
+        self.ibkr_client.reqMarketDataType(1)
+        
+        # Subscribe to each strike
+        new_req_ids = []
+        
+        for row, strike in enumerate(strikes):
+            # Call option
+            call_contract = self.create_option_contract(
+                strike=strike,
+                right='C',
+                symbol=symbol,
+                trading_class=trading_class,
+                expiry=expiry
+            )
+            
+            call_req_id = self.get_next_request_id(chain_type)
+            call_key = f"{symbol}_{strike}_C_{expiry}"
+            
+            self.app_state['market_data_map'][call_req_id] = call_key
+            self.ibkr_client.reqMktData(call_req_id, call_contract, "", False, False, [])
+            new_req_ids.append(call_req_id)
+            
+            # Put option
+            put_contract = self.create_option_contract(
+                strike=strike,
+                right='P',
+                symbol=symbol,
+                trading_class=trading_class,
+                expiry=expiry
+            )
+            
+            put_req_id = self.get_next_request_id(chain_type)
+            put_key = f"{symbol}_{strike}_P_{expiry}"
+            
+            self.app_state['market_data_map'][put_req_id] = put_key
+            self.ibkr_client.reqMktData(put_req_id, put_contract, "", False, False, [])
+            new_req_ids.append(put_req_id)
+            
+            # Set strike in table
+            strike_item = QTableWidgetItem(f"{strike:.0f}")
+            strike_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            strike_item.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+            
+            # Color based on ATM
+            if abs(strike - center_strike) < 0.01:  # This IS the ATM strike
+                strike_item.setBackground(QColor("#FFD700"))  # Gold for ATM
+            elif strike > center_strike:
+                strike_item.setBackground(QColor("#2a4a6a"))  # Above ATM: lighter blue
+            else:
+                strike_item.setBackground(QColor("#1a2a3a"))  # Below ATM: darker blue
+            
+            table.setItem(row, strike_col, strike_item)
+        
+        # Store active request IDs
+        self.active_req_ids[chain_type] = new_req_ids
+        
+        logger.info(f"✓ {chain_type} chain: subscribed to {len(new_req_ids)} contracts ({len(strikes)} strikes × 2)")
+
+    def monitor_chain_drift(self):
+        """
+        Monitor for drift between current ATM and chain center.
+        If drift exceeds threshold, trigger sequential recenter.
+        
+        Called periodically via QTimer.
+        """
+        # Only monitor during market hours
+        if not self.is_market_hours():
+            return
+        
+        current_atm = self.calculate_atm_strike()
+        if current_atm <= 0:
+            return
+        
+        # Check main chain center
+        if not hasattr(self, 'last_chain_center_strike') or self.last_chain_center_strike <= 0:
+            self.last_chain_center_strike = current_atm
+            return
+        
+        # Calculate drift in number of strikes
+        strike_increment = self.instrument['strike_increment']
+        drift_strikes = abs(current_atm - self.last_chain_center_strike) / strike_increment
+        
+        # Check if drift exceeds threshold
+        if drift_strikes >= self.chain_drift_threshold:
+            logger.warning(f"⚠️ CHAIN DRIFT DETECTED: {drift_strikes:.1f} strikes")
+            logger.warning(f"  Current ATM: {current_atm:.0f}, Chain Center: {self.last_chain_center_strike:.0f}")
+            logger.warning(f"  Threshold: {self.chain_drift_threshold} strikes")
+            
+            self.log_message(f"Recentering chains (drift: {drift_strikes:.1f} strikes)...", "WARNING")
+            
+            # Trigger sequential reload
+            self.load_all_chains_sequential()
+
+    # ============================================================================
+    # END OF SIMPLIFIED CHAIN LOADING SYSTEM
+    # ============================================================================
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # DELETED: build_main_chain_only() and build_ts_chains_after_main_complete()
+    # Replaced by: load_all_chains_sequential() and build_single_chain()
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # DELETED: get_adjusted_es_price() - No longer needed
+    # ATM calculation now uses ONLY underlying price, no ES adjustments
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # DELETED: find_atm_strike_by_delta() - No longer needed
+    # ATM is now simply: round(underlying_price / strike_interval) * strike_interval
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def refresh_option_chain(self):
         """
         SIMPLIFIED PHASE 1: Build ONLY the main option chain
         
@@ -7105,160 +7463,11 @@ class MainWindow(QMainWindow):
     # ===== COMPLEX ATM SCANNING FUNCTIONS REMOVED =====
     # The request_atm_scan_for_ts_chain() function has been deleted as part of simplification.
     # TS chains now use the same master ATM calculation as main chain for consistent chain building.
+    
+    # ===== COMPLEX FUNCTION REMOVED =====
+    # This complex chain building function was removed during simplification.
+    # All chains now use the unified master ATM calculation.
 
-            
-            # Get expiry
-            if contract_type == "0DTE":
-                expiry = self.calculate_expiry_date(0)
-                self.ts_0dte_expiry = expiry
-            else:
-                expiry_0dte = self.calculate_expiry_date(0)
-                expiry_1dte = self.calculate_expiry_date(1)
-                if expiry_1dte == expiry_0dte:
-                    expiry = self.calculate_expiry_date(2)
-                else:
-                    expiry = expiry_1dte
-                self.ts_1dte_expiry = expiry
-            
-            # Use master ATM calculation for consistency
-            strike_interval = self.instrument['strike_increment']
-            reference_price = self.calculate_master_atm_strike()
-            if reference_price == 0:
-                logger.warning(f"[TS {contract_type} ATM SCAN] No underlying price available - waiting for data")
-                return
-            logger.info(f"[TS {contract_type} ATM SCAN] Using master ATM calculation: ${reference_price:.2f}")
-            
-            # Build scan range: ±10 strikes around reference
-            center_estimate = round(reference_price / strike_interval) * strike_interval
-            scan_strikes = []
-            for i in range(-10, 11):  # -10 to +10 inclusive
-                scan_strikes.append(center_estimate + (i * strike_interval))
-            
-            logger.info(f"[TS {contract_type} ATM SCAN] Scanning {len(scan_strikes)} strikes: {min(scan_strikes):.0f} to {max(scan_strikes):.0f}")
-            self.log_message(f"Scanning {contract_type} for ATM strike ({min(scan_strikes):.0f}-{max(scan_strikes):.0f})...", "INFO")
-            
-            # Store scan state
-            scan_state_key = f'ts_{contract_type.lower()}_atm_scan'
-            self.app_state[scan_state_key] = {
-                'expiry': expiry,
-                'contract_type': contract_type,
-                'scan_strikes': scan_strikes,
-                'deltas': {},
-                'scan_complete': False
-            }
-            
-            # Request ONLY deltas for ATM scan - send all requests immediately like main chain
-            # NOTE: Cannot use snapshot=True with generic ticks (error 321)
-            trading_class = "SPXW" if SELECTED_INSTRUMENT == "SPX" else "XSP"
-            
-            scan_req_ids = []
-            # Use dedicated ID range for TS scans: 2000+ (avoid conflicts with main chain 100-999)
-            base_req_id = 2000 if contract_type == "0DTE" else 2100
-            
-            for i, strike in enumerate(scan_strikes):
-                call_contract = self.create_option_contract(
-                    strike=strike,
-                    right='C',
-                    symbol=SELECTED_INSTRUMENT,
-                    trading_class=trading_class,
-                    expiry=expiry
-                )
-                
-                req_id = base_req_id + i
-                self.ibkr_client.reqMktData(req_id, call_contract, "", False, False, [])
-                
-                # Map request to scan
-                self.app_state['market_data_map'][req_id] = {
-                    'scan_key': scan_state_key,
-                    'strike': strike,
-                    'contract_type': contract_type
-                }
-                scan_req_ids.append(req_id)
-            
-            # Store request IDs
-            self.app_state[scan_state_key]['req_ids'] = scan_req_ids
-            
-            # Set timeout to complete scan and find ATM (5 seconds for 1DTE, 3 for 0DTE)
-    # ===== ORPHANED CODE REMOVED =====
-    # Removed leftover code from complex ATM scanning function
-    
-    def complete_atm_scan_and_build_chain(self, contract_type: str):
-        """
-        Phase 2: Analyze scan results, find true ATM, build proper chain.
-        
-        Args:
-            contract_type: "0DTE" or "1DTE"
-        """
-        try:
-            scan_state_key = f'ts_{contract_type.lower()}_atm_scan'
-            scan_state = self.app_state.get(scan_state_key)
-            
-            if not scan_state:
-                logger.warning(f"[TS {contract_type} ATM SCAN] No scan state found")
-                return
-            
-            deltas = scan_state.get('deltas', {})
-            
-            logger.info(f"[TS {contract_type} ATM SCAN] Scan complete - received {len(deltas)} deltas out of 21 strikes")
-            
-            if not deltas:
-                logger.warning(f"[TS {contract_type} ATM SCAN] No deltas received, falling back to price-based center")
-                # DON'T cancel - causes disconnect. Just clean up mapping.
-                scan_req_ids = scan_state.get('req_ids', [])
-                logger.info(f"[TS {contract_type} ATM SCAN] Cleaning up {len(scan_req_ids)} scan request mappings (fallback path)")
-                
-                for req_id in scan_req_ids:
-                    if req_id in self.app_state['market_data_map']:
-                        del self.app_state['market_data_map'][req_id]
-                
-                # Clear scan state
-                del self.app_state[scan_state_key]
-                
-                # Fall back to price-based chain
-                logger.info(f"[TS {contract_type} ATM SCAN] Falling back to price-based centering")
-                self.request_ts_chain(contract_type)
-                return
-            
-            # Find strike with delta closest to 0.5
-            best_strike = 0
-            best_diff = float('inf')
-            
-            for strike, delta in deltas.items():
-                if delta is not None and 0 < delta < 1:
-                    diff = abs(delta - 0.5)
-                    if diff < best_diff:
-                        best_diff = diff
-                        best_strike = strike
-            
-            if best_strike == 0:
-                logger.warning(f"[TS {contract_type} ATM SCAN] Could not find valid ATM, falling back")
-                self.request_ts_chain(contract_type)
-                return
-            
-            logger.info(f"[TS {contract_type} ATM SCAN] ✅ Found true ATM: {best_strike:.0f} (delta: {deltas[best_strike]:.3f})")
-            logger.info(f"[TS {contract_type} ATM SCAN] === Phase 2: Building chain centered on ATM ===")
-            self.log_message(f"{contract_type} ATM found at {best_strike:.0f} - building chain...", "SUCCESS")
-            
-            # DON'T cancel scan subscriptions - causes Error 504 disconnect!
-            # Just clean up the mapping - the scan data will be ignored/overwritten
-            scan_req_ids = scan_state.get('req_ids', [])
-            logger.info(f"[TS {contract_type} ATM SCAN] Cleaning up {len(scan_req_ids)} scan request mappings (not canceling)")
-            
-            for req_id in scan_req_ids:
-                # Just remove from mapping, subscriptions stay active but ignored
-                if req_id in self.app_state['market_data_map']:
-                    del self.app_state['market_data_map'][req_id]
-            
-            # Clear scan state
-            del self.app_state[scan_state_key]
-            
-            # Build the chain immediately - scan subscriptions are harmless background noise now
-            logger.info(f"[TS {contract_type} ATM SCAN] Building chain centered on ATM strike {best_strike}")
-            self.request_ts_chain(contract_type, force_center_strike=best_strike)
-            
-        except Exception as e:
-            logger.error(f"[TS {contract_type} ATM SCAN] Error completing scan: {e}", exc_info=True)
-    
     def calculate_initial_atm_strike(self, contract_type: str = "0DTE") -> float:
         """
         Calculate initial ATM strike for chain centering using best available method.
@@ -9645,7 +9854,7 @@ class MainWindow(QMainWindow):
         """Handle entry signal from TradeStation"""
         try:
             action = signal_data.get('action', '')
-            symbol = signal_data.get('symbol', SELECTED_INSTRUMENT)
+            symbol = signal_data.get('symbol', self.selected_instrument)
             quantity = signal_data.get('quantity', 1)
             signal_id = signal_data.get('signal_id', '')
             
@@ -9679,7 +9888,7 @@ class MainWindow(QMainWindow):
         """Handle exit signal from TradeStation"""
         try:
             action = signal_data.get('action', '')
-            symbol = signal_data.get('symbol', SELECTED_INSTRUMENT)
+            symbol = signal_data.get('symbol', self.selected_instrument)
             signal_id = signal_data.get('signal_id', '')
             
             self.log_message(f"Exit signal received: {action} for {symbol}", "INFO")
@@ -10304,7 +10513,7 @@ class MainWindow(QMainWindow):
             logger.info(f"[TS {contract_type}] Requesting {len(strikes)} strikes from {min(strikes):.0f} to {max(strikes):.0f} (center: {center_strike:.0f})")
             
             # Determine trading class
-            trading_class = "SPXW" if SELECTED_INSTRUMENT == "SPX" else "XSP"
+            trading_class = "SPXW" if self.selected_instrument == "SPX" else "XSP"
             
             # Request market data for each strike - use dedicated ID ranges like main chain
             # 0DTE TS: 3000-3099, 1DTE TS: 4000-4099 (avoid conflicts)
@@ -10314,20 +10523,20 @@ class MainWindow(QMainWindow):
             for strike in strikes:
                 # Request call
                 call_contract = self.create_option_contract(
-                    strike=strike, right='C', symbol=SELECTED_INSTRUMENT,
+                    strike=strike, right='C', symbol=self.selected_instrument,
                     trading_class=trading_class, expiry=expiry
                 )
-                call_key = f"{SELECTED_INSTRUMENT}_{strike}_C_{expiry}"
+                call_key = f"{self.selected_instrument}_{strike}_C_{expiry}"
                 self.ibkr_client.reqMktData(req_id, call_contract, "", False, False, [])
                 self.app_state['market_data_map'][req_id] = call_key
                 req_id += 1
                 
                 # Request put
                 put_contract = self.create_option_contract(
-                    strike=strike, right='P', symbol=SELECTED_INSTRUMENT,
+                    strike=strike, right='P', symbol=self.selected_instrument,
                     trading_class=trading_class, expiry=expiry
                 )
-                put_key = f"{SELECTED_INSTRUMENT}_{strike}_P_{expiry}"
+                put_key = f"{self.selected_instrument}_{strike}_P_{expiry}"
                 self.ibkr_client.reqMktData(req_id, put_contract, "", False, False, [])
                 self.app_state['market_data_map'][req_id] = put_key
                 req_id += 1
