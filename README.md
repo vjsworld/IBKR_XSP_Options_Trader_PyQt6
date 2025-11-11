@@ -149,6 +149,56 @@ python main.py
 
 ## Architecture
 
+### CRITICAL: Strike Type Convention (FLOAT Only)
+
+**⚠️ IB API REQUIREMENT**: All strikes MUST be typed as `float`, never `int`.
+
+IBKR's API sends strike prices as floating-point numbers (e.g., `684.0`, `685.0`) even for whole-number strikes. Our application MUST maintain this convention throughout the codebase to prevent contract key mismatches that cause data overwriting bugs.
+
+**Contract Key Format** (CORRECT):
+```python
+contract_key = f"XSP_{strike}_C_{expiry}"  # strike is FLOAT
+# Example: "XSP_684.0_C_20251111"
+```
+
+**Contract Key Format** (WRONG - DO NOT USE):
+```python
+strike_int = int(strike)  # ❌ NEVER convert to int
+contract_key = f"XSP_{strike_int}_C_{expiry}"
+# Example: "XSP_684_C_20251111"  # ❌ Mismatches IBKR data
+```
+
+**Why This Matters**:
+When a strike is converted to `int`, contract keys won't match IBKR's float-based data:
+- IBKR sends: `"XSP_684.0_P_20251111"` (float strike)
+- If we use: `"XSP_684_P_20251111"` (int strike)
+- Result: **Data lookup fails**, creates separate dictionary entry
+- Consequence: Bid/ask prices get **overwritten** between contracts
+
+**Rules for Developers**:
+1. ✅ **Always** use `float` type for strike variables
+2. ✅ **Never** call `int(strike)` when building contract keys
+3. ✅ Use `{strike:.1f}` or `{strike:.2f}` in logging for clarity
+4. ✅ Compare strikes with tolerance: `abs(strike1 - strike2) < 0.01`
+5. ❌ **Never** use `{strike:.0f}` (hides the float nature)
+6. ❌ **Never** create "strike_int" variables for contract keys
+
+**Key Locations** (already fixed in codebase):
+- Contract key generation in chain loading (lines ~5565, ~5581)
+- TradeStation automation entry (lines ~10425-10428)
+- Straddle strategy (lines ~12519-12587)
+- Option chain cell updates (line ~7252)
+- TS chain cell updates (lines ~10871-10872)
+
+**Testing Strike Types**:
+```python
+# Verify contract key format
+assert isinstance(strike, float), "Strike must be float"
+assert "_" in contract_key and "." in contract_key.split("_")[1], "Strike must include decimal"
+```
+
+See `copilot-instructions.md` for AI agent guidance on maintaining this convention.
+
 ### Thread Safety
 All GUI updates use PyQt6 signals/slots for thread safety:
 ```

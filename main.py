@@ -683,9 +683,21 @@ class IBKRWrapper(EWrapper):
         - Real-time P&L updates
         - Bid/ask availability for close order mid-price chasing
         """
+        contract_key = f"{contract.symbol}_{contract.strike}_{contract.right}_{contract.lastTradeDateOrContractMonth[:8]}"
+        
         if position != 0:
-            contract_key = f"{contract.symbol}_{contract.strike}_{contract.right}_{contract.lastTradeDateOrContractMonth[:8]}"
             per_option_cost = avgCost / 100 if contract.secType == "OPT" else avgCost
+            
+            # Mark this position as confirmed by IBKR
+            if self._main_window:
+                self._main_window.positions_confirmed_by_ibkr.add(contract_key)
+            
+            # Check if this position came from an automated order
+            is_automated = False
+            if self._main_window and hasattr(self._main_window, '_automated_order_ids'):
+                # Check recent fills - this is a simplified check
+                # In production, you'd track order_id -> contract_key mapping more precisely
+                is_automated = len(self._main_window._automated_order_ids) > 0
             
             position_data = {
                 'contract': contract,
@@ -693,7 +705,8 @@ class IBKRWrapper(EWrapper):
                 'avgCost': per_option_cost,
                 'currentPrice': 0,
                 'pnl': 0,
-                'entryTime': datetime.now()
+                'entryTime': datetime.now(),
+                'is_automated': is_automated  # Mark automated positions
             }
             self.signals.position_update.emit(contract_key, position_data)
             
@@ -744,7 +757,29 @@ class IBKRWrapper(EWrapper):
             self.signals.connection_message.emit(f"Position closed: {contract_key}", "INFO")
     
     def positionEnd(self):
-        """Called when initial position data is complete"""
+        """
+        Called when initial position data is complete.
+        Clean up any stale positions that weren't confirmed by IBKR.
+        """
+        if self._main_window:
+            # Find positions that were loaded from file but not confirmed by IBKR
+            stale_positions = []
+            for contract_key in list(self._main_window.positions.keys()):
+                if contract_key not in self._main_window.positions_confirmed_by_ibkr:
+                    stale_positions.append(contract_key)
+            
+            # Remove stale positions
+            if stale_positions:
+                logger.info(f"Cleaning up {len(stale_positions)} stale position(s) not confirmed by IBKR")
+                for contract_key in stale_positions:
+                    logger.info(f"Removing stale position: {contract_key}")
+                    self.signals.position_closed.emit(contract_key)
+            else:
+                logger.info("All saved positions confirmed by IBKR")
+            
+            # Clear the confirmation set for next connection
+            self._main_window.positions_confirmed_by_ibkr.clear()
+        
         self.signals.connection_message.emit("Position subscription complete", "INFO")
     
     def execDetails(self, reqId: int, contract: Contract, execution):
@@ -1054,18 +1089,47 @@ class TradeStationManager(QObject):
             if show_all:
                 self.signals.ts_activity.emit(f"[CHANGE] {key} = {value_str}")
             
-            # Handle StrategyDirection: 1=Long, -1=Short
+            # Handle StrategyDirection from TradeStation
+            # CURRENT FORMAT: 1=LONG, -1=SHORT, 0=FLAT (TradeStation standard)
+            # FUTURE FORMAT: Will support 0=FLAT, 1=LONG, 2=SHORT (normalized)
             if key == "StrategyDirection":
                 try:
-                    direction = int(value)
-                    # Only emit signal and log if direction actually changed
-                    if direction != self.last_strategy_direction:
-                        self.last_strategy_direction = direction
-                        self.signals.strategy_direction_changed.emit(direction)
-                        direction_str = "LONG" if direction == 1 else "SHORT" if direction == -1 else "FLAT"
-                        logger.info(f"[TS→PYTHON] Strategy direction changed to: {direction_str} ({direction})")
+                    raw_value = int(value)
+                    
+                    # Convert TradeStation format to normalized format
+                    # Current: 1=LONG, -1=SHORT, 0=FLAT
+                    # Convert to: 0=FLAT, 1=LONG, 2=SHORT (for handler)
+                    if raw_value == 1:
+                        direction = 1  # LONG
+                        direction_str = "LONG"
+                    elif raw_value == -1:
+                        direction = 2  # SHORT (convert -1 to 2)
+                        direction_str = "SHORT"
+                    elif raw_value == 0:
+                        direction = 0  # FLAT
+                        direction_str = "FLAT"
+                    else:
+                        # Future-proof: if TS sends 2, accept it as SHORT
+                        if raw_value == 2:
+                            direction = 2
+                            direction_str = "SHORT"
+                        else:
+                            direction = 0  # Unknown values default to FLAT
+                            direction_str = f"UNKNOWN({raw_value})->FLAT"
+                            logger.warning(f"Unknown StrategyDirection value {raw_value}, defaulting to FLAT")
+                    
+                    # ALWAYS emit signal to support immediate join mode
+                    # BUT only log if value changed to reduce spam
+                    direction_changed = (direction != self.last_strategy_direction)
+                    self.last_strategy_direction = direction
+                    self.signals.strategy_direction_changed.emit(direction)
+                    
+                    if direction_changed:
+                        logger.info(f"[TS→PYTHON] StrategyDirection: {direction_str} (TS={raw_value} → Python={direction})")
                         self.signals.ts_activity.emit(f"[STRATEGY] Direction: {direction_str}")
-                    # Don't log if direction hasn't changed (prevents spam)
+                    else:
+                        # Only log at DEBUG level if no change (reduces spam)
+                        logger.debug(f"[TS→PYTHON] StrategyDirection: {direction_str} (unchanged)")
                 except (ValueError, TypeError):
                     logger.warning(f"Invalid StrategyDirection value: {value}")
             
@@ -2447,6 +2511,7 @@ class MainWindow(QMainWindow):
         # Trading state
         self.positions = {}  # contract_key -> position_data
         self.saved_positions = {}  # Loaded from positions.json for entryTime persistence
+        self.positions_confirmed_by_ibkr = set()  # Track which positions IBKR confirmed (for stale detection)
         self.market_data = {}  # contract_key -> market_data
         self.pending_orders = {}  # order_id -> (contract_key, action, quantity)
         self.chasing_orders = {}  # order_id -> chasing_order_info (for all orders with mid-price chasing enabled)
@@ -2576,8 +2641,9 @@ class MainWindow(QMainWindow):
         self.offset_save_timer.timeout.connect(self.save_offset_to_settings)
         self.offset_save_timer.start(60000)  # Save every 60 seconds
         
-        # Manual trading settings
-        self.give_in_interval = 5.0  # Seconds between "give in" price adjustments (configurable)
+        # Manual trading settings - Chase give-in logic (time-based tick progression)
+        self.chase_give_in_interval = 3.0  # Seconds between give-in adjustments (will be loaded from settings)
+        self.min_order_modification_interval = 2.0  # HARD LIMIT: IB compliance - never modify order faster than 2 seconds
         
         # Master Settings (Strategy Control Panel)
         self.strategy_enabled = False  # Strategy automation OFF by default
@@ -4700,6 +4766,24 @@ class MainWindow(QMainWindow):
         
         layout.addWidget(ts_chain_group)
         
+        # Order Chasing Settings
+        chase_group = QGroupBox("Order Chasing Settings")
+        chase_layout = QFormLayout(chase_group)
+        
+        self.chase_give_in_spin = QDoubleSpinBox()
+        self.chase_give_in_spin.setRange(1.0, 10.0)
+        self.chase_give_in_spin.setSingleStep(0.5)
+        self.chase_give_in_spin.setDecimals(1)
+        self.chase_give_in_spin.setValue(self.chase_give_in_interval)
+        self.chase_give_in_spin.setSuffix(" sec")
+        self.chase_give_in_spin.setToolTip("Time between price adjustments when chasing mid-price. Lower = more aggressive, Higher = more patient.")
+        chase_layout.addRow("Chase Give-In Interval:", self.chase_give_in_spin)
+        
+        # Connect signal for immediate value changes
+        self.chase_give_in_spin.valueChanged.connect(self.on_chase_interval_changed)
+        
+        layout.addWidget(chase_group)
+        
         # TradeStation GlobalDictionary Settings
         gd_group = QGroupBox("TradeStation GlobalDictionary")
         gd_layout = QVBoxLayout(gd_group)
@@ -4725,6 +4809,14 @@ class MainWindow(QMainWindow):
         """Update the GlobalDictionary communications setting immediately when checkbox is toggled"""
         self.show_all_gd_communications = self.show_all_gd_checkbox.isChecked()
         logger.info(f"GlobalDictionary show all communications setting updated to: {self.show_all_gd_communications}")
+    
+    def on_chase_interval_changed(self):
+        """Handle chase interval spinbox value changes"""
+        self.chase_give_in_interval = self.chase_give_in_spin.value()
+        logger.info(f"Chase give-in interval updated to: {self.chase_give_in_interval:.1f} seconds")
+        self.log_message(f"Chase interval: {self.chase_give_in_interval:.1f}s", "INFO")
+        # Save settings immediately
+        self.save_settings()
     
     def apply_dark_theme(self):
         """Apply IBKR TWS dark color scheme with minimal Bloomberg-style orange accents"""
@@ -5157,8 +5249,8 @@ class MainWindow(QMainWindow):
         # Get underlying price - ONLY from underlying, no ES fallback
         underlying_price = self.app_state.get('underlying_price', 0)
         
-        logger.info(f"🔍 ATM DEBUG: app_state['underlying_price'] = {underlying_price}")
-        logger.info(f"🔍 ATM DEBUG: strike_increment = {strike_increment}")
+        logger.debug(f"🔍 ATM DEBUG: app_state['underlying_price'] = {underlying_price}")
+        logger.debug(f"🔍 ATM DEBUG: strike_increment = {strike_increment}")
         
         # If no underlying price, always wait (no ES fallback to avoid wrong calculations)
         if underlying_price <= 0:
@@ -5168,8 +5260,8 @@ class MainWindow(QMainWindow):
         # Round to nearest strike increment - that's the ATM!
         atm_strike = round(underlying_price / strike_increment) * strike_increment
         
-        logger.info(f"💎 Master ATM calculation: Price ${underlying_price:.2f} (underlying) → Strike ${atm_strike:.0f}")
-        logger.info(f"💎 ATM DEBUG: Calculation: round({underlying_price:.4f} / {strike_increment}) * {strike_increment} = {atm_strike:.0f}")
+        logger.debug(f"💎 Master ATM calculation: Price ${underlying_price:.2f} (underlying) → Strike ${atm_strike:.0f}")
+        logger.debug(f"💎 ATM DEBUG: Calculation: round({underlying_price:.4f} / {strike_increment}) * {strike_increment} = {atm_strike:.0f}")
         
         # CRITICAL: If we get 662 instead of 671, log an alert
         if underlying_price > 671.0 and atm_strike < 665:
@@ -5401,9 +5493,12 @@ class MainWindow(QMainWindow):
             expiry_1dte = self.calculate_expiry_date(1)
             if expiry_1dte == expiry_0dte:
                 expiry = self.calculate_expiry_date(2)
+                logger.info(f"🔄 1DTE = 0DTE ({expiry_1dte}), using 2DTE expiry: {expiry}")
             else:
                 expiry = expiry_1dte
+                logger.info(f"✓ Using 1DTE expiry: {expiry} (0DTE={expiry_0dte})")
             self.ts_1dte_expiry = expiry
+            logger.info(f"📅 Set self.ts_1dte_expiry = {self.ts_1dte_expiry}")
             symbol = self.instrument['options_symbol']
             trading_class = self.instrument['options_trading_class']
             # Check if TS table exists
@@ -5452,6 +5547,11 @@ class MainWindow(QMainWindow):
         new_req_ids = []
         
         for row, strike in enumerate(strikes):
+            # CRITICAL: IB API CONVENTION - Strikes MUST be FLOAT type
+            # Contract keys use FLOAT strikes (e.g., "XSP_686.0_C_20251112") to match IBKR's data format
+            # Never convert to int - this causes contract key mismatches and data overwriting
+            # IBKR sends strikes as floats (684.0, 685.0, etc.), so our keys must match exactly
+            
             # Call option
             call_contract = self.create_option_contract(
                 strike=strike,
@@ -5462,7 +5562,7 @@ class MainWindow(QMainWindow):
             )
             
             call_req_id = self.get_next_request_id(chain_type)
-            call_key = f"{symbol}_{strike}_C_{expiry}"
+            call_key = f"{symbol}_{strike}_C_{expiry}"  # Keep strike as FLOAT
             
             self.app_state['market_data_map'][call_req_id] = call_key
             self.ibkr_client.reqMktData(call_req_id, call_contract, "", False, False, [])
@@ -5478,7 +5578,7 @@ class MainWindow(QMainWindow):
             )
             
             put_req_id = self.get_next_request_id(chain_type)
-            put_key = f"{symbol}_{strike}_P_{expiry}"
+            put_key = f"{symbol}_{strike}_P_{expiry}"  # Keep strike as FLOAT
             
             self.app_state['market_data_map'][put_req_id] = put_key
             self.ibkr_client.reqMktData(put_req_id, put_contract, "", False, False, [])
@@ -5847,6 +5947,9 @@ class MainWindow(QMainWindow):
     @pyqtSlot(str, dict)
     def on_position_update(self, contract_key: str, position_data: dict):
         """Handle position updates"""
+        # Check if this is a new position or update
+        is_new_position = contract_key not in self.positions
+        
         # Add entryTime if this is a new position
         if contract_key not in self.positions:
             position_data['entryTime'] = datetime.now()
@@ -5855,6 +5958,19 @@ class MainWindow(QMainWindow):
             position_data['entryTime'] = self.positions[contract_key].get('entryTime', datetime.now())
         
         self.positions[contract_key] = position_data
+        
+        # ACTIVITY LOG: Position update
+        if hasattr(self, 'ts_signals'):
+            qty = position_data.get('position', 0)
+            avg_cost = position_data.get('avgCost', 0)
+            if is_new_position:
+                self.ts_signals.ts_activity.emit(
+                    f"📊 NEW POSITION: {contract_key} | Qty: {qty} @ ${avg_cost:.2f}"
+                )
+            else:
+                self.ts_signals.ts_activity.emit(
+                    f"📊 POSITION UPDATE: {contract_key} | Qty: {qty}"
+                )
         
         # Merge with saved positions to restore entryTime from previous session
         self.merge_saved_positions(contract_key)
@@ -5929,6 +6045,29 @@ class MainWindow(QMainWindow):
             
             # Remove from pending if filled or cancelled
             status = status_data.get('status', '')
+            
+            # ACTIVITY LOG: Order status change
+            if hasattr(self, 'ts_signals'):
+                contract_key = self.pending_orders[order_id].get('contract_key', 'Unknown')
+                action = self.pending_orders[order_id].get('action', '?')
+                qty = self.pending_orders[order_id].get('quantity', 0)
+                filled = status_data.get('filled', 0)
+                remaining = status_data.get('remaining', 0)
+                avg_fill_price = status_data.get('avgFillPrice', 0)
+                
+                if status == 'Filled':
+                    self.ts_signals.ts_activity.emit(
+                        f"✅ ORDER FILLED: #{order_id} | {action} {qty}x {contract_key} @ ${avg_fill_price:.2f}"
+                    )
+                elif status == 'Cancelled':
+                    self.ts_signals.ts_activity.emit(f"🚫 ORDER CANCELLED: #{order_id} | {contract_key}")
+                elif status == 'PartiallyFilled':
+                    self.ts_signals.ts_activity.emit(
+                        f"⏳ PARTIAL FILL: #{order_id} | {filled}/{qty} filled, {remaining} remaining"
+                    )
+                elif status in ['PreSubmitted', 'Submitted']:
+                    self.ts_signals.ts_activity.emit(f"📨 ORDER {status.upper()}: #{order_id}")
+            
             if status in ['Filled', 'Cancelled', 'Inactive']:
                 self.log_message(f"Order #{order_id} {status}", "SUCCESS")
                 
@@ -7111,89 +7250,92 @@ class MainWindow(QMainWindow):
             symbol, strike, right, expiry = parts
             strike = float(strike)
             
-            # Find the row for this strike
+            # Find the row for this strike using FLOAT comparison with tolerance
             for row in range(self.option_table.rowCount()):
                 strike_item = self.option_table.item(row, 10)  # Strike column
-                if strike_item and float(strike_item.text()) == strike:
-                    # Get market data
-                    data = self.market_data.get(contract_key, {})
-                    
-                    if right == 'C':  # Call options (left side)
-                        # Columns: Imp Vol, Delta, Theta, Vega, Gamma, Volume, CHANGE %, Last, Ask, Bid
-                        items = [
-                            QTableWidgetItem(f"{data.get('iv', 0):.2f}"),
-                            QTableWidgetItem(f"{data.get('delta', 0):.3f}"),
-                            QTableWidgetItem(f"{data.get('theta', 0):.2f}"),
-                            QTableWidgetItem(f"{data.get('vega', 0):.2f}"),
-                            QTableWidgetItem(f"{data.get('gamma', 0):.4f}"),
-                            QTableWidgetItem(f"{int(data.get('volume', 0))}")
-                        ]
-                        for col, item in enumerate(items):
-                            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                            self.option_table.setItem(row, col, item)
+                if strike_item:
+                    row_strike = float(strike_item.text())
+                    # Compare floats with small tolerance for rounding
+                    if abs(row_strike - strike) < 0.01:
+                        # Get market data
+                        data = self.market_data.get(contract_key, {})
                         
-                        # Calculate change %
-                        last = data.get('last', 0)
-                        prev = data.get('prev_close', 0)
-                        change_pct = ((last - prev) / prev * 100) if prev > 0 else 0
-                        change_item = QTableWidgetItem(f"{change_pct:.1f}%")
-                        change_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                        change_item.setForeground(QColor("#00ff00" if change_pct >= 0 else "#ff0000"))
-                        self.option_table.setItem(row, 6, change_item)
+                        if right == 'C':  # Call options (left side)
+                            # Columns: Imp Vol, Delta, Theta, Vega, Gamma, Volume, CHANGE %, Last, Ask, Bid
+                            items = [
+                                QTableWidgetItem(f"{(data.get('iv') or 0):.2f}"),
+                                QTableWidgetItem(f"{(data.get('delta') or 0):.3f}"),
+                                QTableWidgetItem(f"{(data.get('theta') or 0):.2f}"),
+                                QTableWidgetItem(f"{(data.get('vega') or 0):.2f}"),
+                                QTableWidgetItem(f"{(data.get('gamma') or 0):.4f}"),
+                                QTableWidgetItem(f"{int(data.get('volume') or 0)}")
+                            ]
+                            for col, item in enumerate(items):
+                                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                                self.option_table.setItem(row, col, item)
+                            
+                            # Calculate change %
+                            last = data.get('last') or 0
+                            prev = data.get('prev_close') or 0
+                            change_pct = ((last - prev) / prev * 100) if prev > 0 else 0
+                            change_item = QTableWidgetItem(f"{change_pct:.1f}%")
+                            change_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                            change_item.setForeground(QColor("#00ff00" if change_pct >= 0 else "#ff0000"))
+                            self.option_table.setItem(row, 6, change_item)
+                            
+                            price_items = [
+                                (7, f"{(last):.2f}"),
+                                (8, f"{(data.get('bid') or 0):.2f}"),
+                                (9, f"{(data.get('ask') or 0):.2f}")
+                            ]
+                            for col, text in price_items:
+                                item = QTableWidgetItem(text)
+                                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                                self.option_table.setItem(row, col, item)
                         
-                        price_items = [
-                            (7, f"{last:.2f}"),
-                            (8, f"{data.get('bid', 0):.2f}"),
-                            (9, f"{data.get('ask', 0):.2f}")
-                        ]
-                        for col, text in price_items:
-                            item = QTableWidgetItem(text)
-                            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                            self.option_table.setItem(row, col, item)
-                    
-                    elif right == 'P':  # Put options (right side)
-                        # Columns: Bid, Ask, Last, CHANGE %, Volume, Gamma, Vega, Theta, Delta, Imp Vol
-                        price_items = [
-                            (11, f"{data.get('bid', 0):.2f}"),
-                            (12, f"{data.get('ask', 0):.2f}"),
-                            (13, f"{data.get('last', 0):.2f}")
-                        ]
-                        for col, text in price_items:
-                            item = QTableWidgetItem(text)
-                            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                            self.option_table.setItem(row, col, item)
+                        elif right == 'P':  # Put options (right side)
+                            # Columns: Bid, Ask, Last, CHANGE %, Volume, Gamma, Vega, Theta, Delta, Imp Vol
+                            price_items = [
+                                (11, f"{(data.get('bid') or 0):.2f}"),
+                                (12, f"{(data.get('ask') or 0):.2f}"),
+                                (13, f"{(data.get('last') or 0):.2f}")
+                            ]
+                            for col, text in price_items:
+                                item = QTableWidgetItem(text)
+                                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                                self.option_table.setItem(row, col, item)
+                            
+                            # Calculate change %
+                            last = data.get('last') or 0
+                            prev = data.get('prev_close') or 0
+                            change_pct = ((last - prev) / prev * 100) if prev > 0 else 0
+                            change_item = QTableWidgetItem(f"{change_pct:.1f}%")
+                            change_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                            change_item.setForeground(QColor("#00ff00" if change_pct >= 0 else "#ff0000"))
+                            self.option_table.setItem(row, 14, change_item)
+                            
+                            # Handle None values gracefully
+                            volume = data.get('volume') or 0
+                            gamma = data.get('gamma') or 0
+                            vega = data.get('vega') or 0
+                            theta = data.get('theta') or 0
+                            delta = data.get('delta') or 0
+                            iv = data.get('iv') or 0
+                            
+                            greeks_items = [
+                                (15, f"{int(volume)}"),
+                                (16, f"{gamma:.4f}"),
+                                (17, f"{vega:.2f}"),
+                                (18, f"{theta:.2f}"),
+                                (19, f"{delta:.3f}"),
+                                (20, f"{iv:.2f}")
+                            ]
+                            for col, text in greeks_items:
+                                item = QTableWidgetItem(text)
+                                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                                self.option_table.setItem(row, col, item)
                         
-                        # Calculate change %
-                        last = data.get('last', 0)
-                        prev = data.get('prev_close', 0)
-                        change_pct = ((last - prev) / prev * 100) if prev > 0 else 0
-                        change_item = QTableWidgetItem(f"{change_pct:.1f}%")
-                        change_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                        change_item.setForeground(QColor("#00ff00" if change_pct >= 0 else "#ff0000"))
-                        self.option_table.setItem(row, 14, change_item)
-                        
-                        # Handle None values gracefully
-                        volume = data.get('volume') or 0
-                        gamma = data.get('gamma') or 0
-                        vega = data.get('vega') or 0
-                        theta = data.get('theta') or 0
-                        delta = data.get('delta') or 0
-                        iv = data.get('iv') or 0
-                        
-                        greeks_items = [
-                            (15, f"{int(volume)}"),
-                            (16, f"{gamma:.4f}"),
-                            (17, f"{vega:.2f}"),
-                            (18, f"{theta:.2f}"),
-                            (19, f"{delta:.3f}"),
-                            (20, f"{iv:.2f}")
-                        ]
-                        for col, text in greeks_items:
-                            item = QTableWidgetItem(text)
-                            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                            self.option_table.setItem(row, col, item)
-                    
-                    break
+                        break
         
         except Exception as e:
             logger.debug(f"Error updating option chain cell for {contract_key}: {e}")
@@ -7869,9 +8011,20 @@ class MainWindow(QMainWindow):
                 logger.info(f"✓ placeOrder() API call completed for order #{order_id}")
                 self.log_message(f"✓ Order #{order_id} sent to TWS successfully", "SUCCESS")
                 
+                # ACTIVITY LOG: Order placed
+                if hasattr(self, 'ts_signals'):
+                    order_type_str = "MKT" if limit_price == 0 else f"LMT@${limit_price:.2f}"
+                    self.ts_signals.ts_activity.emit(
+                        f"📤 ORDER PLACED: #{order_id} | {action} {quantity}x {contract_key} | {order_type_str}"
+                    )
+                
             except Exception as e:
                 self.log_message(f"✗ EXCEPTION during placeOrder(): {e}", "ERROR")
                 logger.error(f"placeOrder() exception: {e}", exc_info=True)
+                
+                # ACTIVITY LOG: Order failed
+                if hasattr(self, 'ts_signals'):
+                    self.ts_signals.ts_activity.emit(f"❌ ORDER FAILED: {e}")
                 return None
             
             # STEP 7: Track order ONLY AFTER successful placeOrder() call
@@ -7886,6 +8039,7 @@ class MainWindow(QMainWindow):
             
             # Track for chasing if enabled
             if enable_chasing:
+                now = datetime.now()
                 self.chasing_orders[order_id] = {
                     'contract_key': contract_key,
                     'contract': contract,
@@ -7895,8 +8049,9 @@ class MainWindow(QMainWindow):
                     'last_mid': limit_price,
                     'last_price': limit_price,  # Track actual order price (different from mid during "give in")
                     'give_in_count': 0,  # Number of times we've given in (accumulates)
+                    'last_give_in_time': now,  # Track when we last gave in a tick (for time-based chasing)
                     'attempts': 1,
-                    'timestamp': datetime.now(),  # Reset every time price updates (for 10-second "give in" timer)
+                    'timestamp': now,  # When order was placed/last updated
                     'order': order
                 }
             
@@ -8089,21 +8244,26 @@ class MainWindow(QMainWindow):
     
     def update_orders(self):
         """
-        Monitor all orders with intelligent mid-price chasing and "give in" logic
+        Monitor all orders with intelligent mid-price chasing and time-based "give in" logic
         
         Runs every 1 second to check if:
         1. Order is still open (not filled/cancelled)
-        2. Mid-price has moved significantly (≥$0.05) → recalculate: current_mid ± X_ticks
-        3. Every N seconds without fill → increment X_ticks, recalculate: current_mid ± X_ticks
+        2. Every N seconds without fill → increment X_ticks by 1, recalculate: current_mid ± X_ticks
+        3. Mid-price updates always use current market mid (not sticky to initial mid)
         
         "Give in" logic: Price is ALWAYS current_mid ± X_ticks
         - X_ticks starts at 0 (initial order at pure mid)
-        - After 10 sec: X_ticks = 1 → price = mid ± (1 * tick_size)
-        - After 20 sec: X_ticks = 2 → price = mid ± (2 * tick_size)
-        - After 30 sec: X_ticks = 3 → price = mid ± (3 * tick_size)
+        - After 3 sec: X_ticks = 1 → price = mid ± (1 * tick_size)
+        - After 6 sec: X_ticks = 2 → price = mid ± (2 * tick_size)
+        - After 9 sec: X_ticks = 3 → price = mid ± (3 * tick_size)
         - For BUY: price = mid + X_ticks (creeping toward ask)
         - For SELL: price = mid - X_ticks (creeping toward bid)
         - Uses SPX tick size rules (≥$3.00→$0.10, <$3.00→$0.05)
+        - Interval is configurable in Settings (default 3.0 seconds)
+        
+        IB COMPLIANCE:
+        - Hard minimum 2.0 seconds between ANY order modifications (enforced by min_order_modification_interval)
+        - This overrides all other logic to ensure we never violate IB rate limits
         """
         if not self.chasing_orders:
             # No orders to monitor - stop timer
@@ -8130,9 +8290,6 @@ class MainWindow(QMainWindow):
             last_price = order_info.get('last_price', order_info['last_mid'])
             action = order_info['action']
             
-            # Calculate time since last price update
-            time_since_last_update = (datetime.now() - order_info['timestamp']).total_seconds()
-            
             # Get market data for ask/bid
             market_data = self.market_data.get(contract_key, {})
             ask_price = market_data.get('ask', 0)
@@ -8147,17 +8304,35 @@ class MainWindow(QMainWindow):
             should_update = False
             update_reason = ""
             
+            # IB COMPLIANCE CHECK: Hard minimum 2.0 seconds between ANY order modifications
+            # This is the overriding rule that ensures we never violate IB rate limits
+            last_modification_time = order_info.get('timestamp', order_info.get('last_give_in_time', datetime.now()))
+            time_since_last_modification = (datetime.now() - last_modification_time).total_seconds()
+            
+            if time_since_last_modification < self.min_order_modification_interval:
+                # Too soon since last modification - skip this order
+                continue
+            
+            # TIME-BASED GIVE-IN LOGIC
+            # Calculate how much time has elapsed since last give-in adjustment
+            last_give_in_time = order_info.get('last_give_in_time', order_info['timestamp'])
+            time_since_last_give_in = (datetime.now() - last_give_in_time).total_seconds()
+            
             # Get current give-in tick count
             give_in_ticks = order_info.get('give_in_count', 0)
             
-            # Check if we need to increment give-in counter
-            if time_since_last_update >= self.give_in_interval:
+            # Check if we should add another tick based on elapsed time
+            # Using chase_give_in_interval (configurable, default 3.0 seconds)
+            if time_since_last_give_in >= self.chase_give_in_interval:
                 # Time to give in another tick
                 give_in_ticks += 1
                 order_info['give_in_count'] = give_in_ticks
+                order_info['last_give_in_time'] = datetime.now()  # Update last give-in time
                 should_update = True
-                update_reason = f"Give in timer ({time_since_last_update:.1f}s) → X_ticks={give_in_ticks}"
+                update_reason = f"Time-based give-in (every {self.chase_give_in_interval:.1f}s) → X_ticks={give_in_ticks}"
             
+            # MID-PRICE TRACKING: Recalculate price with current mid (not sticky to old mid)
+            # This ensures we track the market even without giving in more ticks
             # Check if mid-price has moved significantly (use minimum tick size as threshold)
             min_tick = min(self.instrument['tick_size_above_3'], self.instrument['tick_size_below_3'])
             if abs(current_mid - order_info['last_mid']) >= min_tick:
@@ -9599,6 +9774,9 @@ class MainWindow(QMainWindow):
                 'ts_immediate_join': self.ts_immediate_join,
                 'ts_wait_for_next_entry': self.ts_wait_for_next_entry,
                 'ts_last_strategy_state': self.ts_last_strategy_state,
+                
+                # Order Chasing Settings
+                'chase_give_in_interval': self.chase_give_in_interval,
             }
             
             Path(self.get_environment_file_path('settings.json')).write_text(json.dumps(settings, indent=2))
@@ -9824,30 +10002,491 @@ class MainWindow(QMainWindow):
     
     @pyqtSlot(int)
     def on_ts_strategy_direction_changed(self, direction: int):
-        """Handle strategy direction change from TradeStation (1=Long, -1=Short)"""
-        # Only process if direction actually changed to prevent spam
-        if direction == self.ts_strategy_direction:
-            return  # No change, skip processing
+        """
+        Handle strategy direction change from TradeStation
+        
+        Args:
+            direction: 0=FLAT, 1=LONG, 2=SHORT (per user specification)
+        """
+        # NUCLEAR OPTION: Check ACTUAL checkbox state, not just the variable
+        # This prevents any state mismatch between UI and variable
+        if not hasattr(self, 'ts_auto_trading_checkbox'):
+            logger.debug("Auto-trading checkbox not initialized yet")
+            return
             
+        is_checkbox_checked = self.ts_auto_trading_checkbox.isChecked()
+        
+        # CRITICAL: Check master switch FIRST before any processing
+        if not is_checkbox_checked:
+            logger.debug(f"Auto-trading CHECKBOX unchecked - ignoring TS signal (direction={direction})")
+            return
+        
+        # Also check the variable for consistency
+        if not self.ts_auto_trading_enabled:
+            logger.warning(f"Auto-trading variable is False but checkbox is checked - MISMATCH!")
+            logger.warning(f"Using checkbox state (checked={is_checkbox_checked})")
+            return
+        
         # Convert numeric direction to text
         if direction == 1:
             direction_str = "LONG"
             color = "#4CAF50"  # Green
-        elif direction == -1:
+        elif direction == 2:
             direction_str = "SHORT" 
             color = "#FF6B6B"  # Red
-        else:
+        elif direction == 0:
             direction_str = "FLAT"
             color = "#FFFF00"  # Yellow
+        else:
+            direction_str = f"UNKNOWN({direction})"
+            color = "#FF9800"  # Orange
+            logger.warning(f"Invalid StrategyDirection value: {direction}")
+        
+        # Store previous direction for comparison
+        previous_direction = self.ts_strategy_direction
+        previous_direction_str = "LONG" if previous_direction == 1 else "SHORT" if previous_direction == 2 else "FLAT"
+        
+        # Check if direction actually changed
+        direction_changed = (direction != self.ts_strategy_direction)
         
         # Store current strategy direction
         self.ts_strategy_direction = direction
         
-        # Update strategy state display to show direction
-        self.on_ts_strategy_state_changed(direction_str)
+        # Only update UI and log if direction changed (reduces spam)
+        if direction_changed:
+            # Update strategy state display to show direction
+            self.on_ts_strategy_state_changed(direction_str)
+            
+            # Log the change
+            self.log_message(f"📡 TS Strategy: {previous_direction_str} → {direction_str}", "INFO")
+            logger.info(f"TS Strategy direction changed: {previous_direction_str} ({previous_direction}) → {direction_str} ({direction})")
         
-        # Only log actual changes, not repetitive updates
-        self.log_message(f"TS Strategy direction changed to: {direction_str} ({direction})", "INFO")
+        # ===== AUTOMATED TRADING LOGIC =====
+        # Execute trades (master switch already checked at top of function)
+        self.process_strategy_direction_change(direction, previous_direction)
+    
+    def process_strategy_direction_change(self, new_direction: int, old_direction: int):
+        """
+        Process strategy direction change and execute trades based on checkbox settings
+        
+        Trading Rules:
+        1. If LONG checked only: Enter CALL on LONG signal, exit CALL on SHORT/FLAT signal
+        2. If SHORT checked only: Enter PUT on SHORT signal, exit PUT on LONG/FLAT signal
+        3. If BOTH checked: Switch between CALL and PUT on signal changes, exit on FLAT
+        
+        Args:
+            new_direction: New direction (0=FLAT, 1=LONG, 2=SHORT)
+            old_direction: Previous direction (0=FLAT, 1=LONG, 2=SHORT)
+        """
+        try:
+            # ⚠️ CRITICAL: Don't process if direction hasn't changed (prevents spam)
+            if new_direction == old_direction:
+                logger.debug(f"Direction unchanged ({new_direction}) - skipping processing")
+                return
+            
+            logger.info(f"===== PROCESSING STRATEGY CHANGE: {old_direction} → {new_direction} =====")
+            logger.info(f"Settings: ts_auto_trading_enabled={self.ts_auto_trading_enabled}, LONG={self.ts_auto_long_enabled}, SHORT={self.ts_auto_short_enabled}")
+            
+            # CRITICAL SAFETY CHECKS before trading
+            
+            # 1. Check if automation is enabled (MASTER SWITCH)
+            if not self.ts_auto_trading_enabled:
+                logger.info("⛔ Auto-trading MASTER SWITCH disabled - ignoring signal")
+                self.log_message("⛔ Auto-trading disabled - signal ignored", "INFO")
+                return
+            
+            # 2. Check if connected to IBKR
+            if self.connection_state != ConnectionState.CONNECTED:
+                logger.warning("Not connected to IBKR - cannot process signal")
+                self.log_message("⚠️ Cannot trade: Not connected to IBKR", "WARNING")
+                return
+            
+            # 3. Check if option chains are loaded (at least one expiry available)
+            if not self.ts_0dte_expiry and not self.ts_1dte_expiry:
+                logger.warning("Option chains not loaded - cannot process signal")
+                self.log_message("⚠️ Cannot trade: Option chains not loaded yet", "WARNING")
+                return
+            
+            # 4. Check if ATM strike is available
+            atm_strike = self.calculate_master_atm_strike()
+            if atm_strike <= 0:
+                logger.warning("ATM strike not available - cannot process signal")
+                self.log_message("⚠️ Cannot trade: ATM strike not calculated yet", "WARNING")
+                return
+            
+            # All safety checks passed - proceed with trading
+            logger.info("✓ All safety checks passed - proceeding with automated trading")
+            
+            # Check if we should act on this signal based on entry timing mode
+            if not self._should_act_on_signal(new_direction, old_direction):
+                return
+            
+            # ===== IMPLEMENT TRADING RULES =====
+            
+            # Determine what action to take based on checkboxes and signals
+            long_enabled = self.ts_auto_long_enabled
+            short_enabled = self.ts_auto_short_enabled
+            
+            # RULE 1: LONG only (SHORT disabled)
+            if long_enabled and not short_enabled:
+                if new_direction == 1:  # LONG signal
+                    # Close any existing positions first, then enter CALL
+                    self._close_automated_positions(old_direction)
+                    self._enter_automated_position(1)  # Enter CALL
+                    logger.info("LONG-only mode: Entered CALL on LONG signal")
+                elif new_direction in [0, 2]:  # FLAT or SHORT signal
+                    # Exit any CALL positions, don't enter anything
+                    self._close_automated_positions(old_direction)
+                    logger.info(f"LONG-only mode: Closed positions on {'FLAT' if new_direction == 0 else 'SHORT'} signal")
+                    self.log_message("📊 LONG-only mode: Position closed (SHORT disabled)", "INFO")
+            
+            # RULE 2: SHORT only (LONG disabled)
+            elif short_enabled and not long_enabled:
+                if new_direction == 2:  # SHORT signal
+                    # Close any existing positions first, then enter PUT
+                    self._close_automated_positions(old_direction)
+                    self._enter_automated_position(2)  # Enter PUT
+                    logger.info("SHORT-only mode: Entered PUT on SHORT signal")
+                elif new_direction in [0, 1]:  # FLAT or LONG signal
+                    # Exit any PUT positions, don't enter anything
+                    self._close_automated_positions(old_direction)
+                    logger.info(f"SHORT-only mode: Closed positions on {'FLAT' if new_direction == 0 else 'LONG'} signal")
+                    self.log_message("📊 SHORT-only mode: Position closed (LONG disabled)", "INFO")
+            
+            # RULE 3: BOTH enabled - switch between CALL and PUT
+            elif long_enabled and short_enabled:
+                if new_direction == 1:  # LONG signal
+                    # Close any existing positions (PUT if switching), then enter CALL
+                    self._close_automated_positions(old_direction)
+                    self._enter_automated_position(1)  # Enter CALL
+                    logger.info("BOTH mode: Entered CALL on LONG signal")
+                elif new_direction == 2:  # SHORT signal
+                    # Close any existing positions (CALL if switching), then enter PUT
+                    self._close_automated_positions(old_direction)
+                    self._enter_automated_position(2)  # Enter PUT
+                    logger.info("BOTH mode: Entered PUT on SHORT signal")
+                elif new_direction == 0:  # FLAT signal
+                    # Close all positions, don't enter anything
+                    self._close_automated_positions(old_direction)
+                    logger.info("BOTH mode: Closed all positions on FLAT signal")
+                    self.log_message("📊 Strategy FLAT - all positions closed", "INFO")
+            
+            # RULE 4: Neither enabled - just close any existing positions
+            else:
+                logger.warning("Neither LONG nor SHORT enabled - closing any existing positions")
+                self._close_automated_positions(old_direction)
+                self.log_message("⚠️ No trade directions enabled - positions closed", "WARNING")
+                
+        except Exception as e:
+            logger.error(f"Error processing strategy direction change: {e}", exc_info=True)
+            self.log_message(f"❌ Error processing strategy change: {e}", "ERROR")
+    
+    def _should_act_on_signal(self, new_direction: int, old_direction: int) -> bool:
+        """
+        Determine if we should act on this signal based on entry timing mode
+        
+        Returns:
+            True if we should process the signal, False if we should ignore it
+        """
+        # Check if this is the first signal we're receiving (startup)
+        if not hasattr(self, '_ts_first_signal_received'):
+            self._ts_first_signal_received = True
+            
+            # Immediate join mode: Act on first signal
+            if self.ts_immediate_join:
+                logger.info("IMMEDIATE JOIN MODE: Acting on first signal")
+                return True
+            
+            # Wait for next entry mode: Don't act on first signal, just observe
+            if self.ts_wait_for_next_entry:
+                logger.info("WAIT FOR NEXT ENTRY MODE: Ignoring first signal, waiting for change")
+                self.log_message("⏳ Observing strategy - waiting for signal change", "INFO")
+                return False
+        
+        # After first signal, always act on changes
+        logger.info("Acting on strategy direction change")
+        return True
+    
+    def _close_automated_positions(self, old_direction: int):
+        """
+        Close any existing automated positions based on checkbox settings
+        
+        Args:
+            old_direction: Previous direction (0=FLAT, 1=LONG, 2=SHORT)
+        """
+        try:
+            # ⚠️ CRITICAL: Clear the entry tracking when closing positions
+            # This allows new entries after position is closed
+            if hasattr(self, '_last_automated_entry_direction'):
+                logger.info(f"🔓 Clearing entry tracking: was {self._last_automated_entry_direction}")
+                delattr(self, '_last_automated_entry_direction')
+            
+            # Find ALL automated positions (calls and puts)
+            positions_to_close = []
+            
+            for contract_key, position_data in self.positions.items():
+                # Check if this is an automated position
+                if not position_data.get('is_automated', False):
+                    continue
+                
+                quantity = position_data.get('position', 0)  # Use 'position' not 'quantity'
+                if quantity == 0:
+                    continue
+                
+                # Parse contract to determine if it's call or put
+                symbol, strike, right, expiry = self.parse_contract_key(contract_key)
+                if strike is None:
+                    continue
+                
+                # Always close ALL automated positions when we get here
+                # The caller (process_strategy_direction_change) determines WHEN to close
+                logger.info(f"Closing automated position: {contract_key} ({'CALL' if right == 'C' else 'PUT'})")
+                positions_to_close.append((contract_key, position_data))
+            
+            # Close the positions
+            if positions_to_close:
+                self.log_message(f"🔻 Closing {len(positions_to_close)} automated position(s)", "INFO")
+                
+                # ACTIVITY LOG: Position closure
+                if hasattr(self, 'ts_signals'):
+                    self.ts_signals.ts_activity.emit(
+                        f"🔻 CLOSING {len(positions_to_close)} AUTOMATED POSITION(S)"
+                    )
+                
+                for contract_key, position_data in positions_to_close:
+                    self._close_single_position(contract_key, position_data)
+            else:
+                logger.debug("No automated positions to close")
+                
+        except Exception as e:
+            logger.error(f"Error closing automated positions: {e}", exc_info=True)
+            self.log_message(f"❌ Error closing positions: {e}", "ERROR")
+    
+    def _close_single_position(self, contract_key: str, position_data: dict):
+        """
+        Close a single position using mid-price chasing logic
+        
+        Args:
+            contract_key: Contract key (e.g., "XSP_590_C_20251107")
+            position_data: Position data dictionary
+        """
+        try:
+            quantity = position_data.get('position', 0)  # Use 'position' not 'quantity'
+            if quantity == 0:
+                return
+            
+            # Parse contract
+            symbol, strike, right, expiry = self.parse_contract_key(contract_key)
+            if strike is None:
+                logger.error(f"Failed to parse contract key: {contract_key}")
+                return
+            
+            # Get market data for mid-price calculation
+            market_data = self.market_data.get(contract_key, {})
+            bid = market_data.get('bid', 0)
+            ask = market_data.get('ask', 0)
+            
+            if bid > 0 and ask > 0:
+                mid_price = round((bid + ask) / 2, 2)
+            else:
+                logger.warning(f"No bid/ask for {contract_key}, using last price")
+                mid_price = market_data.get('last', 0)
+            
+            if mid_price <= 0:
+                logger.error(f"No valid price for {contract_key}, cannot close")
+                self.log_message(f"❌ Cannot close {contract_key} - no market data", "ERROR")
+                return
+            
+            # Place closing order (sell if we're long, buy if we're short)
+            action = "SELL" if quantity > 0 else "BUY"
+            abs_quantity = abs(quantity)
+            
+            # ACTIVITY LOG: Closing position
+            if hasattr(self, 'ts_signals'):
+                position_type = "CALL" if right == 'C' else "PUT"
+                self.ts_signals.ts_activity.emit(
+                    f"🔻 CLOSING {position_type}: {contract_key} | {action} {abs_quantity} @ mid ${mid_price:.2f}"
+                )
+            
+            # Place order using place_order function with chasing enabled
+            order_id = self.place_order(
+                contract_key=contract_key,
+                action=action,
+                quantity=abs_quantity,
+                limit_price=mid_price,
+                enable_chasing=True  # Enable mid-price chasing for automated exits
+            )
+            
+            if order_id:
+                self.log_message(
+                    f"📤 Exit order #{order_id}: {action} {abs_quantity} {symbol} {strike}{right} @ ${mid_price:.2f}",
+                    "SUCCESS"
+                )
+            else:
+                self.log_message(f"❌ Failed to place exit order for {contract_key}", "ERROR")
+            
+        except Exception as e:
+            logger.error(f"Error closing position {contract_key}: {e}", exc_info=True)
+            self.log_message(f"❌ Error closing {contract_key}: {e}", "ERROR")
+    
+    def _enter_automated_position(self, direction: int):
+        """
+        Enter a new automated position based on direction
+        
+        CRITICAL SAFETY: Only enters if no existing position or pending order exists FOR THIS DIRECTION
+        Allows simultaneous call and put positions (for straddles/strangles)
+        
+        Args:
+            direction: 1=LONG (buy call), 2=SHORT (buy put)
+        """
+        try:
+            # ⚠️ CRITICAL SAFETY CHECK: Prevent duplicate orders FOR THIS DIRECTION
+            # Check if we already have an open position or pending order for this specific direction
+            if hasattr(self, '_last_automated_entry_direction'):
+                if self._last_automated_entry_direction == direction:
+                    logger.info(f"⛔ SAFETY: Already have {direction} position/order - skipping duplicate entry")
+                    return
+            
+            # Determine which type we're entering (CALL or PUT)
+            if direction == 1:  # LONG: Buy CALL
+                right = 'C'
+                position_type = "CALL"
+            else:  # direction == 2, SHORT: Buy PUT
+                right = 'P'
+                position_type = "PUT"
+            
+            # Check if we have any open positions OF THIS TYPE (call or put)
+            if self.positions:
+                # Count positions of the same type (call/put) we're trying to enter
+                same_type_positions = []
+                for contract_key, pos in self.positions.items():
+                    if pos.get('quantity', 0) > 0:
+                        # Parse contract to check if it's same type
+                        symbol, strike, pos_right, expiry = self.parse_contract_key(contract_key)
+                        if pos_right == right:  # Same type (both calls or both puts)
+                            same_type_positions.append(contract_key)
+                
+                if same_type_positions:
+                    logger.warning(f"⚠️ SAFETY: Already have {len(same_type_positions)} open {position_type} position(s) - skipping entry")
+                    self.log_message(f"⚠️ Already have {position_type} position open - entry blocked", "WARNING")
+                    return
+            
+            # Check if we have any pending orders OF THIS TYPE (call or put)
+            if self.pending_orders:
+                # Count pending entry orders (BUY orders) of the same type
+                same_type_orders = []
+                for order_id, order in self.pending_orders.items():
+                    if order.get('action') == 'BUY':
+                        order_contract = order.get('contract_key', '')
+                        # Parse to check type
+                        if order_contract:
+                            symbol, strike, order_right, expiry = self.parse_contract_key(order_contract)
+                            if order_right == right:  # Same type
+                                same_type_orders.append(order_id)
+                
+                if same_type_orders:
+                    logger.warning(f"⚠️ SAFETY: Already have {len(same_type_orders)} pending {position_type} entry order(s) - skipping entry")
+                    self.log_message(f"⚠️ Already have pending {position_type} order - entry blocked", "WARNING")
+                    return
+            
+            # NOTE: Checkbox validation is done by caller (process_strategy_direction_change)
+            # This function just executes the trade
+            
+            # Determine which chain to use (0DTE or 1DTE)
+            contract_type = self.get_ts_active_contract_type()
+            expiry = self.ts_0dte_expiry if contract_type == "0DTE" else self.ts_1dte_expiry
+            
+            logger.info(f"📅 Using {contract_type} chain, expiry={expiry}, 0DTE={self.ts_0dte_expiry}, 1DTE={self.ts_1dte_expiry}")
+            
+            if not expiry:
+                logger.error(f"No expiry available for {contract_type}")
+                self.log_message(f"❌ Cannot enter trade - no {contract_type} expiry", "ERROR")
+                return
+            
+            # Get current ATM strike
+            atm_strike = self.calculate_master_atm_strike()
+            if atm_strike <= 0:
+                logger.error("No ATM strike available")
+                self.log_message("❌ Cannot enter trade - no ATM strike", "ERROR")
+                return
+            
+            # Determine strike and right based on direction
+            strike_increment = self.instrument['strike_increment']
+            
+            if direction == 1:  # LONG: Buy 1st OTM CALL
+                strike = atm_strike + strike_increment  # 1 strike above ATM
+                right = 'C'
+                direction_str = "LONG (Call)"
+            else:  # direction == 2, SHORT: Buy 1st OTM PUT
+                strike = atm_strike - strike_increment  # 1 strike below ATM
+                right = 'P'
+                direction_str = "SHORT (Put)"
+            
+            # CRITICAL: IB API CONVENTION - Strikes MUST remain as FLOAT type
+            # Market data keys use FLOAT strikes (e.g., "XSP_686.0_C_20251111")
+            # Never convert to int - this causes contract key mismatches
+            
+            # Build contract key with FLOAT strike
+            contract_key = f"{self.instrument['options_symbol']}_{strike}_{right}_{expiry}"
+            
+            logger.info(f"🎯 Target contract: {contract_key}")
+            
+            # Get market data for mid-price
+            market_data = self.market_data.get(contract_key, {})
+            bid = market_data.get('bid', 0)
+            ask = market_data.get('ask', 0)
+            
+            logger.info(f"📊 Market data for {contract_key}: bid={bid}, ask={ask}, has_data={contract_key in self.market_data}")
+            
+            if bid > 0 and ask > 0:
+                mid_price = round((bid + ask) / 2, 2)
+            else:
+                logger.warning(f"No bid/ask for {contract_key}, using last price")
+                mid_price = market_data.get('last', 0)
+            
+            if mid_price <= 0:
+                logger.error(f"No valid price for {contract_key}")
+                logger.error(f"Total contracts in market_data: {len(self.market_data)}")
+                logger.error(f"All 0DTE contracts: {[k for k in self.market_data.keys() if self.ts_0dte_expiry and self.ts_0dte_expiry in k]}")
+                logger.error(f"All 1DTE contracts: {[k for k in self.market_data.keys() if self.ts_1dte_expiry and self.ts_1dte_expiry in k]}")
+                logger.error(f"Expiry values: 0DTE={self.ts_0dte_expiry}, 1DTE={self.ts_1dte_expiry}")
+                self.log_message(f"❌ Cannot enter {direction_str} - no market data for {contract_key}", "ERROR")
+                return
+            
+            # Place entry order
+            quantity = 1  # Buy 1 contract
+            
+            order_id = self.place_order(
+                contract_key=contract_key,
+                action="BUY",
+                quantity=quantity,
+                limit_price=mid_price,
+                enable_chasing=True  # Enable mid-price chasing for automated entries
+            )
+            
+            if order_id:
+                # Mark this order as automated in tracking
+                if not hasattr(self, '_automated_order_ids'):
+                    self._automated_order_ids = set()
+                self._automated_order_ids.add(order_id)
+                
+                # ⚠️ CRITICAL: Track that we entered this direction to prevent duplicates
+                self._last_automated_entry_direction = direction
+                logger.info(f"✅ Tracked automated entry: direction={direction}, order_id={order_id}")
+                
+                self.log_message(
+                    f"📥 Entry order #{order_id}: BUY {quantity} {self.instrument['options_symbol']} "
+                    f"{strike:.1f}{right} @ ${mid_price:.2f} ({contract_type}, {direction_str})",
+                    "SUCCESS"
+                )
+                
+                logger.info(f"Automated entry order placed: {direction_str} at strike {strike}, order_id={order_id}")
+            else:
+                self.log_message(f"❌ Failed to place entry order", "ERROR")
+            
+        except Exception as e:
+            logger.error(f"Error entering automated position: {e}", exc_info=True)
+            self.log_message(f"❌ Error entering position: {e}", "ERROR")
     
     def sync_with_ts_strategy(self):
         """Manually sync strategy state with TradeStation"""
@@ -9908,8 +10547,10 @@ class MainWindow(QMainWindow):
             time_4pm = dt_time(16, 0)
             
             if time_11am <= current_time < time_4pm:
+                logger.info(f"⏰ Time-based selection: {current_time.strftime('%H:%M:%S')} CT → Using 1DTE (11AM-4PM window)")
                 return "1DTE"
             else:
+                logger.info(f"⏰ Time-based selection: {current_time.strftime('%H:%M:%S')} CT → Using 0DTE (outside 11AM-4PM window)")
                 return "0DTE"
                 
         except Exception as e:
@@ -10031,6 +10672,8 @@ class MainWindow(QMainWindow):
     
     def on_auto_trading_toggled(self, checked: bool):
         """Handle master auto-trading toggle"""
+        logger.info(f"🔧 on_auto_trading_toggled called: checked={checked}, current ts_auto_trading_enabled={self.ts_auto_trading_enabled}")
+        
         if checked:
             # Validate settings before enabling
             if not (self.ts_auto_long_checkbox.isChecked() or self.ts_auto_short_checkbox.isChecked()):
@@ -10064,20 +10707,69 @@ class MainWindow(QMainWindow):
         
         # Update settings value
         self.ts_auto_trading_enabled = checked
+        logger.info(f"✅ Updated ts_auto_trading_enabled to: {checked}")
         
         # Save settings
         self.save_settings()
+        logger.info(f"💾 Settings saved with ts_auto_trading_enabled={self.ts_auto_trading_enabled}")
     
     def check_immediate_entry_on_startup(self):
         """Check if we should immediately enter a trade based on current TS strategy state"""
         try:
-            # This will be implemented when we add the actual TS strategy reading logic
             self.log_message("🔍 Checking current TS strategy state for immediate entry...", "INFO")
+            logger.info("=== IMMEDIATE JOIN: Checking current TS strategy direction ===")
             
-            # TODO: Implement TS strategy reading and immediate entry logic
-            # For now, just log that the check happened
-            current_strategy_state = "FLAT"  # Placeholder - will read from TS GlobalDictionary
-            self.log_message(f"Current TS strategy state: {current_strategy_state}", "INFO")
+            if not TRADESTATION_AVAILABLE:
+                logger.warning("TradeStation not available - cannot check immediate entry")
+                self.log_message("⚠️ TradeStation not available", "WARNING")
+                return
+            
+            if not self.ts_manager:
+                logger.warning("TS manager not initialized - cannot check immediate entry")
+                self.log_message("⚠️ TS manager not initialized", "WARNING")
+                return
+            
+            # Read current StrategyDirection from GlobalDictionary
+            try:
+                import GlobalDictionary as gd
+                dictionary_name = 'IBKR-TRADER'
+                
+                # Try to get StrategyDirection value
+                try:
+                    direction = gd.GetValue(dictionary_name, 'StrategyDirection')
+                    logger.info(f"IMMEDIATE JOIN: Read StrategyDirection = {direction}")
+                    
+                    # Convert to int (defensive)
+                    direction = int(direction) if direction else 0
+                    
+                    # Store current direction
+                    previous_direction = self.ts_strategy_direction
+                    self.ts_strategy_direction = direction
+                    
+                    # Convert to string for logging
+                    direction_str = "LONG" if direction == 1 else "SHORT" if direction == 2 else "FLAT"
+                    self.log_message(f"� Current TS Strategy: {direction_str}", "INFO")
+                    logger.info(f"IMMEDIATE JOIN: StrategyDirection = {direction_str} ({direction})")
+                    
+                    # If strategy is not FLAT, process it to enter immediately
+                    if direction != 0:  # Not FLAT
+                        logger.info(f"IMMEDIATE JOIN: Strategy is {direction_str} - will attempt entry")
+                        self.log_message(f"🚀 Immediate join: Attempting to enter {direction_str} position...", "INFO")
+                        
+                        # Call strategy processing with old_direction=0 to ensure entry logic runs
+                        # (We pretend we're coming from FLAT state to trigger entry)
+                        self.process_strategy_direction_change(direction, 0)
+                    else:
+                        logger.info("IMMEDIATE JOIN: Strategy is FLAT - no immediate entry needed")
+                        self.log_message("ℹ️ Strategy is FLAT - waiting for signal", "INFO")
+                    
+                except Exception as gd_error:
+                    logger.error(f"Error reading StrategyDirection: {gd_error}")
+                    self.log_message(f"⚠️ Could not read TS strategy direction: {gd_error}", "WARNING")
+                    
+            except Exception as import_error:
+                logger.error(f"Error importing GlobalDictionary: {import_error}")
+                self.log_message(f"⚠️ Error accessing GlobalDictionary: {import_error}", "WARNING")
             
         except Exception as e:
             logger.error(f"Error checking immediate entry: {e}", exc_info=True)
@@ -10131,89 +10823,125 @@ class MainWindow(QMainWindow):
     # ═══════════════════════════════════════════════════════════════════════════
     
     def update_ts_chain_cell(self, contract_key: str):
-        """Update a single cell in TS chain tables when market data arrives."""
+        """
+        Update a single cell in TS chain tables when market data arrives.
+        
+        CRITICAL: This function must correctly identify which table (0DTE vs 1DTE)
+        and which row (strike) to update, then only update the appropriate columns
+        (call columns for calls, put columns for puts) WITHOUT touching other data.
+        """
         try:
             # Parse contract key using helper function
             symbol, strike, right, expiry = self.parse_contract_key(contract_key)
             if strike is None:
                 return
             
-            # Determine which table(s) to update and which contract type(s)
-            tables_to_update = []
-            contract_types = []
+            # CRITICAL: Determine which specific table to update based on expiry match
+            # We must NOT update both tables - only the one matching this expiry
+            table_to_update = None
+            contract_type = None
+            
             if (hasattr(self, 'ts_0dte_expiry') and hasattr(self, 'ts_0dte_table') and 
-                expiry == self.ts_0dte_expiry):
-                tables_to_update.append(self.ts_0dte_table)
-                contract_types.append("0DTE")
-            if (hasattr(self, 'ts_1dte_expiry') and hasattr(self, 'ts_1dte_table') and 
-                expiry == self.ts_1dte_expiry):
-                tables_to_update.append(self.ts_1dte_table)
-                contract_types.append("1DTE")
+                self.ts_0dte_expiry and expiry == self.ts_0dte_expiry):
+                table_to_update = self.ts_0dte_table
+                contract_type = "0DTE"
+            elif (hasattr(self, 'ts_1dte_expiry') and hasattr(self, 'ts_1dte_table') and 
+                  self.ts_1dte_expiry and expiry == self.ts_1dte_expiry):
+                table_to_update = self.ts_1dte_table
+                contract_type = "1DTE"
+            else:
+                # This contract doesn't match any TS expiry - not an error, just not a TS chain
+                return
             
-            if not tables_to_update:
-                return  # Not a TS chain expiry
-            
-            # Get market data for this contract - handle both regular and ATM_SCAN prefixed keys
+            # Get market data for this contract
+            # CRITICAL: Use EXACT contract_key match only - no fallback logic
+            # The contract_key format is: {SYMBOL}_{STRIKE_INT}_{RIGHT}_{EXPIRY}
             data = self.market_data.get(contract_key, {})
-            if not data and contract_key.startswith('ATM_SCAN_'):
-                # If no data found with ATM_SCAN prefix, try without prefix
-                actual_key = contract_key[9:]
-                data = self.market_data.get(actual_key, {})
-            elif not data and not contract_key.startswith('ATM_SCAN_'):
-                # If no data found without prefix, try with ATM_SCAN prefix
-                scan_key = f"ATM_SCAN_{contract_key}"
-                data = self.market_data.get(scan_key, {})
             
-            for idx, table in enumerate(tables_to_update):
-                # Find the row for this strike
-                for row in range(table.rowCount()):
-                    strike_item = table.item(row, 4)  # Strike is column 4
-                    if strike_item and abs(float(strike_item.text()) - strike) < 0.01:
-                        # Found the row! Now update the appropriate columns
-                        if right == 'C':  # Call option
-                            # Call Delta (column 0)
-                            delta_val = data.get('delta', 0.0) or 0.0
-                            item = QTableWidgetItem(f"{delta_val:.3f}")
-                            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                            table.setItem(row, 0, item)
-                            # Call Gamma (column 1)
-                            gamma_val = data.get('gamma', 0.0) or 0.0
-                            item = QTableWidgetItem(f"{gamma_val:.4f}")
-                            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                            table.setItem(row, 1, item)
-                            # Call Bid (column 2)
-                            bid_val = data.get('bid', 0.0) or 0.0
-                            item = QTableWidgetItem(f"{bid_val:.2f}")
-                            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                            table.setItem(row, 2, item)
-                            # Call Ask (column 3)
-                            ask_val = data.get('ask', 0.0) or 0.0
-                            item = QTableWidgetItem(f"{ask_val:.2f}")
-                            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                            table.setItem(row, 3, item)
-                        else:  # Put option
-                            # Put Bid (column 5)
-                            bid_val = data.get('bid', 0.0) or 0.0
-                            item = QTableWidgetItem(f"{bid_val:.2f}")
-                            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                            table.setItem(row, 5, item)
-                            # Put Ask (column 6)
-                            ask_val = data.get('ask', 0.0) or 0.0
-                            item = QTableWidgetItem(f"{ask_val:.2f}")
-                            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                            table.setItem(row, 6, item)
-                            # Put Gamma (column 7)
-                            gamma_val = data.get('gamma', 0.0) or 0.0
-                            item = QTableWidgetItem(f"{gamma_val:.4f}")
-                            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                            table.setItem(row, 7, item)
-                            # Put Delta (column 8)
-                            delta_val = data.get('delta', 0.0) or 0.0
-                            item = QTableWidgetItem(f"{delta_val:.3f}")
-                            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                            table.setItem(row, 8, item)
-                        break  # Found the row, no need to continue
-                    
+            # Validate we have actual data to display
+            if not data:
+                logger.debug(f"No market data yet for {contract_key} in {contract_type} chain")
+                return
+            
+            # CRITICAL: Find the EXACT row for this strike using FLOAT comparison
+            # Must use precise strike matching (float comparison with tolerance)
+            row_to_update = None
+            for row in range(table_to_update.rowCount()):
+                strike_item = table_to_update.item(row, 4)  # Strike is column 4
+                if strike_item:
+                    try:
+                        row_strike = float(strike_item.text())
+                        # Compare floats with small tolerance for rounding
+                        if abs(row_strike - float(strike)) < 0.01:
+                            row_to_update = row
+                            break
+                    except (ValueError, AttributeError):
+                        continue
+            
+            if row_to_update is None:
+                # Debug only - this is expected for strikes outside TS chain range
+                logger.debug(f"Strike {strike:.1f} not found in {contract_type} table for {contract_key}")
+                return
+            
+            # CRITICAL: Update ONLY the columns for this option type (call OR put, not both)
+            # Column layout: Call Δ(0), Call Γ(1), Call Bid(2), Call Ask(3), Strike(4), Put Bid(5), Put Ask(6), Put Γ(7), Put Δ(8)
+            
+            if right == 'C':  # Call option - update CALL columns only (0-3)
+                # Call Delta (column 0)
+                delta_val = data.get('delta', 0.0) or 0.0
+                item = QTableWidgetItem(f"{delta_val:.3f}")
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                table_to_update.setItem(row_to_update, 0, item)
+                
+                # Call Gamma (column 1)
+                gamma_val = data.get('gamma', 0.0) or 0.0
+                item = QTableWidgetItem(f"{gamma_val:.4f}")
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                table_to_update.setItem(row_to_update, 1, item)
+                
+                # Call Bid (column 2)
+                bid_val = data.get('bid', 0.0) or 0.0
+                item = QTableWidgetItem(f"{bid_val:.2f}")
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                table_to_update.setItem(row_to_update, 2, item)
+                
+                # Call Ask (column 3)
+                ask_val = data.get('ask', 0.0) or 0.0
+                item = QTableWidgetItem(f"{ask_val:.2f}")
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                table_to_update.setItem(row_to_update, 3, item)
+                
+                logger.debug(f"Updated {contract_type} CALL row {row_to_update} strike {strike:.0f}: "
+                           f"Δ={delta_val:.3f} Γ={gamma_val:.4f} Bid={bid_val:.2f} Ask={ask_val:.2f}")
+                
+            elif right == 'P':  # Put option - update PUT columns only (5-8)
+                # Put Bid (column 5)
+                bid_val = data.get('bid', 0.0) or 0.0
+                item = QTableWidgetItem(f"{bid_val:.2f}")
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                table_to_update.setItem(row_to_update, 5, item)
+                
+                # Put Ask (column 6)
+                ask_val = data.get('ask', 0.0) or 0.0
+                item = QTableWidgetItem(f"{ask_val:.2f}")
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                table_to_update.setItem(row_to_update, 6, item)
+                
+                # Put Gamma (column 7)
+                gamma_val = data.get('gamma', 0.0) or 0.0
+                item = QTableWidgetItem(f"{gamma_val:.4f}")
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                table_to_update.setItem(row_to_update, 7, item)
+                
+                # Put Delta (column 8)
+                delta_val = data.get('delta', 0.0) or 0.0
+                item = QTableWidgetItem(f"{delta_val:.3f}")
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                table_to_update.setItem(row_to_update, 8, item)
+                
+                logger.debug(f"Updated {contract_type} PUT row {row_to_update} strike {strike:.0f}: "
+                           f"Bid={bid_val:.2f} Ask={ask_val:.2f} Γ={gamma_val:.4f} Δ={delta_val:.3f}")
+            
         except Exception as e:
             logger.error(f"Error updating TS chain cell for {contract_key}: {e}", exc_info=True)
     
@@ -10546,13 +11274,23 @@ class MainWindow(QMainWindow):
         logger.info(f"TS Position cell clicked: row={row}, col={col}")
         self.log_message(f"TS Position table click: row={row}, col={col}", "INFO")
         
+        # ACTIVITY LOG: Log all clicks
+        if hasattr(self, 'ts_signals'):
+            self.ts_signals.ts_activity.emit(f"📍 Position table clicked: row={row}, col={col}")
+        
         if col != 10:  # Only handle Close button column (column 10)
             logger.info(f"Click on column {col} - not Close button (column 10), ignoring")
+            if hasattr(self, 'ts_signals'):
+                self.ts_signals.ts_activity.emit(f"   ↳ Column {col} ignored (not Close button)")
             return
         
         logger.info("TS Close button clicked - starting close position flow")
         self.log_message("=" * 60, "INFO")
         self.log_message("TS CLOSE BUTTON CLICKED", "INFO")
+        
+        # ACTIVITY LOG: Close button clicked
+        if hasattr(self, 'ts_signals'):
+            self.ts_signals.ts_activity.emit(f"🔴 CLOSE BUTTON CLICKED (row {row})")
         
         # Get contract key from first column
         contract_key_item = self.ts_positions_table.item(row, 0)
@@ -10571,7 +11309,7 @@ class MainWindow(QMainWindow):
             return
         
         pos = self.positions[contract_key]
-        position_size = pos.get('quantity', 0)
+        position_size = pos.get('position', 0)  # Use 'position' not 'quantity'
         
         # PROTECTION: Check if position is zero (nothing to close)
         if position_size == 0:
@@ -10622,6 +11360,18 @@ class MainWindow(QMainWindow):
             self.log_message(f"Using last price ${mid_price:.2f} for exit", "WARNING")
         
         self.log_message(f"Exit order: {action} {qty} @ ${mid_price:.2f}", "INFO")
+        
+        # CRITICAL: Disable TS automation to prevent re-entry
+        if self.ts_auto_trading_enabled:
+            self.ts_auto_trading_enabled = False
+            if hasattr(self, 'ts_auto_trading_checkbox'):
+                self.ts_auto_trading_checkbox.setChecked(False)
+            self.log_message("🛑 TS AUTOMATION DISABLED (manual close)", "WARNING")
+            logger.info("TS automation disabled due to manual close button click")
+            
+            # ACTIVITY LOG: Automation disabled
+            if hasattr(self, 'ts_signals'):
+                self.ts_signals.ts_activity.emit("🛑 TS AUTOMATION DISABLED (manual position close)")
         
         # Place exit order with mid-price chasing enabled
         self.place_manual_order(contract_key, action, qty, mid_price)
@@ -10915,6 +11665,10 @@ class MainWindow(QMainWindow):
                 self.ts_immediate_join = settings.get('ts_immediate_join', False)
                 self.ts_wait_for_next_entry = settings.get('ts_wait_for_next_entry', True)
                 self.ts_last_strategy_state = settings.get('ts_last_strategy_state', 'FLAT')
+                
+                # Order Chasing Settings
+                self.chase_give_in_interval = settings.get('chase_give_in_interval', 3.0)
+                self.chase_give_in_spin.setValue(self.chase_give_in_interval)
                 
                 # Update TradeStation Automated Trading UI (will be set after tab creation)
                 # Note: Widget updates are deferred until after TradeStation tab is created
@@ -11763,34 +12517,37 @@ class MainWindow(QMainWindow):
             logger.debug(f"Straddle: ATM={atm_strike:.0f}, Call={call_strike:.0f}, Put={put_strike:.0f}")
             
             # Update ATM
-            self.straddle_atm_label.setText(f"{atm_strike:.0f}")
+            self.straddle_atm_label.setText(f"{atm_strike:.1f}")
             
-            # Get call data
-            call_key = f"{self.instrument['options_symbol']}_{call_strike:.0f}_C_{self.current_expiry}"
+            # CRITICAL: IB API CONVENTION - Keep strikes as FLOAT (no int conversion)
+            # Contract keys must use FLOAT strikes to match IBKR's data format
+            
+            # Get call data using FLOAT strike
+            call_key = f"{self.instrument['options_symbol']}_{call_strike}_C_{self.current_expiry}"
             call_data = self.market_data.get(call_key, {})
-            call_bid = call_data.get('bid', 0)
-            call_ask = call_data.get('ask', 0)
+            call_bid = float(call_data.get('bid', 0) or 0)
+            call_ask = float(call_data.get('ask', 0) or 0)
             call_mid = (call_bid + call_ask) / 2 if call_bid and call_ask else 0
-            call_iv = call_data.get('iv', 0)
-            call_delta = call_data.get('delta', 0)
+            call_iv = float(call_data.get('iv', 0) or 0)
+            call_delta = float(call_data.get('delta', 0) or 0)
             
             # Update call display
-            self.straddle_call_strike_label.setText(f"{call_strike:.0f}")
+            self.straddle_call_strike_label.setText(f"{call_strike:.1f}")
             self.straddle_call_iv_label.setText(f"{call_iv*100:.1f}%" if call_iv > 0 else "--")
             self.straddle_call_delta_label.setText(f"{call_delta:.3f}" if call_delta != 0 else "--")
             self.straddle_call_price_label.setText(f"${call_mid:.2f}" if call_mid > 0 else "--")
             
-            # Get put data
-            put_key = f"{self.instrument['options_symbol']}_{put_strike:.0f}_P_{self.current_expiry}"
+            # Get put data using FLOAT strike
+            put_key = f"{self.instrument['options_symbol']}_{put_strike}_P_{self.current_expiry}"
             put_data = self.market_data.get(put_key, {})
-            put_bid = put_data.get('bid', 0)
-            put_ask = put_data.get('ask', 0)
+            put_bid = float(put_data.get('bid', 0) or 0)
+            put_ask = float(put_data.get('ask', 0) or 0)
             put_mid = (put_bid + put_ask) / 2 if put_bid and put_ask else 0
-            put_iv = put_data.get('iv', 0)
-            put_delta = put_data.get('delta', 0)
+            put_iv = float(put_data.get('iv', 0) or 0)
+            put_delta = float(put_data.get('delta', 0) or 0)
             
             # Update put display
-            self.straddle_put_strike_label.setText(f"{put_strike:.0f}")
+            self.straddle_put_strike_label.setText(f"{put_strike:.1f}")
             self.straddle_put_iv_label.setText(f"{put_iv*100:.1f}%" if put_iv > 0 else "--")
             self.straddle_put_delta_label.setText(f"{put_delta:.3f}" if put_delta != 0 else "--")
             self.straddle_put_price_label.setText(f"${put_mid:.2f}" if put_mid > 0 else "--")
@@ -11828,9 +12585,12 @@ class MainWindow(QMainWindow):
                 self.log_message("❌ Cannot determine strikes - wait for market data", "WARNING")
                 return
             
-            # Get market data
-            call_key = f"{self.instrument['options_symbol']}_{call_strike:.0f}_C_{self.current_expiry}"
-            put_key = f"{self.instrument['options_symbol']}_{put_strike:.0f}_P_{self.current_expiry}"
+            # CRITICAL: IB API CONVENTION - Keep strikes as FLOAT (no int conversion)
+            # Contract keys must use FLOAT strikes to match IBKR's data format
+            
+            # Get market data using FLOAT strikes
+            call_key = f"{self.instrument['options_symbol']}_{call_strike}_C_{self.current_expiry}"
+            put_key = f"{self.instrument['options_symbol']}_{put_strike}_P_{self.current_expiry}"
             
             call_data = self.market_data.get(call_key, {})
             put_data = self.market_data.get(put_key, {})

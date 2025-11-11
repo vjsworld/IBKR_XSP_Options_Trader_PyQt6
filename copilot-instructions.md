@@ -3,6 +3,152 @@
 ## Project Overview
 Professional Bloomberg/TWS-style GUI application for automated 0DTE (Zero Days To Expiration) options trading via Interactive Brokers API. **Designed to trade TWO separate instruments** (SPX and XSP) with configurable settings. Modern PyQt6 architecture with **matplotlib/mplfinance** for professional TradingView-style candlestick visualization.
 
+## 🚨 CRITICAL: FLOAT Strike Type Convention (IB API Requirement)
+
+### ⚠️ ALL STRIKES MUST BE TYPED AS `float`, NEVER `int`
+
+**This is a mandatory IBKR API convention that prevents severe data corruption bugs.**
+
+**THE PROBLEM**:
+IBKR's API sends strike prices as floating-point numbers (`684.0`, `685.0`, etc.) even for whole-number strikes. If we convert strikes to `int` anywhere in our code, contract keys won't match IBKR's data format, causing:
+- ❌ Market data lookup failures
+- ❌ Separate dictionary entries for the same contract
+- ❌ **Bid/ask price overwriting between different contracts**
+- ❌ Trading on stale or wrong data
+
+**EXAMPLE OF THE BUG**:
+```python
+# WRONG CODE (causes bug):
+strike_int = int(strike)  # Convert 684.0 → 684
+contract_key = f"XSP_{strike_int}_C_{expiry}"  # "XSP_684_C_20251111"
+
+# What IBKR sends:
+ibkr_data_key = "XSP_684.0_C_20251111"  # Float strike
+
+# Result: Keys don't match!
+# - Our lookup: "XSP_684_C_20251111" → No data found
+# - IBKR stores: "XSP_684.0_C_20251111" → Data orphaned
+# - Creates SEPARATE entries for "684" vs "684.0"
+# - Bid/ask from 684.0 contract overwrites 684 contract data
+```
+
+### ✅ CORRECT: Always Use FLOAT Strikes
+
+**Contract Key Generation** (CORRECT):
+```python
+# Keep strike as float - never convert to int
+contract_key = f"{symbol}_{strike}_C_{expiry}"
+# Example: "XSP_684.0_C_20251111" ✅
+```
+
+**Contract Key Generation** (WRONG):
+```python
+# ❌ NEVER DO THIS - causes contract key mismatches
+strike_int = int(strike)
+contract_key = f"{symbol}_{strike_int}_C_{expiry}"
+# Example: "XSP_684_C_20251111" ❌ Wrong format!
+```
+
+**Strike Comparison** (CORRECT):
+```python
+# Use float comparison with tolerance for rounding
+if abs(strike1 - strike2) < 0.01:  # ✅ Correct
+    # Strikes match
+```
+
+**Strike Comparison** (WRONG):
+```python
+# ❌ NEVER convert to int for comparison
+if int(strike1) == int(strike2):  # ❌ Wrong!
+    # May miss slight differences
+```
+
+**Logging Strikes** (CORRECT):
+```python
+# Show decimal to make float type clear
+logger.info(f"Strike: {strike:.1f}")   # "Strike: 684.0" ✅
+logger.info(f"Strike: {strike:.2f}")   # "Strike: 684.00" ✅
+```
+
+**Logging Strikes** (WRONG):
+```python
+# ❌ Never use .0f - hides float nature
+logger.info(f"Strike: {strike:.0f}")   # "Strike: 684" ❌ Looks like int!
+logger.info(f"Strike: {int(strike)}")  # "Strike: 684" ❌ IS int!
+```
+
+### 📋 Development Rules for Strikes
+
+1. ✅ **ALWAYS** declare strikes as `float` type
+   ```python
+   strike: float = 684.0
+   ```
+
+2. ✅ **NEVER** call `int(strike)` when building contract keys
+   ```python
+   # ❌ NO: strike_int = int(strike)
+   # ✅ YES: Use strike directly as float
+   ```
+
+3. ✅ Use `.1f` or `.2f` in logging (shows decimal)
+   ```python
+   f"{strike:.1f}"   # ✅ "684.0"
+   f"{strike:.2f}"   # ✅ "684.00"
+   ```
+
+4. ❌ **NEVER** use `.0f` in logging (hides float)
+   ```python
+   f"{strike:.0f}"   # ❌ "684" - looks like int!
+   ```
+
+5. ✅ Compare floats with tolerance
+   ```python
+   abs(strike1 - strike2) < 0.01  # ✅ Correct
+   ```
+
+6. ❌ **NEVER** compare with int conversion
+   ```python
+   int(strike1) == int(strike2)  # ❌ Wrong!
+   ```
+
+7. ✅ **NEVER** create variables named `strike_int`
+   ```python
+   # ❌ NO: strike_int = int(strike)
+   # ✅ YES: strike (keep as float)
+   ```
+
+### 🔍 Key Locations in Codebase (Already Fixed)
+
+These areas have been corrected to use FLOAT strikes:
+- **Line ~5553-5581**: Main chain contract key generation
+- **Line ~7252**: `update_option_chain_cell()` strike matching
+- **Line ~10425-10428**: TradeStation automated trading
+- **Line ~10871-10872**: TS chain cell update strike matching
+- **Line ~12519-12587**: Straddle strategy contract keys
+
+**Search for violations**: If you ever see `int(strike)` or `strike_int` in the code, it's a BUG that must be fixed.
+
+### 🧪 Testing Strike Types
+
+Add assertions in critical functions:
+```python
+def create_contract_key(symbol: str, strike: float, right: str, expiry: str) -> str:
+    """Create contract key with FLOAT strike - critical for IBKR data matching."""
+    assert isinstance(strike, float), f"Strike must be float, got {type(strike)}"
+    contract_key = f"{symbol}_{strike}_{right}_{expiry}"
+    # Verify decimal point exists in strike portion
+    assert "." in contract_key.split("_")[1], "Strike must include decimal point"
+    return contract_key
+```
+
+### 📚 Additional Resources
+
+- **README.md**: See "CRITICAL: Strike Type Convention" section
+- **Architecture Section**: Explains why IBKR uses float strikes
+- **Code Comments**: Search for "IB API CONVENTION" comments
+
+**REMEMBER**: One `int(strike)` conversion can cause bid/ask prices to be overwritten between different contracts. Always maintain FLOAT typing throughout the entire codebase.
+
 ## ⚙️ Instrument Selection (How to Switch Between SPX and XSP)
 
 **The instrument selection is at the very top of `main.py` for easy access:**
