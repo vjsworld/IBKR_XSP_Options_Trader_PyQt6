@@ -33,7 +33,55 @@ The application is almost entirely contained within the monolithic `main.py` fil
 1.  **Single-File Structure**: Nearly all logic resides in `main.py`.
 2.  **Threading Model**: The IBKR API is asynchronous but its Python client uses a blocking `run()` loop. We manage this by running the client in a separate `QThread`.
 3.  **Signal/Slot for Thread Safety**: All data flowing from the IBKR API thread to the main GUI thread **must** be sent via a `pyqtSignal` defined in `IBKRSignals`. This is critical to prevent crashes. Slots (handler methods) in `MainWindow` are decorated with `@pyqtSlot(...)` and receive this data to update the UI and application state.
-4.  **Configuration via `SELECTED_INSTRUMENT`**: At the top of `main.py`, the `SELECTED_INSTRUMENT` variable is used to switch the application's behavior between 'SPX' and 'XSP'. This is a simple but important configuration point.
+4.  **Configuration via `SELECTED_INSTRUMENT`**: The `SELECTED_INSTRUMENT` variable in `config.py` switches the application between instruments. Set to 'SPX', 'XSP', or an ES futures contract (e.g., 'ESZ5', 'ESH6'). This controls all instrument-specific behavior.
+
+### 2.1. Instrument Configuration
+
+The application supports three distinct trading instrument types with different contract structures:
+
+**Supported Instruments**:
+- **SPX**: Full-size S&P 500 Index Options (secType=OPT, $100 multiplier, $5 strikes)
+- **XSP**: Mini S&P 500 Index Options (secType=OPT, $100 multiplier, $1 strikes)
+- **ES Futures**: E-mini S&P 500 Futures Options (secType=FOP, $50 multiplier, $5 strikes)
+
+**Configuration Location**: `config.py`
+```python
+# For index options:
+SELECTED_INSTRUMENT = 'XSP'   # or 'SPX'
+
+# For ES futures options - use actual futures contract:
+SELECTED_INSTRUMENT = 'ESZ5'  # December 2025
+SELECTED_INSTRUMENT = 'ESH6'  # March 2026
+```
+
+**Auto-Detection**: The application automatically detects ES futures contracts (starts with "ES") and configures FOP parameters.
+
+**CRITICAL Contract Differences**:
+
+| Feature | Index Options (SPX/XSP) | Futures Options (ES_FOP) |
+|---------|-------------------------|--------------------------|
+| **secType** | `"OPT"` | `"FOP"` |
+| **underlying** | Cash-settled index | Futures contract |
+| **symbol** | `"SPX"` or `"XSP"` | `"ES"` |
+| **tradingClass** | `"SPXW"` or `"XSP"` | `"ES"` |
+| **exchange** | `"SMART"` | `"CME"` |
+| **expiration** | Daily (YYYYMMDD) | Futures expiry (3rd Friday) |
+| **multiplier** | `"100"` | `"50"` |
+
+**Contract Creation**:
+- **ALWAYS** use `create_instrument_option_contract(strike, right, expiry)` for new contract creation
+- This function automatically handles OPT vs FOP differences based on `self.instrument['sec_type']`
+- **NEVER** hardcode `secType`, `tradingClass`, or `exchange` - use `self.instrument` config
+
+**FOP-Specific Requirements**:
+- `lastTradeDateOrContractMonth` MUST use futures expiry (e.g., "20251219"), NOT daily expiry
+- Options expire with underlying futures, not daily like index options
+- `futures_symbol` and `futures_expiry` are set at runtime from `ES_FRONT_MONTH`
+
+**ES Futures Month Codes** (CME convention):
+- H=Mar, M=Jun, U=Sep, Z=Dec
+- Year: last digit (5=2025, 6=2026)
+- Example: ESZ5 = ES December 2025
 
 ## 3. Key Workflows & Logic
 

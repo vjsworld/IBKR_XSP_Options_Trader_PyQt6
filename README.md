@@ -76,6 +76,63 @@ The application requires:
 
 ## Running the Application
 
+### Instrument Configuration
+
+The application supports trading on three types of instruments:
+- **XSP**: Mini S&P 500 Index Options ($100 multiplier, $1 strike increments)
+- **SPX**: Full-size S&P 500 Index Options ($100 multiplier, $5 strike increments)
+- **ES Futures**: E-mini S&P 500 Futures Options (FOP, $50 multiplier, $5 strike increments)
+
+**To select an instrument**, edit `config.py`:
+
+```python
+# For index options:
+SELECTED_INSTRUMENT = 'XSP'   # or 'SPX'
+
+# For ES futures options - use the actual futures contract:
+SELECTED_INSTRUMENT = 'ESZ5'  # December 2025
+SELECTED_INSTRUMENT = 'ESH6'  # March 2026
+SELECTED_INSTRUMENT = 'ESM6'  # June 2026
+```
+
+#### ES Futures Options (FOP) Configuration
+
+For ES Futures Options, specify the **actual futures contract symbol** in `SELECTED_INSTRUMENT`:
+
+**ES Futures Contract Naming** (CME convention):
+- **Month Codes**: H=Mar, M=Jun, U=Sep, Z=Dec (quarterly contracts)
+- **Year**: Last digit (5=2025, 6=2026, etc.)
+- **Format**: ES + Month Code + Year Digit
+- **Examples**: 
+  - `ESZ5` = ES December 2025 (current front month)
+  - `ESH6` = ES March 2026
+  - `ESM6` = ES June 2026
+  - `ESU6` = ES September 2026
+
+**The application will automatically**:
+- Detect that you're trading futures options (starts with "ES")
+- Parse the contract month and year
+- Calculate the 3rd Friday expiry date
+- Configure FOP-specific parameters (CME exchange, $50 multiplier, etc.)
+
+**CRITICAL DIFFERENCES - FOP vs Index Options**:
+
+| Feature | Index Options (SPX/XSP) | Futures Options (ES) |
+|---------|-------------------------|----------------------|
+| **Security Type** | OPT (index options) | FOP (futures options) |
+| **Underlying** | Cash-settled index | Futures contract (ESZ5, ESH6, etc.) |
+| **Symbol** | "SPX" or "XSP" | "ES" |
+| **Trading Class** | "SPXW" or "XSP" | "ES" |
+| **Exchange** | SMART | CME |
+| **Expiration** | Daily (0DTE, 1DTE, etc.) | Futures contract expiry (3rd Friday) |
+| **Strike Intervals** | SPX: $5, XSP: $1 | ES: $5 |
+| **Multiplier** | $100 per point | $50 per point |
+| **Tick Sizes** | SPX: $0.05/$0.10, XSP: $0.01 | ES: $0.05/$0.25 |
+
+**Important**: ES options expire with the underlying futures contract (quarterly cycle), NOT daily like cash-settled index options. The application automatically uses the correct expiration date from the futures contract symbol.
+
+**Rollover**: When approaching futures expiration (typically 8 days before), change `SELECTED_INSTRUMENT` in `config.py` to the next front month contract (e.g., ESZ5 → ESH6).
+
 ### Start TWS or IB Gateway
 1. Launch Interactive Brokers TWS or IB Gateway
 2. Configure API settings:

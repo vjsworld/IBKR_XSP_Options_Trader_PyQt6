@@ -308,6 +308,7 @@ INSTRUMENT_CONFIG = {
         'options_trading_class': 'SPXW',    # Weekly options
         'underlying_type': 'IND',            # Index
         'underlying_exchange': 'CBOE',
+        'sec_type': 'OPT',                   # Standard options on index
         'multiplier': '100',
         'strike_increment': 5.0,             # $5 increments
         'tick_size_above_3': 0.10,           # >= $3.00: $0.10 tick
@@ -327,6 +328,7 @@ INSTRUMENT_CONFIG = {
         'options_trading_class': 'XSP',
         'underlying_type': 'IND',            # Index (NOT stock)
         'underlying_exchange': 'CBOE',       # CBOE exchange like SPX
+        'sec_type': 'OPT',                   # Standard options on index
         'multiplier': '100',
         'strike_increment': 1.0,             # $1 increments (1/10 of SPX)
         'tick_size_above_3': 0.01,           # XSP trades in $0.01 increments (all prices)
@@ -338,6 +340,50 @@ INSTRUMENT_CONFIG = {
         'hedge_sec_type': 'FUT',
         'hedge_multiplier': 5,               # $5 per point (1/10 of ES)
         'hedge_ratio': 20.0                  # 1 XSP option delta (100 shares) ~= 20 MES contracts (5 per point * 20 = 100)
+    },
+    'ES_FOP': {
+        'name': 'ES Futures Options',
+        'underlying_symbol': 'ES',           # E-mini S&P 500 futures
+        'options_symbol': 'ES',              # Options symbol (same as underlying)
+        'options_trading_class': 'ES',       # Trading class for FOP
+        'underlying_type': 'FUT',            # Futures (NOT index)
+        'underlying_exchange': 'CME',        # Chicago Mercantile Exchange
+        'sec_type': 'FOP',                   # CRITICAL: Futures Options, not OPT
+        'multiplier': '50',                  # $50 per point (same as ES futures)
+        'strike_increment': 5.0,             # ES options: 5-point increments (5800, 5805, 5810, etc.)
+        'tick_size_above_3': 0.25,           # ES options >= $3.00: $0.25 tick
+        'tick_size_below_3': 0.05,           # ES options < $3.00: $0.05 tick
+        'description': 'E-mini S&P 500 Futures Options (FOP, $50 multiplier)',
+        'futures_symbol': None,              # Will be set from config.ES_FRONT_MONTH at runtime (e.g., 'ESZ5')
+        'futures_expiry': None,              # Will be calculated from futures_symbol at runtime (e.g., '20251219')
+        'hedge_instrument': 'ES',            # Hedge with ES futures directly
+        'hedge_symbol': 'ES',
+        'hedge_exchange': 'CME',
+        'hedge_sec_type': 'FUT',
+        'hedge_multiplier': 50,              # $50 per point
+        'hedge_ratio': 1.0                   # 1 ES option delta = 1 ES futures contract (same underlying)
+    },
+    'MES_FOP': {
+        'name': 'MES Futures Options',
+        'underlying_symbol': 'MES',          # Micro E-mini S&P 500 futures
+        'options_symbol': 'MES',             # Options symbol (same as underlying)
+        'options_trading_class': 'MES',      # Trading class for FOP
+        'underlying_type': 'FUT',            # Futures (NOT index)
+        'underlying_exchange': 'CME',        # Chicago Mercantile Exchange
+        'sec_type': 'FOP',                   # CRITICAL: Futures Options, not OPT
+        'multiplier': '5',                   # $5 per point (1/10 of ES, same as MES futures)
+        'strike_increment': 5.0,             # MES options: 5-point increments (5800, 5805, 5810, etc.)
+        'tick_size_above_3': 0.25,           # MES options >= $3.00: $0.25 tick
+        'tick_size_below_3': 0.05,           # MES options < $3.00: $0.05 tick
+        'description': 'Micro E-mini S&P 500 Futures Options (FOP, $5 multiplier, 1/10 size of ES)',
+        'futures_symbol': None,              # Will be set from config.MES_FRONT_MONTH at runtime (e.g., 'MESZ5')
+        'futures_expiry': None,              # Will be calculated from futures_symbol at runtime (e.g., '20251219')
+        'hedge_instrument': 'MES',           # Hedge with MES futures directly
+        'hedge_symbol': 'MES',
+        'hedge_exchange': 'CME',
+        'hedge_sec_type': 'FUT',
+        'hedge_multiplier': 5,               # $5 per point
+        'hedge_ratio': 1.0                   # 1 MES option delta = 1 MES futures contract (same underlying)
     }
 }
 
@@ -651,6 +697,13 @@ class IBKRWrapper(EWrapper):
                    parentId: int, lastFillPrice: float, clientId: int,
                    whyHeld: str, mktCapPrice: float):
         """Receives order status updates"""
+        logger.info(f"📋 orderStatus callback for Order #{orderId}:")
+        logger.info(f"   Status: {status}")
+        logger.info(f"   Filled: {filled}, Remaining: {remaining}")
+        logger.info(f"   AvgFillPrice: {avgFillPrice}, LastFillPrice: {lastFillPrice}")
+        logger.info(f"   PermId: {permId}, ClientId: {clientId}")
+        logger.info(f"   WhyHeld: {whyHeld if whyHeld else 'None'}")
+        
         status_data = {
             'status': status,
             'filled': filled,
@@ -660,7 +713,7 @@ class IBKRWrapper(EWrapper):
         }
         self.signals.order_status_update.emit(orderId, status_data)
         self.signals.connection_message.emit(
-            f"Order {orderId}: {status} - Filled: {filled} @ {avgFillPrice}",
+            f"📋 Order #{orderId}: {status} - Filled: {filled}/{filled+remaining} @ ${avgFillPrice:.2f}",
             "INFO"
         )
     
@@ -686,7 +739,13 @@ class IBKRWrapper(EWrapper):
         contract_key = f"{contract.symbol}_{contract.strike}_{contract.right}_{contract.lastTradeDateOrContractMonth[:8]}"
         
         if position != 0:
-            per_option_cost = avgCost / 100 if contract.secType == "OPT" else avgCost
+            # CRITICAL: IBKR reports avgCost as total contract value (price × multiplier)
+            # We need to divide by multiplier to get per-option price for display
+            # - OPT (SPX/XSP): multiplier = 100 → divide by 100
+            # - FOP (ES): multiplier = 50 → divide by 50
+            # - FOP (MES): multiplier = 5 → divide by 5
+            multiplier = int(contract.multiplier) if contract.multiplier else 100
+            per_option_cost = avgCost / multiplier
             
             # Mark this position as confirmed by IBKR
             if self._main_window:
@@ -2555,7 +2614,51 @@ class MainWindow(QMainWindow):
         # ========================================================================
         # The instrument is now controlled by SELECTED_INSTRUMENT in config.py
         self.trading_instrument = self.selected_instrument
-        self.instrument = INSTRUMENT_CONFIG[self.trading_instrument]
+        
+        # Handle Futures Options (FOP) configuration for ES or MES
+        if self.selected_instrument == 'ES':
+            # Trading ES Futures Options (FOP)
+            from config import ES_FRONT_MONTH, parse_futures_contract
+            
+            # Use ES_FOP configuration template
+            self.instrument = INSTRUMENT_CONFIG['ES_FOP'].copy()
+            
+            # Parse the futures contract to get expiry details
+            futures_info = parse_futures_contract(ES_FRONT_MONTH)
+            self.instrument['futures_symbol'] = ES_FRONT_MONTH
+            self.instrument['futures_expiry'] = futures_info['expiry_date']
+            
+            # Update instrument name to show specific contract
+            self.instrument['name'] = f"ES {futures_info['month_name']} {futures_info['full_year']} Futures Options"
+            
+            logger.info(f"ES FOP Configuration:")
+            logger.info(f"  Futures Contract: {ES_FRONT_MONTH}")
+            logger.info(f"  Expiry Month: {futures_info['month_name']} {futures_info['full_year']}")
+            logger.info(f"  Expiry Date: {futures_info['expiry_date']} (3rd Friday)")
+            
+        elif self.selected_instrument == 'MES':
+            # Trading MES Futures Options (FOP)
+            from config import MES_FRONT_MONTH, parse_futures_contract
+            
+            # Use MES_FOP configuration template
+            self.instrument = INSTRUMENT_CONFIG['MES_FOP'].copy()
+            
+            # Parse the futures contract to get expiry details
+            futures_info = parse_futures_contract(MES_FRONT_MONTH)
+            self.instrument['futures_symbol'] = MES_FRONT_MONTH
+            self.instrument['futures_expiry'] = futures_info['expiry_date']
+            
+            # Update instrument name to show specific contract
+            self.instrument['name'] = f"MES {futures_info['month_name']} {futures_info['full_year']} Futures Options"
+            
+            logger.info(f"MES FOP Configuration:")
+            logger.info(f"  Futures Contract: {MES_FRONT_MONTH}")
+            logger.info(f"  Expiry Month: {futures_info['month_name']} {futures_info['full_year']}")
+            logger.info(f"  Expiry Date: {futures_info['expiry_date']} (3rd Friday)")
+            
+        else:
+            # Trading index options (SPX or XSP)
+            self.instrument = INSTRUMENT_CONFIG[self.trading_instrument]
         
         # Set convenient shortcuts to instrument properties
         self.strike_interval = self.instrument['strike_increment']
@@ -3901,14 +4004,34 @@ class MainWindow(QMainWindow):
         # Add 25-pixel spacing
         header_layout.addSpacing(25)
         
-        # ES to SPX offset display
-        self.es_offset_label = QLabel("ES to SPX offset: N/A")
-        self.es_offset_label.setStyleSheet("font-size: 12pt; color: #90EE90;")
-        self.es_offset_label.setToolTip("ES futures premium/discount to cash index (persistent during overnight)")
-        header_layout.addWidget(self.es_offset_label)
+        # Futures Contract Month (for FOP trading) - only show if ES or MES selected
+        if self.selected_instrument in ['ES', 'MES']:
+            contract_symbol = self.instrument.get('futures_symbol', 'N/A')
+            self.futures_contract_label = QLabel(f"Contract: {contract_symbol}")
+            self.futures_contract_label.setStyleSheet("font-size: 12pt; font-weight: bold; color: #FFB347;")
+            self.futures_contract_label.setToolTip(
+                f"{self.selected_instrument} Futures Contract: {contract_symbol}\n"
+                f"Options expire with this futures contract\n"
+                f"Expiry: {self.instrument.get('futures_expiry', 'N/A')}"
+            )
+            header_layout.addWidget(self.futures_contract_label)
+            
+            # Add 25-pixel spacing
+            header_layout.addSpacing(25)
         
-        # Add 25-pixel spacing
-        header_layout.addSpacing(25)
+        # ES to SPX offset display (only show for SPX/XSP, not needed for ES/MES FOP trading)
+        if self.selected_instrument not in ['ES', 'MES']:
+            self.es_offset_label = QLabel("ES to SPX offset: N/A")
+            self.es_offset_label.setStyleSheet("font-size: 12pt; color: #90EE90;")
+            self.es_offset_label.setToolTip("ES futures premium/discount to cash index (persistent during overnight)")
+            header_layout.addWidget(self.es_offset_label)
+            
+            # Add 25-pixel spacing
+            header_layout.addSpacing(25)
+        else:
+            # For ES/MES trading, create a hidden label to avoid errors in update functions
+            self.es_offset_label = QLabel("")
+            self.es_offset_label.hide()
         
         # ATM Strike display (based on 0.5 delta)
         self.atm_strike_label = QLabel("ATM: Calculating...")
@@ -5064,12 +5187,21 @@ class MainWindow(QMainWindow):
     # ========================================================================
     
     def subscribe_underlying_price(self):
-        """Subscribe to underlying price (SPX or XSP based on SELECTED_INSTRUMENT)"""
+        """Subscribe to underlying price (SPX, XSP, or ES futures based on SELECTED_INSTRUMENT)"""
         underlying_contract = Contract()
         underlying_contract.symbol = self.instrument['underlying_symbol']
         underlying_contract.secType = self.instrument['underlying_type']
         underlying_contract.currency = "USD"
         underlying_contract.exchange = self.instrument['underlying_exchange']
+        
+        # For ES FOP: Need to specify the futures contract month
+        if self.instrument['sec_type'] == 'FOP':
+            # Use the futures_symbol as lastTradeDateOrContractMonth (e.g., '202512' from ESZ5)
+            from config import parse_futures_contract
+            futures_info = parse_futures_contract(self.instrument['futures_symbol'])
+            underlying_contract.lastTradeDateOrContractMonth = futures_info['expiry_date']
+            logger.info(f"ES FOP underlying: subscribing to {self.instrument['futures_symbol']} "
+                       f"(expiry: {futures_info['expiry_date']})")
         
         req_id = 1
         self.app_state['underlying_req_id'] = req_id
@@ -5552,12 +5684,10 @@ class MainWindow(QMainWindow):
             # Never convert to int - this causes contract key mismatches and data overwriting
             # IBKR sends strikes as floats (684.0, 685.0, etc.), so our keys must match exactly
             
-            # Call option
-            call_contract = self.create_option_contract(
+            # Call option - USE INSTRUMENT-AWARE CONTRACT BUILDER
+            call_contract = self.create_instrument_option_contract(
                 strike=strike,
                 right='C',
-                symbol=symbol,
-                trading_class=trading_class,
                 expiry=expiry
             )
             
@@ -5568,12 +5698,10 @@ class MainWindow(QMainWindow):
             self.ibkr_client.reqMktData(call_req_id, call_contract, "", False, False, [])
             new_req_ids.append(call_req_id)
             
-            # Put option
-            put_contract = self.create_option_contract(
+            # Put option - USE INSTRUMENT-AWARE CONTRACT BUILDER
+            put_contract = self.create_instrument_option_contract(
                 strike=strike,
                 right='P',
-                symbol=symbol,
-                trading_class=trading_class,
                 expiry=expiry
             )
             
@@ -6109,10 +6237,13 @@ class MainWindow(QMainWindow):
             del self.positions[contract_key]
             logger.info(f"Removed {contract_key} from positions tracking")
         
-        # Remove from market_data dict
+        # Remove from market_data dict ONLY if not in the option chain
         if contract_key in self.market_data:
-            del self.market_data[contract_key]
-            logger.debug(f"Removed {contract_key} from market_data")
+            if hasattr(self, 'option_chain') and contract_key in self.option_chain:
+                logger.debug(f"NOT removing market_data for {contract_key} - still in option chain")
+            else:
+                del self.market_data[contract_key]
+                logger.debug(f"Removed {contract_key} from market_data")
         
         # Update display (position will disappear from table)
         # No need to call update_positions_display() - timer does it automatically
@@ -6121,7 +6252,13 @@ class MainWindow(QMainWindow):
         """
         Unsubscribe from market data for a closed position.
         Cleans up resources by canceling the market data subscription.
+        IMPORTANT: Don't unsubscribe if contract is still in the displayed option chain!
         """
+        # Check if this contract is in the current option chain (if chain exists)
+        if hasattr(self, 'option_chain') and contract_key in self.option_chain:
+            logger.debug(f"NOT unsubscribing from market data for {contract_key} - still in option chain")
+            return
+        
         # Find the req_id for this contract_key
         req_id_to_cancel = None
         for req_id, mapped_key in list(self.app_state.get('market_data_map', {}).items()):
@@ -7001,13 +7138,13 @@ class MainWindow(QMainWindow):
         
         return tab
     
-    def create_option_contract(self, strike: float, right: str, symbol: str = "SPX", 
+    def create_option_contract(self, strike: float, right: str, symbol: str = "SPX",
                               trading_class: str = "SPXW", expiry: Optional[str] = None) -> Contract:
         """
         Create an option contract with specified or current expiration.
         
         Args:
-            strike: Strike price
+            strike: Strike price (MUST be FLOAT - e.g., 684.0, not 684)
             right: "C" for call or "P" for put
             symbol: Underlying symbol (default: "SPX")
             trading_class: Trading class (default: "SPXW" for SPX weeklies, "XSP" for XSP)
@@ -7017,6 +7154,9 @@ class MainWindow(QMainWindow):
             Contract object ready for IBKR API calls
         
         NOTE: For SPX weekly options (0DTE), MUST use tradingClass="SPXW"
+        
+        DEPRECATED: Use create_instrument_option_contract() for instrument-aware contract creation
+        This function is kept for backward compatibility but doesn't support FOP.
         """
         contract = Contract()
         contract.symbol = symbol
@@ -7028,6 +7168,105 @@ class MainWindow(QMainWindow):
         contract.right = right  # "C" or "P"
         contract.lastTradeDateOrContractMonth = expiry if expiry else self.current_expiry
         contract.multiplier = "100"
+        return contract
+    
+    def create_instrument_option_contract(self, strike: float, right: str, expiry: Optional[str] = None) -> Contract:
+        """
+        Create an option contract for the currently selected instrument (SPX/XSP/ES_FOP).
+        
+        This is the RECOMMENDED function for all new contract creation as it automatically
+        handles the differences between index options (OPT) and futures options (FOP).
+        
+        Args:
+            strike: Strike price (MUST be FLOAT - e.g., 5800.0, not 5800)
+            right: "C" for call or "P" for put
+            expiry: Expiration date YYYYMMDD (default: use self.current_expiry)
+        
+        Returns:
+            Contract object configured for the selected instrument type
+        
+        Contract Differences:
+            Index Options (SPX/XSP):
+                - secType = "OPT"
+                - symbol = "SPX" or "XSP"
+                - tradingClass = "SPXW" or "XSP"
+                - exchange = "SMART"
+                - lastTradeDateOrContractMonth = expiry (e.g., "20251107")
+            
+            Futures Options (ES_FOP):
+                - secType = "FOP"
+                - symbol = futures symbol (e.g., "ES")
+                - tradingClass = UNSET (auto-resolved by IBKR to weekly codes like EW1, EW2)
+                - exchange = "CME"
+                - lastTradeDateOrContractMonth = expiry date (e.g., "20251112" for 0DTE)
+                - CRITICAL: DO NOT set tradingClass for FOP - let IBKR auto-resolve
+        """
+        # Get expiry date (use current_expiry if not specified)
+        expiry_date = expiry if expiry else self.current_expiry
+        
+        contract = Contract()
+        contract.strike = strike
+        contract.right = right
+        contract.currency = "USD"
+        
+        # Set instrument-specific parameters
+        if self.instrument['sec_type'] == 'FOP':
+            # ====================================================================
+            # FUTURES OPTIONS (FOP) - ES Options on Futures
+            # ====================================================================
+            contract.secType = "FOP"
+            contract.symbol = self.instrument['underlying_symbol']  # "ES"
+            contract.exchange = self.instrument['underlying_exchange']  # "CME"
+            contract.multiplier = self.instrument['multiplier']  # "50"
+            
+            # CRITICAL: For FOP contracts, DO NOT set tradingClass!
+            # Let IBKR's API automatically resolve the correct trading class.
+            # ES options use weekly codes (EW1, EW2, EW3, EW4, etc.) that vary by week.
+            # Setting tradingClass="ES" causes "Error 200: No security definition found"
+            # 
+            # The API auto-determines the correct trading class from:
+            # - symbol ("ES")
+            # - lastTradeDateOrContractMonth (e.g., "20251112")  
+            # - exchange ("CME")
+            # 
+            # DO NOT SET: contract.tradingClass
+            # contract.tradingClass is intentionally left UNSET for FOP contracts
+            
+            # CRITICAL FOP DATE FORMAT:
+            # - For MONTHLY options: Use YYYYMM (e.g., "202512" for Dec 2025 monthly options)
+            # - For 0DTE/Daily/Weekly options: Use YYYYMMDD (e.g., "20251112" for Nov 12, 2025 options)
+            # 
+            # ES futures support daily (0DTE) option expiration!
+            # The lastTradeDateOrContractMonth specifies the OPTION expiration date, which can be:
+            #   1. Daily (0DTE): Any trading day (YYYYMMDD)
+            #   2. Weekly: Friday of each week (YYYYMMDD)
+            #   3. Monthly: 3rd Friday of month (can use YYYYMM or YYYYMMDD)
+            #   4. Quarterly: Futures expiration dates (YYYYMMDD)
+            #
+            # The underlying futures contract is still ESZ5 (Dec 2025), but options can expire daily.
+            
+            # Use YYYYMMDD format for daily/0DTE options (8 characters)
+            # Use YYYYMM format for monthly options (6 characters)
+            if len(expiry_date) == 8:
+                # Daily/0DTE option - use full date YYYYMMDD
+                contract.lastTradeDateOrContractMonth = expiry_date
+            else:
+                # Monthly option - use YYYYMM format
+                contract.lastTradeDateOrContractMonth = expiry_date[:6]  # Extract YYYYMM
+            
+        else:
+            # ====================================================================
+            # INDEX OPTIONS (OPT) - SPX/XSP Cash-Settled Index Options
+            # ====================================================================
+            contract.secType = "OPT"
+            contract.symbol = self.instrument['options_symbol']  # "SPX" or "XSP"
+            contract.tradingClass = self.instrument['options_trading_class']  # "SPXW" or "XSP"
+            contract.exchange = "SMART"  # SMART routing works with tradingClass
+            contract.multiplier = self.instrument['multiplier']  # "100"
+            
+            # Index options use daily expiration dates
+            contract.lastTradeDateOrContractMonth = expiry_date
+        
         return contract
     
     def get_expiration_options(self) -> list:
@@ -7058,7 +7297,12 @@ class MainWindow(QMainWindow):
     def refresh_option_chain(self):
         """Refresh main option chain only (manual refresh)"""
         self.log_message("Refreshing main option chain...", "INFO")
-        self.request_option_chain()
+        # Use unified chain loading system to prevent duplicate subscriptions
+        atm_strike = self.calculate_atm_strike()
+        if atm_strike > 0:
+            self.build_single_chain('main', atm_strike, self.strikes_above, self.strikes_below)
+        else:
+            self.log_message("Cannot refresh chain - no underlying price available", "WARNING")
     
     def recenter_chain_on_atm(self):
         """Manually recenter the option chain on the current ATM strike"""
@@ -7066,7 +7310,8 @@ class MainWindow(QMainWindow):
         atm_strike = self.find_atm_strike_by_delta()
         if atm_strike > 0:
             self.log_message(f"Manual recentering: ATM detected at {atm_strike:.0f}", "INFO")
-            self.request_option_chain(force_center_strike=atm_strike)
+            # Use unified chain loading to prevent duplicate subscriptions
+            self.build_single_chain('main', atm_strike, self.strikes_above, self.strikes_below)
         else:
             # Use ONLY underlying price - NO ES fallback to avoid wrong calculations
             current_price = self.app_state.get('underlying_price', 0)
@@ -7075,7 +7320,8 @@ class MainWindow(QMainWindow):
                 strike_increment = self.instrument['strike_increment']
                 center_strike = round(current_price / strike_increment) * strike_increment
                 self.log_message(f"🎯 Manual recentering: Using underlying price {current_price:.2f} → strike {center_strike:.0f}", "INFO")
-                self.request_option_chain(force_center_strike=center_strike)
+                # Use unified chain loading to prevent duplicate subscriptions
+                self.build_single_chain('main', center_strike, self.strikes_above, self.strikes_below)
             else:
                 self.log_message("❌ Cannot recenter: No underlying price available (ES fallback disabled)", "WARNING")
     
@@ -7099,18 +7345,8 @@ class MainWindow(QMainWindow):
         else:
             logger.debug("Delta-based recenter - keeping delta_calibration_done to prevent ES recenter")
         
-        # Cancel existing option chain subscriptions to avoid duplicate ticker ID errors
-        if self.app_state.get('active_option_req_ids'):
-            self.log_message(f"Canceling {len(self.app_state['active_option_req_ids'])} existing subscriptions...", "INFO")
-            for req_id in self.app_state['active_option_req_ids']:
-                try:
-                    self.ibkr_client.cancelMktData(req_id)
-                except Exception as e:
-                    logger.debug(f"Error canceling reqId {req_id}: {e}")
-            self.app_state['active_option_req_ids'] = []
-            # Clear market data map for old requests
-            self.app_state['market_data_map'] = {k: v for k, v in self.app_state['market_data_map'].items() 
-                                                  if not (isinstance(k, int) and 100 <= k <= 999)}
+        # Cancel existing option chain subscriptions using centralized system
+        self.cancel_chain_subscriptions('main')
         
         # If force_center_strike is provided, use it directly (delta-based recenter)
         if force_center_strike is not None:
@@ -7155,21 +7391,16 @@ class MainWindow(QMainWindow):
         self.option_table.setRowCount(0)
         self.option_table.setRowCount(len(strikes))
         
-        # Subscribe to market data for each strike
-        req_id = 100  # Start from 100 for option contracts
+        # Subscribe to market data for each strike using centralized request ID system
         new_req_ids = []  # Track new request IDs
         
         for row, strike in enumerate(strikes):
-            # Create call contract using helper function and instrument configuration
-            call_contract = self.create_option_contract(
-                strike, "C", 
-                self.instrument['options_symbol'], 
-                self.instrument['options_trading_class']
-            )
+            # Create call contract using instrument-aware helper function
+            call_contract = self.create_instrument_option_contract(strike, "C")
             
             # Log the contract details for debugging
             logger.info(
-                f"Creating CALL contract: symbol={call_contract.symbol}, "
+                f"Creating CALL contract: symbol={call_contract.symbol}, secType={call_contract.secType}, "
                 f"strike={call_contract.strike}, right={call_contract.right}, "
                 f"expiry={call_contract.lastTradeDateOrContractMonth}, "
                 f"exchange={call_contract.exchange}, tradingClass={call_contract.tradingClass}, "
@@ -7177,22 +7408,18 @@ class MainWindow(QMainWindow):
             )
             
             call_key = f"{self.instrument['options_symbol']}_{strike}_C_{self.current_expiry}"
+            req_id = self.get_next_request_id('main')
             self.app_state['market_data_map'][req_id] = call_key
             self.ibkr_client.reqMktData(req_id, call_contract, "", False, False, [])
             logger.info(f"Requested market data for {call_key} with reqId={req_id}")
             new_req_ids.append(req_id)
-            req_id += 1
             
-            # Create put contract using helper function and instrument configuration
-            put_contract = self.create_option_contract(
-                strike, "P", 
-                self.instrument['options_symbol'], 
-                self.instrument['options_trading_class']
-            )
+            # Create put contract using instrument-aware helper function
+            put_contract = self.create_instrument_option_contract(strike, "P")
             
             # Log the contract details for debugging
             logger.info(
-                f"Creating PUT contract: symbol={put_contract.symbol}, "
+                f"Creating PUT contract: symbol={put_contract.symbol}, secType={put_contract.secType}, "
                 f"strike={put_contract.strike}, right={put_contract.right}, "
                 f"expiry={put_contract.lastTradeDateOrContractMonth}, "
                 f"exchange={put_contract.exchange}, tradingClass={put_contract.tradingClass}, "
@@ -7200,11 +7427,11 @@ class MainWindow(QMainWindow):
             )
             
             put_key = f"{self.instrument['options_symbol']}_{strike}_P_{self.current_expiry}"
+            req_id = self.get_next_request_id('main')
             self.app_state['market_data_map'][req_id] = put_key
             self.ibkr_client.reqMktData(req_id, put_contract, "", False, False, [])
             logger.info(f"Requested market data for {put_key} with reqId={req_id}")
             new_req_ids.append(req_id)
-            req_id += 1
             
             # Set strike in table
             strike_item = QTableWidgetItem(f"{strike:.0f}")
@@ -7221,9 +7448,9 @@ class MainWindow(QMainWindow):
             
             self.option_table.setItem(row, 10, strike_item)
         
-        # Store active request IDs for future cleanup
-        self.app_state['active_option_req_ids'] = new_req_ids
-        self.log_message(f"Subscribed to {len(strikes) * 2} option contracts", "SUCCESS")
+        # Store active request IDs using centralized tracking system
+        self.active_req_ids['main'] = new_req_ids
+        self.log_message(f"✓ main chain: subscribed to {len(new_req_ids)} contracts ({len(strikes)} strikes × 2)", "SUCCESS")
         
         # Clear recentering flags now that chain is loaded
         self.is_recentering_chain = False
@@ -7249,6 +7476,11 @@ class MainWindow(QMainWindow):
             
             symbol, strike, right, expiry = parts
             strike = float(strike)
+            
+            # CRITICAL: Only update main chain if expiry matches current_expiry
+            # This prevents duplicate subscriptions or old expiry data from updating the table
+            if not hasattr(self, 'current_expiry') or expiry != self.current_expiry:
+                return  # This contract doesn't match main chain's expiry
             
             # Find the row for this strike using FLOAT comparison with tolerance
             for row in range(self.option_table.rowCount()):
@@ -7483,8 +7715,8 @@ class MainWindow(QMainWindow):
             self.is_recentering_chain = True
             self.last_recenter_time = current_time
             
-            # Request new chain centered on current ATM (force center to detected ATM strike)
-            self.request_option_chain(force_center_strike=atm_strike)
+            # Use unified chain loading to prevent duplicate subscriptions
+            self.build_single_chain('main', atm_strike, self.strikes_above, self.strikes_below)
         else:
             # Log debug info about current drift (only after initial calibration is done)
             if self.delta_calibration_done:
@@ -7898,18 +8130,14 @@ class MainWindow(QMainWindow):
                 return None
             
             symbol, strike_str, right, expiry = parts
-            trading_class = "SPXW" if symbol == "SPX" else "XSP"
             
             logger.info(f"Parsing contract_key: {contract_key}")
             logger.info(f"  Symbol: {symbol}, Strike: {strike_str}, Right: {right}, Expiry: {expiry}")
-            logger.info(f"  Trading Class: {trading_class}")
             
-            # Create contract with full validation
-            contract = self.create_option_contract(
+            # Create contract using instrument-aware function (handles both OPT and FOP)
+            contract = self.create_instrument_option_contract(
                 strike=float(strike_str),
                 right=right,
-                symbol=symbol,
-                trading_class=trading_class,
                 expiry=expiry
             )
             
@@ -8006,10 +8234,15 @@ class MainWindow(QMainWindow):
             
             # STEP 6: Place order via IBKR API FIRST (before tracking)
             try:
-                logger.info(f"Calling ibkr_client.placeOrder({order_id}, contract, order)...")
+                logger.info(f"🚀 CRITICAL: About to call ibkr_client.placeOrder({order_id}, contract, order)...")
+                logger.info(f"🚀 ibkr_client type: {type(self.ibkr_client)}")
+                logger.info(f"🚀 ibkr_client connected: {self.ibkr_client.isConnected() if hasattr(self.ibkr_client, 'isConnected') else 'N/A'}")
+                
                 self.ibkr_client.placeOrder(order_id, contract, order)
-                logger.info(f"✓ placeOrder() API call completed for order #{order_id}")
-                self.log_message(f"✓ Order #{order_id} sent to TWS successfully", "SUCCESS")
+                
+                logger.info(f"✅ placeOrder() API call COMPLETED for order #{order_id}")
+                logger.info(f"✅ Order should now be visible in TWS")
+                self.log_message(f"✅ Order #{order_id} sent to TWS/IB Gateway", "SUCCESS")
                 
                 # ACTIVITY LOG: Order placed
                 if hasattr(self, 'ts_signals'):
@@ -8019,8 +8252,9 @@ class MainWindow(QMainWindow):
                     )
                 
             except Exception as e:
-                self.log_message(f"✗ EXCEPTION during placeOrder(): {e}", "ERROR")
-                logger.error(f"placeOrder() exception: {e}", exc_info=True)
+                self.log_message(f"❌ EXCEPTION during placeOrder(): {e}", "ERROR")
+                logger.error(f"❌ placeOrder() exception: {e}", exc_info=True)
+                logger.error(f"❌ Order #{order_id} was NOT sent to TWS")
                 
                 # ACTIVITY LOG: Order failed
                 if hasattr(self, 'ts_signals'):
@@ -8160,9 +8394,10 @@ class MainWindow(QMainWindow):
                     best_contract_key = contract_key
             
             if best_contract_key:
+                multiplier = int(self.instrument['multiplier'])
                 logger.info(
                     f"✓ Found {option_type} option: {best_contract_key} @ ${best_price:.2f} "
-                    f"(Risk: ${best_price * 100:.2f})"
+                    f"(Risk: ${best_price * multiplier:.2f})"
                 )
                 return (best_contract_key, best_price)
             else:
@@ -8367,52 +8602,32 @@ class MainWindow(QMainWindow):
                 logger.info(f"Order #{order_id}: {update_reason} | {price_formula}")
                 
                 try:
-                    # Parse contract key to recreate contract
-                    parts = contract_key.split('_')
-                    if len(parts) == 4:
-                        symbol, strike_str, right, expiry = parts
-                        trading_class = "SPXW" if symbol == "SPX" else "XSP"
-                        
-                        # Create contract
-                        contract = self.create_option_contract(
-                            strike=float(strike_str),
-                            right=right,
-                            symbol=symbol,
-                            trading_class=trading_class,
-                            expiry=expiry
-                        )
-                        
-                        # Create modified order
-                        order = Order()
-                        order.action = order_info['action']
-                        order.totalQuantity = order_info['quantity']
-                        order.orderType = "LMT"
-                        order.lmtPrice = new_price
-                        order.auxPrice = 0
-                        order.tif = "DAY"
-                        order.outsideRth = True  # Enable after-hours trading
-                        order.eTradeOnly = False
-                        order.firmQuoteOnly = False
-                        
-                        # Modify order (use same order_id)
-                        self.ibkr_client.placeOrder(order_id, contract, order)
-                        
-                        # Update tracking
-                        order_info['last_mid'] = current_mid  # Track current mid
-                        order_info['last_price'] = new_price  # Track actual order price
-                        order_info['timestamp'] = datetime.now()  # Reset timer
-                        order_info['attempts'] += 1
-                        
-                        # Update orders display
-                        self.update_orders_display()
-                        self.update_ts_orders_display()
-                        
-                        logger.info(f"✓ Order #{order_id} updated to ${new_price:.2f} (X_ticks={give_in_ticks})")
-                        self.log_message(
-                            f"Order #{order_id}: ${new_price:.2f} | X_ticks={give_in_ticks} | {update_reason}",
-                            "INFO"
-                        )
-                        
+                    # Use the stored contract and order objects (don't recreate - causes "Error 105: order mismatch")
+                    contract = order_info['contract']
+                    order = order_info['order']
+                    
+                    # Modify the order's limit price
+                    order.lmtPrice = new_price
+                    
+                    # Modify order (use same order_id with original order object)
+                    self.ibkr_client.placeOrder(order_id, contract, order)
+                    
+                    # Update tracking
+                    order_info['last_mid'] = current_mid  # Track current mid
+                    order_info['last_price'] = new_price  # Track actual order price
+                    order_info['timestamp'] = datetime.now()  # Reset timer
+                    order_info['attempts'] += 1
+                    
+                    # Update orders display
+                    self.update_orders_display()
+                    self.update_ts_orders_display()
+                    
+                    logger.info(f"✓ Order #{order_id} updated to ${new_price:.2f} (X_ticks={give_in_ticks})")
+                    self.log_message(
+                        f"Order #{order_id}: ${new_price:.2f} | X_ticks={give_in_ticks} | {update_reason}",
+                        "INFO"
+                    )
+                    
                 except Exception as e:
                     logger.error(f"Error updating order #{order_id}: {e}", exc_info=True)
         
@@ -8607,18 +8822,20 @@ class MainWindow(QMainWindow):
                 quantity = self.trade_qty_spin.value()
                 size_description = f"{quantity} contract(s) (Fixed)"
             else:  # calculated by risk
-                # Calculate contracts based on max risk: contracts = max_risk / (option_price * 100)
-                option_cost = mid_price * 100  # Cost per contract
+                # Calculate contracts based on max risk: contracts = max_risk / (option_price * multiplier)
+                multiplier = int(self.instrument['multiplier'])
+                option_cost = mid_price * multiplier  # Cost per contract
                 quantity = max(1, int(max_risk / option_cost))
                 size_description = f"{quantity} contract(s) (By Risk: ${max_risk:.0f} ÷ ${option_cost:.0f})"
             
             # Log order details
+            multiplier = int(self.instrument['multiplier'])
             self.log_message(
                 f"Placing BUY CALL: {quantity} × {contract_key}\n"
                 f"Delta: {actual_delta:.1f} (Target: {target_delta})\n"
-                f"Mid Price: ${mid_price:.2f} (~${mid_price * 100:.0f} per contract)\n"
+                f"Mid Price: ${mid_price:.2f} (~${mid_price * multiplier:.0f} per contract)\n"
                 f"Position Size: {size_description}\n"
-                f"Total Cost: ~${mid_price * 100 * quantity:.0f}",
+                f"Total Cost: ~${mid_price * multiplier * quantity:.0f}",
                 "INFO"
             )
             
@@ -8685,18 +8902,20 @@ class MainWindow(QMainWindow):
                 quantity = self.trade_qty_spin.value()
                 size_description = f"{quantity} contract(s) (Fixed)"
             else:  # calculated by risk
-                # Calculate contracts based on max risk: contracts = max_risk / (option_price * 100)
-                option_cost = mid_price * 100  # Cost per contract
+                # Calculate contracts based on max risk: contracts = max_risk / (option_price * multiplier)
+                multiplier = int(self.instrument['multiplier'])
+                option_cost = mid_price * multiplier  # Cost per contract
                 quantity = max(1, int(max_risk / option_cost))
                 size_description = f"{quantity} contract(s) (By Risk: ${max_risk:.0f} ÷ ${option_cost:.0f})"
             
             # Log order details
+            multiplier = int(self.instrument['multiplier'])
             self.log_message(
                 f"Placing BUY PUT: {quantity} × {contract_key}\n"
                 f"Delta: {actual_delta:.1f} (Target: {target_delta})\n"
-                f"Mid Price: ${mid_price:.2f} (~${mid_price * 100:.0f} per contract)\n"
+                f"Mid Price: ${mid_price:.2f} (~${mid_price * multiplier:.0f} per contract)\n"
                 f"Position Size: {size_description}\n"
-                f"Total Cost: ~${mid_price * 100 * quantity:.0f}",
+                f"Total Cost: ~${mid_price * multiplier * quantity:.0f}",
                 "INFO"
             )
             
@@ -8884,17 +9103,22 @@ class MainWindow(QMainWindow):
                 if bid > 0 and ask > 0:
                     current_price = (bid + ask) / 2
                     pos['currentPrice'] = current_price
-                    pos['pnl'] = (current_price - pos['avgCost']) * pos['position'] * 100
+                    # CRITICAL: Use instrument multiplier for P&L calculation
+                    # SPX/XSP: 100, ES: 50
+                    multiplier = int(self.instrument['multiplier'])
+                    pos['pnl'] = (current_price - pos['avgCost']) * pos['position'] * multiplier
                 else:
                     # Option has no valid bid/ask (worthless or no market data)
                     # Treat as worthless: set price to 0 and calculate total loss
                     pos['currentPrice'] = 0.0
-                    pos['pnl'] = (0.0 - pos['avgCost']) * pos['position'] * 100
+                    multiplier = int(self.instrument['multiplier'])
+                    pos['pnl'] = (0.0 - pos['avgCost']) * pos['position'] * multiplier
                     # Removed debug spam - position updates every second don't need logging
             else:
                 # No market data at all - treat as worthless
                 pos['currentPrice'] = 0.0
-                pos['pnl'] = (0.0 - pos['avgCost']) * pos['position'] * 100
+                multiplier = int(self.instrument['multiplier'])
+                pos['pnl'] = (0.0 - pos['avgCost']) * pos['position'] * multiplier
             
             pnl = pos.get('pnl', 0)
             pnl_pct = (pos['currentPrice'] / pos['avgCost'] - 1) * 100 if pos['avgCost'] > 0 else 0
@@ -8911,8 +9135,10 @@ class MainWindow(QMainWindow):
             time_span_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
             
             # Calculate cost basis and market value
-            cost_basis = pos['avgCost'] * abs(pos['position']) * 100
-            market_value = pos['currentPrice'] * abs(pos['position']) * 100
+            # CRITICAL: Use instrument multiplier (SPX/XSP: 100, ES: 50)
+            multiplier = int(self.instrument['multiplier'])
+            cost_basis = pos['avgCost'] * abs(pos['position']) * multiplier
+            market_value = pos['currentPrice'] * abs(pos['position']) * multiplier
             total_cost_basis += cost_basis
             total_mkt_value += market_value
             
@@ -9342,7 +9568,8 @@ class MainWindow(QMainWindow):
                 self.current_expiry = self.calculate_expiry_date(0)
                 if self.current_expiry != old_expiry:
                     logger.info(f"Expiration auto-switched from {old_expiry} to {self.current_expiry}")
-                    self.request_option_chain()
+                    # Use unified chain loading to prevent duplicate subscriptions
+                    self.load_all_chains_sequential()
         
         # Also check if we just passed 4:00 PM local time on the same day
         elif now_local.hour == 16 and now_local.minute == 0:
@@ -9352,7 +9579,8 @@ class MainWindow(QMainWindow):
                 self.current_expiry = self.calculate_expiry_date(0)  # Will switch to tomorrow
                 if self.current_expiry != old_expiry:
                     logger.info(f"Expiration auto-switched from {old_expiry} to {self.current_expiry}")
-                    self.request_option_chain()
+                    # Use unified chain loading to prevent duplicate subscriptions
+                    self.load_all_chains_sequential()
         
         # AUTO-RECENTER: Check if ES price has drifted from last center strike
         # NOTE: This ES-based recenter is DISABLED after delta calibration is complete.
@@ -9381,7 +9609,8 @@ class MainWindow(QMainWindow):
                         f"[ES-BASED RECENTER - PRE-CALIBRATION] Price drifted {drift:.0f} points from center strike {self.last_chain_center_strike} "
                         f"to {current_center} (threshold: {drift_threshold:.0f}), auto-recentering chain"
                     )
-                    self.request_option_chain()
+                    # Use unified chain loading to prevent duplicate subscriptions
+                    self.load_all_chains_sequential()
     
     def calculate_offset_from_historical_close(self):
         """
@@ -9632,7 +9861,8 @@ class MainWindow(QMainWindow):
         
         if atm_strike > 0:
             self.log_message(f"Manual recentering: ATM detected at {atm_strike:.0f} (delta-based)", "INFO")
-            self.request_option_chain(force_center_strike=atm_strike)
+            # Use unified chain loading to prevent duplicate subscriptions
+            self.build_single_chain('main', atm_strike, self.strikes_above, self.strikes_below)
             return
         
         # Second, try underlying price
@@ -9641,7 +9871,8 @@ class MainWindow(QMainWindow):
             strike_increment = self.instrument['strike_increment']
             center_strike = round(underlying_price / strike_increment) * strike_increment
             self.log_message(f"Manual recentering: Using {self.instrument['underlying_symbol']} price {underlying_price:.2f} → strike {center_strike:.0f}", "INFO")
-            self.request_option_chain(force_center_strike=center_strike)
+            # Use unified chain loading to prevent duplicate subscriptions
+            self.build_single_chain('main', center_strike, self.strikes_above, self.strikes_below)
             return
         
         # Finally, fallback to ES price
@@ -9664,7 +9895,8 @@ class MainWindow(QMainWindow):
         
         # Recenter on the calculated ATM strike
         if self.connection_state == ConnectionState.CONNECTED:
-            self.request_option_chain(force_center_strike=atm_strike)
+            # Use unified chain loading to prevent duplicate subscriptions
+            self.build_single_chain('main', atm_strike, self.strikes_above, self.strikes_below)
         else:
             self.log_message("Cannot recenter - not connected to IBKR", "WARNING")
     
@@ -10439,10 +10671,14 @@ class MainWindow(QMainWindow):
             logger.info(f"📊 Market data for {contract_key}: bid={bid}, ask={ask}, has_data={contract_key in self.market_data}")
             
             if bid > 0 and ask > 0:
-                mid_price = round((bid + ask) / 2, 2)
+                mid_price = (bid + ask) / 2
+                # CRITICAL: Round to valid tick size for the instrument
+                # ES options trade in $0.25 increments (>= $3.00) or $0.05 (< $3.00)
+                mid_price = self.round_to_option_tick(mid_price)
             else:
                 logger.warning(f"No bid/ask for {contract_key}, using last price")
-                mid_price = market_data.get('last', 0)
+                last_price = market_data.get('last', 0)
+                mid_price = self.round_to_option_tick(last_price) if last_price > 0 else 0
             
             if mid_price <= 0:
                 logger.error(f"No valid price for {contract_key}")
@@ -10736,7 +10972,7 @@ class MainWindow(QMainWindow):
                 
                 # Try to get StrategyDirection value
                 try:
-                    direction = gd.GetValue(dictionary_name, 'StrategyDirection')
+                    direction = gd.GetValue(dictionary_name, 'StrategyDirection')  # type: ignore
                     logger.info(f"IMMEDIATE JOIN: Read StrategyDirection = {direction}")
                     
                     # Convert to int (defensive)
@@ -11427,13 +11663,18 @@ class MainWindow(QMainWindow):
                 if bid > 0 and ask > 0:
                     current_price = (bid + ask) / 2
                     pos['currentPrice'] = current_price
-                    pos['pnl'] = (current_price - pos['avgCost']) * pos['position'] * 100
+                    # CRITICAL: Use instrument multiplier for P&L calculation
+                    # SPX/XSP: 100, ES: 50
+                    multiplier = int(self.instrument['multiplier'])
+                    pos['pnl'] = (current_price - pos['avgCost']) * pos['position'] * multiplier
                 else:
                     pos['currentPrice'] = 0.0
-                    pos['pnl'] = (0.0 - pos['avgCost']) * pos['position'] * 100
+                    multiplier = int(self.instrument['multiplier'])
+                    pos['pnl'] = (0.0 - pos['avgCost']) * pos['position'] * multiplier
             else:
                 pos['currentPrice'] = 0.0
-                pos['pnl'] = (0.0 - pos['avgCost']) * pos['position'] * 100
+                multiplier = int(self.instrument['multiplier'])
+                pos['pnl'] = (0.0 - pos['avgCost']) * pos['position'] * multiplier
             
             pnl = pos.get('pnl', 0)
             pnl_pct = (pos['currentPrice'] / pos['avgCost'] - 1) * 100 if pos['avgCost'] > 0 else 0
@@ -11450,8 +11691,10 @@ class MainWindow(QMainWindow):
             time_span_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
             
             # Calculate cost basis and market value
-            cost_basis = pos['avgCost'] * abs(pos['position']) * 100
-            market_value = pos['currentPrice'] * abs(pos['position']) * 100
+            # CRITICAL: Use instrument multiplier (SPX/XSP: 100, ES: 50)
+            multiplier = int(self.instrument['multiplier'])
+            cost_basis = pos['avgCost'] * abs(pos['position']) * multiplier
+            market_value = pos['currentPrice'] * abs(pos['position']) * multiplier
             total_cost_basis += cost_basis
             total_mkt_value += market_value
             
@@ -11773,8 +12016,11 @@ class MainWindow(QMainWindow):
                     except Exception as e:
                         logger.debug(f"Error cancelling reqId {req_id}: {e}")
                 self.app_state['market_data_map'].clear()
-                if 'active_option_req_ids' in self.app_state:
-                    self.app_state['active_option_req_ids'].clear()
+                
+                # Cancel all chain subscriptions using centralized system
+                self.cancel_chain_subscriptions('main')
+                self.cancel_chain_subscriptions('ts_0dte')
+                self.cancel_chain_subscriptions('ts_1dte')
             
             # Cancel all historical data requests
             if self.app_state.get('historical_data_requests'):
@@ -12555,7 +12801,8 @@ class MainWindow(QMainWindow):
             # Calculate totals
             if call_mid > 0 and put_mid > 0:
                 qty = self.straddle_qty_spin.value()
-                total_cost = (call_mid + put_mid) * qty * self.instrument['multiplier']
+                multiplier = float(self.instrument['multiplier'])  # Convert string to float
+                total_cost = (call_mid + put_mid) * qty * multiplier
                 max_risk = total_cost  # Max risk for long straddle is premium paid
                 
                 self.straddle_total_cost_label.setText(f"${total_cost:.2f}")

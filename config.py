@@ -43,9 +43,44 @@ ENVIRONMENT_OVERRIDE = 'development'  # Change to 'production' in prod directory
 # ============================================================================
 # ⚙️ TRADING INSTRUMENT SELECTION - CONFIGURE THE TRADING INSTRUMENT
 # ============================================================================
-# Set this to either 'SPX' (full-size S&P 500) or 'XSP' (mini 1/10 size)
-# This controls which instrument the application will trade
-SELECTED_INSTRUMENT = 'XSP'  # Change to 'SPX' for full-size S&P 500 trading
+# Set this to one of: 'SPX', 'XSP', 'ES', or 'MES'
+# - 'SPX': Full-size S&P 500 Index Options ($100 multiplier, $5 strikes)
+# - 'XSP': Mini S&P 500 Index Options ($100 multiplier, $1 strikes)
+# - 'ES': E-mini S&P 500 Futures Options (FOP, $50 multiplier, $5 strikes)
+# - 'MES': Micro E-mini S&P 500 Futures Options (FOP, $5 multiplier, $5 strikes)
+SELECTED_INSTRUMENT = 'MES'  # Must be 'SPX', 'XSP', 'ES', or 'MES'
+# ============================================================================
+
+# ============================================================================
+# 📈 ES FUTURES OPTIONS (FOP) CONFIGURATION
+# ============================================================================
+# When SELECTED_INSTRUMENT = 'ES', this specifies which futures contract to trade
+# 
+# ES Futures Contract Month Codes (CME convention):
+# H = March, M = June, U = September, Z = December
+# Year: Last digit (5 = 2025, 6 = 2026, etc.)
+# Example: ESZ5 = ES December 2025
+# 
+# CRITICAL: Options on futures (FOP) expire with the underlying futures contract
+# Not the same as cash-settled index options!
+# ============================================================================
+ES_FRONT_MONTH = 'MESZ5'  # Default: December 2025 (current front month)
+# ============================================================================
+
+# ============================================================================
+# 📊 MES FUTURES OPTIONS (FOP) CONFIGURATION
+# ============================================================================
+# When SELECTED_INSTRUMENT = 'MES', this specifies which futures contract to trade
+# 
+# MES Futures Contract Month Codes (same as ES, CME convention):
+# H = March, M = June, U = September, Z = December
+# Year: Last digit (5 = 2025, 6 = 2026, etc.)
+# Example: MESZ5 = MES December 2025
+# 
+# MES is 1/10th the size of ES ($5/point vs $50/point)
+# Same expiry dates and contract months as ES
+# ============================================================================
+MES_FRONT_MONTH = 'MESZ5'  # Default: December 2025 (current front month)
 # ============================================================================
 
 import os
@@ -216,7 +251,7 @@ def validate_environment() -> list[str]:
             
         # Check for conflicting development processes (optional - requires psutil)
         try:
-            import psutil
+            import psutil  # type: ignore
             current_pid = os.getpid()
             
             for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
@@ -225,7 +260,7 @@ def validate_environment() -> list[str]:
                     if cmdline and 'main.py' in ' '.join(cmdline):
                         if proc.info['pid'] != current_pid:
                             issues.append(f"❌ Another trading instance is running (PID: {proc.info['pid']})")
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                except (psutil.NoSuchProcess, psutil.AccessDenied):  # type: ignore
                     continue
         except ImportError:
             issues.append("⚠️ psutil not installed - cannot check for conflicting processes (optional feature)")
@@ -281,6 +316,106 @@ def get_selected_instrument() -> str:
     return SELECTED_INSTRUMENT
 
 
+def get_es_front_month() -> str:
+    """Get the ES front month futures contract symbol"""
+    return ES_FRONT_MONTH
+
+
+def get_mes_front_month() -> str:
+    """Get the MES front month futures contract symbol"""
+    return MES_FRONT_MONTH
+
+
+def parse_futures_contract(symbol: str) -> Dict[str, Any]:
+    """
+    Parse futures contract symbol into components
+    
+    Args:
+        symbol: Futures symbol like 'ESZ5' or 'MESZ5'
+                (ES/MES = root, Z = December, 5 = 2025)
+    
+    Returns:
+        Dict with: root, month_code, month_name, year, full_year, expiry_date
+    
+    Month Codes (CME):
+        F=Jan, G=Feb, H=Mar, J=Apr, K=May, M=Jun,
+        N=Jul, Q=Aug, U=Sep, V=Oct, X=Nov, Z=Dec
+    
+    Examples:
+        ESZ5  -> ES December 2025
+        MESZ5 -> MES December 2025
+    """
+    month_codes = {
+        'F': ('Jan', 1), 'G': ('Feb', 2), 'H': ('Mar', 3),
+        'J': ('Apr', 4), 'K': ('May', 5), 'M': ('Jun', 6),
+        'N': ('Jul', 7), 'Q': ('Aug', 8), 'U': ('Sep', 9),
+        'V': ('Oct', 10), 'X': ('Nov', 11), 'Z': ('Dec', 12)
+    }
+    
+    # Parse symbol (e.g., "ESZ5")
+    if len(symbol) < 3:
+        raise ValueError(f"Invalid futures symbol: {symbol}")
+    
+    root = symbol[:-2]  # "ES"
+    month_code = symbol[-2]  # "Z"
+    year_digit = symbol[-1]  # "5"
+    
+    if month_code not in month_codes:
+        raise ValueError(f"Invalid month code: {month_code}")
+    
+    month_name, month_num = month_codes[month_code]
+    
+    # Convert year digit to full year (5 = 2025, 6 = 2026, etc.)
+    # Assumes 2020-2029 range
+    full_year = 2020 + int(year_digit)
+    
+    # Calculate futures expiration date (3rd Friday of contract month)
+    from datetime import datetime, timedelta
+    first_day = datetime(full_year, month_num, 1)
+    # Find first Friday
+    days_to_friday = (4 - first_day.weekday()) % 7
+    first_friday = first_day + timedelta(days=days_to_friday)
+    # Third Friday is 2 weeks later
+    third_friday = first_friday + timedelta(weeks=2)
+    expiry_date = third_friday.strftime('%Y%m%d')
+    
+    return {
+        'root': root,
+        'month_code': month_code,
+        'month_name': month_name,
+        'month_num': month_num,
+        'year_digit': year_digit,
+        'full_year': full_year,
+        'expiry_date': expiry_date,
+        'full_symbol': symbol
+    }
+
+
+def get_futures_contract_info(symbol: str | None = None) -> str:
+    """
+    Get formatted information about a futures contract
+    
+    Args:
+        symbol: Futures symbol (e.g., 'ESZ5'), defaults to ES_FRONT_MONTH
+    
+    Returns:
+        Formatted string with contract details
+    """
+    if symbol is None:
+        symbol = ES_FRONT_MONTH
+    
+    try:
+        info = parse_futures_contract(symbol)
+        return (
+            f"Futures Contract: {info['full_symbol']}\n"
+            f"  Root: {info['root']}\n"
+            f"  Expiry Month: {info['month_name']} {info['full_year']}\n"
+            f"  Expiry Date: {info['expiry_date']} (3rd Friday)\n"
+        )
+    except Exception as e:
+        return f"Error parsing {symbol}: {e}"
+
+
 def get_environment_info() -> str:
     """Get formatted environment information string"""
     info_lines = [
@@ -294,6 +429,22 @@ def get_environment_info() -> str:
         f"🆔 Client ID Start: {current_config['client_id_start']}",
         f"📡 TradeStation Dict: {current_config['tradestation_dict_name']}"
     ]
+    
+    # Add futures contract info for ES/MES
+    if SELECTED_INSTRUMENT == 'ES':
+        info_lines.append(f"📊 ES Contract: {ES_FRONT_MONTH}")
+        try:
+            futures_info = parse_futures_contract(ES_FRONT_MONTH)
+            info_lines.append(f"   Expiry: {futures_info['month_name']} {futures_info['full_year']} ({futures_info['expiry_date']})")
+        except Exception as e:
+            info_lines.append(f"   Error parsing contract: {e}")
+    elif SELECTED_INSTRUMENT == 'MES':
+        info_lines.append(f"📊 MES Contract: {MES_FRONT_MONTH}")
+        try:
+            futures_info = parse_futures_contract(MES_FRONT_MONTH)
+            info_lines.append(f"   Expiry: {futures_info['month_name']} {futures_info['full_year']} ({futures_info['expiry_date']})")
+        except Exception as e:
+            info_lines.append(f"   Error parsing contract: {e}")
     
     if config.is_production:
         info_lines.append("🚨 LIVE TRADING ENVIRONMENT")
