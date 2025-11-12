@@ -103,10 +103,10 @@ SELECTED_INSTRUMENT = 'ESH6'  # March 2026
 
 - **Purpose**: The price of ES futures is not identical to the cash index (SPX/XSP). The `es_to_cash_offset` variable tracks this basis difference. It is critical for accurately estimating the ATM strike outside of regular trading hours.
 - **Lifecycle**:
-    1.  **Live Tracking**: During market hours (8:30 AM - 3:00 PM CT), `update_es_to_cash_offset()` actively calculates and updates the offset.
+    1.  **Live Tracking**: During futures market hours (8:30 AM - 4:00 PM CT for ES/MES), `update_es_to_cash_offset()` actively calculates and updates the offset.
     2.  **Persistence**: The live offset is periodically saved to `settings.json`.
     3.  **After-Hours Loading**: When the app starts after hours, it loads the last saved offset from `settings.json`.
-    4.  **Historical Fallback**: If the app starts after hours and has no saved offset, `calculate_offset_from_historical_close()` will fetch historical data for ES and the cash index to calculate the offset from the previous day's 3:00 PM CT close.
+    4.  **Historical Fallback**: If the app starts after hours and has no saved offset, `calculate_offset_from_historical_close()` will fetch historical data for ES and the cash index to calculate the offset from the previous day's 4:00 PM CT futures close.
 
 ### 3.4. Trading and Order Management
 
