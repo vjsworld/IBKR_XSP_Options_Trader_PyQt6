@@ -14,7 +14,9 @@ CRITICAL TIMEZONE CONFIGURATION:
 ═══════════════════════════════════════════════════════════════════════════
 🕐 ALL TIMES IN THIS APPLICATION USE CENTRAL TIME (America/Chicago) 🕐
 ═══════════════════════════════════════════════════════════════════════════
-- Market hours: 8:30 AM - 3:00 PM CT
+- Stock market hours: 8:30 AM - 3:00 PM CT (SPX/XSP close at 3:00 PM)
+- Futures market hours: 8:30 AM - 4:00 PM CT (ES/MES close at 4:00 PM)
+- Futures reopen: 5:00 PM CT (Sunday-Thursday)
 - After-hours: 7:15 PM - 7:25 AM CT (for 0DTE overnight trading)
 - Regular trading restarts after a five minute break when stocks to dat 8:30 AM CT
 - All charts display Central Time
@@ -39,6 +41,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from enum import Enum
 from collections import defaultdict
+import csv
 import pytz  # For timezone-aware datetime (CENTRAL TIME - America/Chicago ONLY)
 
 
@@ -2534,6 +2537,461 @@ class ChartWindow(QMainWindow):
 
 
 # ============================================================================
+# TRADELOG VIEWER WINDOW
+# ============================================================================
+
+class TradeLogWindow(QMainWindow):
+    """Window for displaying trade log CSV data"""
+    
+    def __init__(self, csv_file_path, parent=None):
+        super().__init__(parent)
+        self.csv_file_path = csv_file_path
+        self.setWindowTitle(f"Trade Log - {Path(csv_file_path).name}")
+        self.setGeometry(200, 200, 1000, 600)
+        
+        # Central widget
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        
+        # Info label
+        info_label = QLabel(f"📊 Trade Log: {csv_file_path}")
+        info_label.setStyleSheet("font-weight: bold; font-size: 11pt; padding: 5px;")
+        layout.addWidget(info_label)
+        
+        # Table widget
+        self.table = QTableWidget()
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        layout.addWidget(self.table)
+        
+        # Refresh button
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self.load_data)
+        refresh_btn.setMaximumWidth(100)
+        layout.addWidget(refresh_btn, alignment=Qt.AlignmentFlag.AlignRight)
+        
+        # Apply dark theme
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #1e1e1e;
+            }
+            QLabel {
+                color: #ffffff;
+            }
+            QTableWidget {
+                background-color: #2d2d2d;
+                color: #ffffff;
+                gridline-color: #3d3d3d;
+                border: 1px solid #3d3d3d;
+            }
+            QTableWidget::item {
+                padding: 5px;
+            }
+            QHeaderView::section {
+                background-color: #3d3d3d;
+                color: #ffffff;
+                padding: 5px;
+                border: 1px solid #4d4d4d;
+                font-weight: bold;
+            }
+            QPushButton {
+                background-color: #2196F3;
+                color: white;
+                font-weight: bold;
+                padding: 8px 15px;
+                border: none;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #1976D2;
+            }
+        """)
+        
+        # Load initial data
+        self.load_data()
+    
+    def load_data(self):
+        """Load trade log data from CSV"""
+        try:
+            if not Path(self.csv_file_path).exists():
+                self.table.setRowCount(0)
+                self.table.setColumnCount(1)
+                self.table.setHorizontalHeaderLabels(["No Data"])
+                return
+            
+            # Read CSV
+            with open(self.csv_file_path, 'r', encoding='utf-8') as f:
+                reader = csv.reader(f)
+                rows = list(reader)
+            
+            if not rows:
+                return
+            
+            # Set headers
+            headers = rows[0]
+            self.table.setColumnCount(len(headers))
+            self.table.setHorizontalHeaderLabels(headers)
+            
+            # Populate data (reverse order so newest trades are at top)
+            data_rows = rows[1:]
+            data_rows.reverse()
+            self.table.setRowCount(len(data_rows))
+            
+            for row_idx, row_data in enumerate(data_rows):
+                for col_idx, cell_data in enumerate(row_data):
+                    item = QTableWidgetItem(cell_data)
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    
+                    # Color code Source column (if present and valid)
+                    if col_idx < len(headers) and headers[col_idx] == 'Source':
+                        if cell_data == 'Strategy':
+                            item.setForeground(QColor("#4CAF50"))  # Green
+                        elif cell_data == 'Manual':
+                            item.setForeground(QColor("#FF9800"))  # Orange
+                    
+                    self.table.setItem(row_idx, col_idx, item)
+            
+            # Auto-resize columns
+            self.table.resizeColumnsToContents()
+            
+        except Exception as e:
+            logger.error(f"Error loading trade log: {e}", exc_info=True)
+
+
+# ============================================================================
+# PNL VIEWER WINDOW
+# ============================================================================
+
+class PnLWindow(QMainWindow):
+    """Window for displaying P&L CSV data with statistics and chart"""
+    
+    def __init__(self, csv_file_path, parent=None):
+        super().__init__(parent)
+        self.csv_file_path = csv_file_path
+        self.setWindowTitle(f"P&L Analysis - {Path(csv_file_path).name}")
+        self.setGeometry(150, 150, 1200, 800)
+        
+        # Central widget
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+        
+        # Info label
+        info_label = QLabel(f"💰 P&L Analysis: {csv_file_path}")
+        info_label.setStyleSheet("font-weight: bold; font-size: 11pt; padding: 5px;")
+        main_layout.addWidget(info_label)
+        
+        # Create splitter for stats/table and chart
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        
+        # Top section: Stats and Table
+        top_widget = QWidget()
+        top_layout = QVBoxLayout(top_widget)
+        
+        # Statistics panel
+        stats_group = QGroupBox("Trade Performance Statistics")
+        stats_layout = QGridLayout(stats_group)
+        
+        self.total_trades_label = QLabel("Total Trades: 0")
+        self.winning_trades_label = QLabel("Winning: 0")
+        self.losing_trades_label = QLabel("Losing: 0")
+        self.win_rate_label = QLabel("Win Rate: 0%")
+        self.total_pnl_label = QLabel("Total P&L: $0.00")
+        self.avg_win_label = QLabel("Avg Win: $0.00")
+        self.avg_loss_label = QLabel("Avg Loss: $0.00")
+        self.largest_win_label = QLabel("Largest Win: $0.00")
+        self.largest_loss_label = QLabel("Largest Loss: $0.00")
+        self.profit_factor_label = QLabel("Profit Factor: 0.00")
+        
+        # Strategy vs Manual breakdown
+        self.strategy_trades_label = QLabel("Strategy Trades: 0")
+        self.manual_trades_label = QLabel("Manual Trades: 0")
+        self.strategy_pnl_label = QLabel("Strategy P&L: $0.00")
+        self.manual_pnl_label = QLabel("Manual P&L: $0.00")
+        
+        # Layout stats in grid
+        stats_layout.addWidget(self.total_trades_label, 0, 0)
+        stats_layout.addWidget(self.winning_trades_label, 0, 1)
+        stats_layout.addWidget(self.losing_trades_label, 0, 2)
+        stats_layout.addWidget(self.win_rate_label, 0, 3)
+        stats_layout.addWidget(self.total_pnl_label, 1, 0)
+        stats_layout.addWidget(self.avg_win_label, 1, 1)
+        stats_layout.addWidget(self.avg_loss_label, 1, 2)
+        stats_layout.addWidget(self.profit_factor_label, 1, 3)
+        stats_layout.addWidget(self.largest_win_label, 2, 0)
+        stats_layout.addWidget(self.largest_loss_label, 2, 1)
+        stats_layout.addWidget(self.strategy_trades_label, 3, 0)
+        stats_layout.addWidget(self.manual_trades_label, 3, 1)
+        stats_layout.addWidget(self.strategy_pnl_label, 3, 2)
+        stats_layout.addWidget(self.manual_pnl_label, 3, 3)
+        
+        top_layout.addWidget(stats_group)
+        
+        # Table widget
+        self.table = QTableWidget()
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        top_layout.addWidget(self.table)
+        
+        splitter.addWidget(top_widget)
+        
+        # Bottom section: Chart
+        chart_widget = QWidget()
+        chart_layout = QVBoxLayout(chart_widget)
+        
+        # Create matplotlib figure for equity curve
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+        from matplotlib.figure import Figure
+        
+        self.figure = Figure(figsize=(10, 4), facecolor='#1e1e1e')
+        self.canvas = FigureCanvas(self.figure)
+        self.ax = self.figure.add_subplot(111)
+        chart_layout.addWidget(self.canvas)
+        
+        splitter.addWidget(chart_widget)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 1)
+        
+        main_layout.addWidget(splitter)
+        
+        # Refresh button
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self.load_data)
+        refresh_btn.setMaximumWidth(100)
+        main_layout.addWidget(refresh_btn, alignment=Qt.AlignmentFlag.AlignRight)
+        
+        # Apply dark theme
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #1e1e1e;
+            }
+            QLabel {
+                color: #ffffff;
+                font-size: 10pt;
+                padding: 3px;
+            }
+            QGroupBox {
+                color: #ffffff;
+                border: 1px solid #3d3d3d;
+                border-radius: 5px;
+                margin-top: 10px;
+                padding-top: 10px;
+                font-weight: bold;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top center;
+                padding: 0 5px;
+            }
+            QTableWidget {
+                background-color: #2d2d2d;
+                color: #ffffff;
+                gridline-color: #3d3d3d;
+                border: 1px solid #3d3d3d;
+            }
+            QTableWidget::item {
+                padding: 5px;
+            }
+            QHeaderView::section {
+                background-color: #3d3d3d;
+                color: #ffffff;
+                padding: 5px;
+                border: 1px solid #4d4d4d;
+                font-weight: bold;
+            }
+            QPushButton {
+                background-color: #FF9800;
+                color: white;
+                font-weight: bold;
+                padding: 8px 15px;
+                border: none;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #F57C00;
+            }
+        """)
+        
+        # Load initial data
+        self.load_data()
+    
+    def load_data(self):
+        """Load P&L data from CSV and calculate statistics"""
+        try:
+            if not Path(self.csv_file_path).exists():
+                self.table.setRowCount(0)
+                self.table.setColumnCount(1)
+                self.table.setHorizontalHeaderLabels(["No Data"])
+                self.update_chart([])
+                return
+            
+            # Read CSV
+            with open(self.csv_file_path, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+            
+            if not rows:
+                return
+            
+            # Set table headers
+            headers = list(rows[0].keys())
+            self.table.setColumnCount(len(headers))
+            self.table.setHorizontalHeaderLabels(headers)
+            
+            # Populate table (reverse order so newest trades are at top)
+            rows.reverse()
+            self.table.setRowCount(len(rows))
+            
+            pnl_values = []
+            strategy_pnls = []
+            manual_pnls = []
+            
+            for row_idx, row_data in enumerate(rows):
+                for col_idx, header in enumerate(headers):
+                    cell_data = row_data.get(header, '')
+                    item = QTableWidgetItem(cell_data)
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    
+                    # Color code P&L columns
+                    if 'TradePnL$' in header:
+                        try:
+                            pnl = float(cell_data.replace('$', '').replace(',', ''))
+                            pnl_values.append(pnl)
+                            
+                            # Track strategy vs manual
+                            source = row_data.get('Source', 'Manual')
+                            if source == 'Strategy':
+                                strategy_pnls.append(pnl)
+                            else:
+                                manual_pnls.append(pnl)
+                            
+                            if pnl > 0:
+                                item.setForeground(QColor("#00ff00"))
+                            elif pnl < 0:
+                                item.setForeground(QColor("#ff0000"))
+                        except:
+                            pass
+                    
+                    # Color code Source column
+                    if header == 'Source':
+                        if cell_data == 'Strategy':
+                            item.setForeground(QColor("#4CAF50"))
+                        elif cell_data == 'Manual':
+                            item.setForeground(QColor("#FF9800"))
+                    
+                    self.table.setItem(row_idx, col_idx, item)
+            
+            # Auto-resize columns
+            self.table.resizeColumnsToContents()
+            
+            # Calculate and update statistics
+            self.calculate_statistics(pnl_values, strategy_pnls, manual_pnls)
+            
+            # Update equity curve chart
+            self.update_chart(pnl_values)
+            
+        except Exception as e:
+            logger.error(f"Error loading P&L data: {e}", exc_info=True)
+    
+    def calculate_statistics(self, pnl_values, strategy_pnls, manual_pnls):
+        """Calculate trade performance statistics"""
+        if not pnl_values:
+            return
+        
+        total_trades = len(pnl_values)
+        winning_trades = [p for p in pnl_values if p > 0]
+        losing_trades = [p for p in pnl_values if p < 0]
+        
+        num_wins = len(winning_trades)
+        num_losses = len(losing_trades)
+        win_rate = (num_wins / total_trades * 100) if total_trades > 0 else 0
+        
+        total_pnl = sum(pnl_values)
+        avg_win = sum(winning_trades) / num_wins if num_wins > 0 else 0
+        avg_loss = sum(losing_trades) / num_losses if num_losses > 0 else 0
+        
+        largest_win = max(winning_trades) if winning_trades else 0
+        largest_loss = min(losing_trades) if losing_trades else 0
+        
+        total_wins = sum(winning_trades)
+        total_losses = abs(sum(losing_trades))
+        profit_factor = total_wins / total_losses if total_losses > 0 else 0
+        
+        # Strategy vs Manual stats
+        num_strategy = len(strategy_pnls)
+        num_manual = len(manual_pnls)
+        strategy_total = sum(strategy_pnls) if strategy_pnls else 0
+        manual_total = sum(manual_pnls) if manual_pnls else 0
+        
+        # Update labels
+        self.total_trades_label.setText(f"Total Trades: {total_trades}")
+        self.winning_trades_label.setText(f"Winning: {num_wins}")
+        self.losing_trades_label.setText(f"Losing: {num_losses}")
+        self.win_rate_label.setText(f"Win Rate: {win_rate:.1f}%")
+        
+        pnl_color = "#00ff00" if total_pnl >= 0 else "#ff0000"
+        self.total_pnl_label.setText(f"Total P&L: ${total_pnl:.2f}")
+        self.total_pnl_label.setStyleSheet(f"color: {pnl_color}; font-weight: bold; font-size: 12pt;")
+        
+        self.avg_win_label.setText(f"Avg Win: ${avg_win:.2f}")
+        self.avg_loss_label.setText(f"Avg Loss: ${avg_loss:.2f}")
+        self.largest_win_label.setText(f"Largest Win: ${largest_win:.2f}")
+        self.largest_loss_label.setText(f"Largest Loss: ${largest_loss:.2f}")
+        self.profit_factor_label.setText(f"Profit Factor: {profit_factor:.2f}")
+        
+        self.strategy_trades_label.setText(f"Strategy Trades: {num_strategy}")
+        self.manual_trades_label.setText(f"Manual Trades: {num_manual}")
+        
+        strategy_color = "#00ff00" if strategy_total >= 0 else "#ff0000"
+        manual_color = "#00ff00" if manual_total >= 0 else "#ff0000"
+        self.strategy_pnl_label.setText(f"Strategy P&L: ${strategy_total:.2f}")
+        self.strategy_pnl_label.setStyleSheet(f"color: {strategy_color}; font-weight: bold;")
+        self.manual_pnl_label.setText(f"Manual P&L: ${manual_total:.2f}")
+        self.manual_pnl_label.setStyleSheet(f"color: {manual_color}; font-weight: bold;")
+    
+    def update_chart(self, pnl_values):
+        """Update equity curve chart"""
+        self.ax.clear()
+        
+        if not pnl_values:
+            self.ax.text(0.5, 0.5, 'No Data', ha='center', va='center', 
+                        transform=self.ax.transAxes, color='white', fontsize=14)
+            self.canvas.draw()
+            return
+        
+        # Calculate cumulative P&L (reverse back to chronological order)
+        pnl_values.reverse()
+        cumulative_pnl = [sum(pnl_values[:i+1]) for i in range(len(pnl_values))]
+        trade_numbers = list(range(1, len(cumulative_pnl) + 1))
+        
+        # Plot equity curve
+        self.ax.plot(trade_numbers, cumulative_pnl, color='#4CAF50', linewidth=2, marker='o', markersize=4)
+        self.ax.axhline(y=0, color='white', linestyle='--', linewidth=1, alpha=0.5)
+        self.ax.fill_between(trade_numbers, cumulative_pnl, 0, 
+                            where=[p >= 0 for p in cumulative_pnl], 
+                            alpha=0.3, color='#4CAF50', interpolate=True)
+        self.ax.fill_between(trade_numbers, cumulative_pnl, 0, 
+                            where=[p < 0 for p in cumulative_pnl], 
+                            alpha=0.3, color='#ff4444', interpolate=True)
+        
+        # Styling
+        self.ax.set_facecolor('#2d2d2d')
+        self.ax.set_xlabel('Trade Number', color='white', fontsize=10)
+        self.ax.set_ylabel('Cumulative P&L ($)', color='white', fontsize=10)
+        self.ax.set_title('Equity Curve', color='white', fontsize=12, fontweight='bold')
+        self.ax.tick_params(colors='white')
+        self.ax.spines['bottom'].set_color('#3d3d3d')
+        self.ax.spines['top'].set_color('#3d3d3d')
+        self.ax.spines['left'].set_color('#3d3d3d')
+        self.ax.spines['right'].set_color('#3d3d3d')
+        self.ax.grid(True, alpha=0.2, color='#4d4d4d')
+        
+        self.figure.tight_layout()
+        self.canvas.draw()
+
+
+# ============================================================================
 # MAIN WINDOW
 # ============================================================================
 
@@ -2780,10 +3238,14 @@ class MainWindow(QMainWindow):
         self.ts_last_strategy_state = "FLAT"  # Track last known TS strategy state for change detection
         self.ts_current_auto_position_contract = None  # Track current automated position contract
         self.ts_automation_initialized = False  # Track if automation has been initialized
+        self.ts_use_pure_0dte = False  # Default: Hybrid strategy (0DTE→1DTE at 11am)
         self.vega_positions = {}  # Track vega strategy positions: {trade_id: position_data}
         self.vega_scan_results = []  # Store scanner results
         self.last_vega_scan_time = None  # Last scan timestamp
         self.portfolio_greeks = {'delta': 0, 'gamma': 0, 'vega': 0, 'theta': 0}  # Portfolio Greeks
+        
+        # CSV Trade Tracking
+        self.trade_entries = {}  # Track entry orders for P&L calculation: {contract_key: [entry_data, ...]}
         
         # MES Futures Hedging
         self.mes_contract = None  # MES futures contract (will be initialized when needed)
@@ -2853,7 +3315,7 @@ class MainWindow(QMainWindow):
         
         # Log ES offset tracking status at startup
         if self.is_market_hours():
-            logger.info("ES offset tracking: ACTIVE (market hours 8:30 AM - 3:00 PM CT)")
+            logger.info("ES offset tracking: ACTIVE (futures market hours 8:30 AM - 4:00 PM CT)")
         else:
             logger.info("ES offset tracking: INACTIVE (outside market hours) - using saved offset from day session")
         
@@ -2987,10 +3449,123 @@ class MainWindow(QMainWindow):
                 return self.env_config.get('settings_file', 'settings.json')
             elif filename == 'positions.json':
                 return self.env_config.get('positions_file', 'positions.json')
+            elif filename == 'trade_log.csv':
+                # Environment-specific trade log
+                env_prefix = 'prod' if self.environment_name == 'production' else 'dev'
+                return f"{env_prefix}_trade_log.csv"
+            elif filename == 'PnL.csv':
+                # Environment-specific P&L log
+                env_prefix = 'prod' if self.environment_name == 'production' else 'dev'
+                return f"{env_prefix}_PnL.csv"
             else:
                 return filename
         except:
             return filename
+    
+    def log_trade_to_csv(self, order_id: int, contract_key: str, action: str, quantity: int, avg_fill_price: float, is_automated: bool = False):
+        """Log trade to environment-specific trade_log CSV file"""
+        try:
+            csv_file = self.get_environment_file_path('trade_log.csv')
+            file_exists = Path(csv_file).exists()
+            
+            # Get Central Time
+            ct_tz = pytz.timezone('America/Chicago')
+            now_ct = datetime.now(ct_tz)
+            datetime_str = now_ct.strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Parse contract key for side info
+            parts = contract_key.split('_')
+            if len(parts) >= 4:
+                symbol, strike, right, expiry = parts[0], parts[1], parts[2], parts[3]
+                side = f"{symbol} {strike}{right} {expiry}"
+            else:
+                side = contract_key
+            
+            # Determine source
+            source = 'Strategy' if is_automated else 'Manual'
+            
+            with open(csv_file, 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                
+                # Write header if file is new
+                if not file_exists:
+                    writer.writerow(['DateTime', 'OrderID', 'Action', 'Side', 'Qty', 'AvgFillPrc', 'Source'])
+                
+                # Write trade data
+                writer.writerow([datetime_str, order_id, action, side, quantity, f"{avg_fill_price:.2f}", source])
+            
+            logger.info(f"📊 Trade logged to {csv_file}: {action} {quantity} {side} @ ${avg_fill_price:.2f}")
+            
+        except Exception as e:
+            logger.error(f"Error logging trade to CSV: {e}", exc_info=True)
+    
+    def log_pnl_to_csv(self, contract_key: str, entry_data: dict, exit_data: dict):
+        """Log completed trade P&L to environment-specific PnL CSV file"""
+        try:
+            csv_file = self.get_environment_file_path('PnL.csv')
+            file_exists = Path(csv_file).exists()
+            
+            # Parse contract key
+            parts = contract_key.split('_')
+            if len(parts) >= 4:
+                symbol, strike, right, expiry = parts[0], parts[1], parts[2], parts[3]
+                side = f"{symbol} {strike}{right} {expiry}"
+            else:
+                side = contract_key
+            
+            # Calculate P&L
+            entry_qty = entry_data.get('quantity', 0)
+            entry_price = entry_data.get('avg_price', 0)
+            exit_qty = exit_data.get('quantity', 0)
+            exit_price = exit_data.get('avg_price', 0)
+            
+            # P&L calculation (for options, multiplier is typically 100)
+            multiplier = self.instrument.get('multiplier', 100)
+            
+            if entry_data.get('action') == 'BUY':
+                # Bought then sold
+                pnl_dollars = (exit_price - entry_price) * entry_qty * multiplier
+                pnl_percent = ((exit_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
+            else:
+                # Sold then bought back (short)
+                pnl_dollars = (entry_price - exit_price) * entry_qty * multiplier
+                pnl_percent = ((entry_price - exit_price) / entry_price * 100) if entry_price > 0 else 0
+            
+            # Determine source
+            source = 'Strategy' if entry_data.get('is_automated', False) else 'Manual'
+            
+            with open(csv_file, 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                
+                # Write header if file is new
+                if not file_exists:
+                    writer.writerow([
+                        'EntryDateTime', 'EntryAction', 'EntrySide', 'EntryQty', 'EntryAvgFillPrc',
+                        'ExitDateTime', 'ExitAction', 'ExitSide', 'ExitQty', 'ExitAvgFillPrc',
+                        'TradePnL$', 'TradePnL%', 'Source'
+                    ])
+                
+                # Write P&L data
+                writer.writerow([
+                    entry_data.get('datetime', ''),
+                    entry_data.get('action', ''),
+                    side,
+                    entry_qty,
+                    f"{entry_price:.2f}",
+                    exit_data.get('datetime', ''),
+                    exit_data.get('action', ''),
+                    side,
+                    exit_qty,
+                    f"{exit_price:.2f}",
+                    f"{pnl_dollars:.2f}",
+                    f"{pnl_percent:.2f}",
+                    source
+                ])
+            
+            logger.info(f"💰 P&L logged to {csv_file}: {side} - ${pnl_dollars:.2f} ({pnl_percent:.2f}%)")
+            
+        except Exception as e:
+            logger.error(f"Error logging P&L to CSV: {e}", exc_info=True)
     
     # ========================================================================
     # SIGNAL CONNECTIONS
@@ -3558,6 +4133,28 @@ class MainWindow(QMainWindow):
             self.show_charts_btn.setText("Show Charts")
             logger.info("Chart window hidden")
     
+    def show_tradelog_window(self):
+        """Show the trade log viewer window"""
+        try:
+            csv_file = self.get_environment_file_path('trade_log.csv')
+            tradelog_window = TradeLogWindow(csv_file, self)
+            tradelog_window.show()
+            logger.info(f"Trade log window opened: {csv_file}")
+        except Exception as e:
+            logger.error(f"Error opening trade log window: {e}", exc_info=True)
+            self.log_message(f"Error opening trade log: {e}", "ERROR")
+    
+    def show_pnl_window(self):
+        """Show the P&L analysis window"""
+        try:
+            csv_file = self.get_environment_file_path('PnL.csv')
+            pnl_window = PnLWindow(csv_file, self)
+            pnl_window.show()
+            logger.info(f"P&L window opened: {csv_file}")
+        except Exception as e:
+            logger.error(f"Error opening P&L window: {e}", exc_info=True)
+            self.log_message(f"Error opening P&L: {e}", "ERROR")
+    
     def on_underlying_settings_changed(self, chart_widget, is_trade_chart: bool):
         """Handle interval or days combo box changes for underlying charts"""
         if self.connection_state != ConnectionState.CONNECTED or not self.ibkr_client:
@@ -4063,6 +4660,50 @@ class MainWindow(QMainWindow):
         """)
         header_layout.addWidget(self.show_charts_btn)
         
+        # Show TradeLog button
+        self.show_tradelog_btn = QPushButton("Show TradeLog")
+        self.show_tradelog_btn.clicked.connect(self.show_tradelog_window)
+        self.show_tradelog_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2196F3;
+                color: white;
+                font-weight: bold;
+                font-size: 10pt;
+                padding: 5px 15px;
+                border: none;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #1976D2;
+            }
+            QPushButton:pressed {
+                background-color: #0D47A1;
+            }
+        """)
+        header_layout.addWidget(self.show_tradelog_btn)
+        
+        # Show PnL button
+        self.show_pnl_btn = QPushButton("Show PnL")
+        self.show_pnl_btn.clicked.connect(self.show_pnl_window)
+        self.show_pnl_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #FF9800;
+                color: white;
+                font-weight: bold;
+                font-size: 10pt;
+                padding: 5px 15px;
+                border: none;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #F57C00;
+            }
+            QPushButton:pressed {
+                background-color: #E65100;
+            }
+        """)
+        header_layout.addWidget(self.show_pnl_btn)
+        
         # Add spacing before Expiration label
         header_layout.addSpacing(20)
         
@@ -4164,9 +4805,9 @@ class MainWindow(QMainWindow):
         pos_layout = QVBoxLayout(positions_group)
         
         self.positions_table = QTableWidget()
-        self.positions_table.setColumnCount(11)
+        self.positions_table.setColumnCount(12)
         self.positions_table.setHorizontalHeaderLabels([
-            "Contract", "Qty", "Entry", "Current", "P&L", "P&L %", "$ Cost Basis", "$ Mkt Value", "EntryTime", "TimeSpan", "Action"
+            "Contract", "Qty", "Entry", "Current", "P&L", "P&L %", "$ Cost Basis", "$ Mkt Value", "EntryTime", "TimeSpan", "Source", "Action"
         ])
         self.positions_table.verticalHeader().setVisible(False)  # type: ignore[union-attr]
         self.positions_table.setMaximumHeight(339)  # Increased by 3x (was 113)
@@ -4189,9 +4830,9 @@ class MainWindow(QMainWindow):
         orders_layout = QVBoxLayout(orders_group)
         
         self.orders_table = QTableWidget()
-        self.orders_table.setColumnCount(7)
+        self.orders_table.setColumnCount(8)
         self.orders_table.setHorizontalHeaderLabels([
-            "Order ID", "Contract", "Action", "Qty", "Price", "Status", "Action"
+            "Order ID", "Contract", "Action", "Qty", "Price", "Status", "Source", "Action"
         ])
         self.orders_table.verticalHeader().setVisible(False)  # type: ignore[union-attr]
         self.orders_table.setMaximumHeight(339)  # Increased by 3x (was 113)
@@ -5227,17 +5868,18 @@ class MainWindow(QMainWindow):
         self.update_charts_with_live_data()
     
     def is_market_hours(self):
-        """Check if it's during regular market hours (8:30 AM - 3:00 PM Central Time)"""
+        """Check if it's during market hours - For ES/MES futures: 8:30 AM - 4:00 PM Central Time"""
         import pytz
         ct_tz = pytz.timezone('US/Central')
         now_ct = datetime.now(ct_tz)
         
-        # Market is open Monday-Friday, 8:30 AM - 3:00 PM CT (9:30 AM - 4:00 PM ET)
+        # ES/MES Futures market: Monday-Friday, 8:30 AM - 4:00 PM CT
+        # Note: SPX/XSP close at 3:00 PM, but ES/MES continue to 4:00 PM
         if now_ct.weekday() >= 5:  # Weekend
             return False
         
         market_open = now_ct.replace(hour=8, minute=30, second=0, microsecond=0)
-        market_close = now_ct.replace(hour=15, minute=0, second=0, microsecond=0)
+        market_close = now_ct.replace(hour=16, minute=0, second=0, microsecond=0)  # 4:00 PM for futures
         
         return market_open <= now_ct <= market_close
     
@@ -5246,7 +5888,7 @@ class MainWindow(QMainWindow):
         Check if the ES-to-cash offset is stale and needs to be recalculated.
         Offset is considered stale if:
         - It's zero (never set)
-        - It's older than the most recent 3pm market close
+        - It's older than the most recent 4pm futures market close
         """
         if self.es_to_cash_offset == 0:
             return True
@@ -5259,24 +5901,24 @@ class MainWindow(QMainWindow):
         now_ct = datetime.now(ct_tz)
         last_update = datetime.fromtimestamp(self.last_offset_update_time, tz=ct_tz)
         
-        # Find the most recent 3pm market close
-        if now_ct.hour >= 15:  # After 3pm today
-            latest_close = now_ct.replace(hour=15, minute=0, second=0, microsecond=0)
-        else:  # Before 3pm today, use yesterday's close
-            latest_close = now_ct.replace(hour=15, minute=0, second=0, microsecond=0) - timedelta(days=1)
+        # Find the most recent 4pm futures market close (ES/MES close at 4:00 PM CT)
+        if now_ct.hour >= 16:  # After 4pm today
+            latest_close = now_ct.replace(hour=16, minute=0, second=0, microsecond=0)
+        else:  # Before 4pm today, use yesterday's close
+            latest_close = now_ct.replace(hour=16, minute=0, second=0, microsecond=0) - timedelta(days=1)
         
         # Move back to Friday if latest_close is on weekend
         while latest_close.weekday() >= 5:  # Saturday or Sunday
             latest_close -= timedelta(days=1)
         
-        # Offset is stale if it was updated before the most recent 3pm close
+        # Offset is stale if it was updated before the most recent 4pm close
         return last_update < latest_close
     
     def is_futures_market_closed(self):
         """
         Check if ES futures market is closed (needs snapshot instead of streaming).
-        ES futures are closed during: 4:00-5:00 PM CT (5:00-6:00 PM ET) weekdays and all weekend.
-        Weekend starts Friday at 4:00 PM CT (5:00 PM ET) and ends Sunday at 5:00 PM CT (6:00 PM ET).
+        ES/MES futures are closed during: 4:00-5:00 PM CT weekdays and all weekend.
+        Weekend: Friday 4:00 PM CT to Sunday 5:00 PM CT.
         """
         import pytz
         ct_tz = pytz.timezone('US/Central')
@@ -5300,7 +5942,7 @@ class MainWindow(QMainWindow):
     
     def update_es_to_cash_offset(self, underlying_price=None, es_price=None):
         """
-        Calculate and update ES-to-cash offset during market hours (8:30 AM - 3:00 PM CT).
+        Calculate and update ES-to-cash offset during futures market hours (8:30 AM - 4:00 PM CT).
         Offset is saved to settings every minute for use during after-hours trading.
         """
         # Use current prices if not provided
@@ -5313,7 +5955,7 @@ class MainWindow(QMainWindow):
         if underlying_price <= 0 or es_price <= 0:
             return
         
-        # Only update offset during market hours (8:30 AM - 3:00 PM Central Time)
+        # Only update offset during futures market hours (8:30 AM - 4:00 PM Central Time)
         if not self.is_market_hours():
             self.offset_update_enabled = False
             return
@@ -6187,6 +6829,86 @@ class MainWindow(QMainWindow):
                     self.ts_signals.ts_activity.emit(
                         f"✅ ORDER FILLED: #{order_id} | {action} {qty}x {contract_key} @ ${avg_fill_price:.2f}"
                     )
+                    
+                    # Get is_automated flag
+                    is_automated = self.pending_orders[order_id].get('is_automated', False)
+                    
+                    # Log trade to CSV
+                    self.log_trade_to_csv(order_id, contract_key, action, qty, avg_fill_price, is_automated)
+                    
+                    # Track entry orders for P&L calculation
+                    if action == 'BUY':
+                        # This is an entry order - add to list of entries for this contract
+                        ct_tz = pytz.timezone('America/Chicago')
+                        now_ct = datetime.now(ct_tz)
+                        entry_data = {
+                            'datetime': now_ct.strftime('%Y-%m-%d %H:%M:%S'),
+                            'order_id': order_id,
+                            'action': action,
+                            'quantity': qty,
+                            'avg_price': avg_fill_price,
+                            'is_automated': is_automated
+                        }
+                        if contract_key not in self.trade_entries:
+                            self.trade_entries[contract_key] = []
+                        self.trade_entries[contract_key].append(entry_data)
+                        logger.info(f"🟢 P&L TRACKING - BUY: Added entry for {contract_key}, Order #{order_id}, Qty={qty}, Price={avg_fill_price}, Source={'Strategy' if is_automated else 'Manual'}")
+                        logger.info(f"   Total entries for {contract_key}: {len(self.trade_entries[contract_key])}")
+                    elif action == 'SELL':
+                        # Debug logging for SELL
+                        logger.info(f"🔴 P&L TRACKING - SELL: Order #{order_id}, {contract_key}, Qty={qty}, Price={avg_fill_price}")
+                        logger.info(f"   contract_key in trade_entries? {contract_key in self.trade_entries}")
+                        if contract_key in self.trade_entries:
+                            logger.info(f"   Number of BUY entries: {len(self.trade_entries[contract_key])}")
+                            logger.info(f"   Entries: {self.trade_entries[contract_key]}")
+                        else:
+                            logger.warning(f"   ⚠️ No BUY entries found for {contract_key}! Cannot log P&L.")
+                        
+                        if contract_key in self.trade_entries and len(self.trade_entries[contract_key]) > 0:
+                            # This is an exit order - match with entries and log P&L
+                            logger.info(f"   ✅ Proceeding with FIFO matching for {contract_key}")
+                            ct_tz = pytz.timezone('America/Chicago')
+                            now_ct = datetime.now(ct_tz)                        # Process SELL quantity - may need to match multiple BUY entries
+                        remaining_qty = qty
+                        entries_to_remove = []
+                        
+                        for idx, entry_data in enumerate(self.trade_entries[contract_key]):
+                            if remaining_qty <= 0:
+                                break
+                            
+                            entry_qty = entry_data['quantity']
+                            exit_qty = min(remaining_qty, entry_qty)
+                            
+                            # Create exit data for this portion
+                            exit_data = {
+                                'datetime': now_ct.strftime('%Y-%m-%d %H:%M:%S'),
+                                'order_id': order_id,
+                                'action': action,
+                                'quantity': exit_qty,
+                                'avg_price': avg_fill_price
+                            }
+                            
+                            # Log P&L for this matched pair
+                            self.log_pnl_to_csv(contract_key, entry_data, exit_data)
+                            logger.info(f"   📊 Logged P&L: Entry Order #{entry_data['order_id']} → Exit Order #{order_id}, Qty={exit_qty}")
+                            
+                            # Track which entries to remove or update
+                            if exit_qty >= entry_qty:
+                                # Fully closed this entry
+                                entries_to_remove.append(idx)
+                                remaining_qty -= entry_qty
+                            else:
+                                # Partially closed - update the entry quantity
+                                self.trade_entries[contract_key][idx]['quantity'] -= exit_qty
+                                remaining_qty = 0
+                        
+                        # Remove fully closed entries (in reverse order to maintain indices)
+                        for idx in reversed(entries_to_remove):
+                            del self.trade_entries[contract_key][idx]
+                        
+                        # Clean up if no entries left
+                        if len(self.trade_entries[contract_key]) == 0:
+                            del self.trade_entries[contract_key]
                 elif status == 'Cancelled':
                     self.ts_signals.ts_activity.emit(f"🚫 ORDER CANCELLED: #{order_id} | {contract_key}")
                 elif status == 'PartiallyFilled':
@@ -6204,7 +6926,10 @@ class MainWindow(QMainWindow):
                     logger.info(f"Removing order #{order_id} from chasing_orders (status: {status})")
                     del self.chasing_orders[order_id]
                 
-                # Keep in pending_orders for display but mark as complete
+                # CRITICAL: Remove from pending_orders to prevent blocking new automated entries
+                if order_id in self.pending_orders:
+                    logger.info(f"Removing order #{order_id} from pending_orders (status: {status})")
+                    del self.pending_orders[order_id]
             
             # Update orders table
             self.update_orders_display()
@@ -6229,6 +6954,13 @@ class MainWindow(QMainWindow):
         """
         logger.info(f"Handling position close for {contract_key}")
         
+        # CRITICAL: If closing an automated position, clear the entry tracking flag
+        # This allows new automated entries after any position is closed (manual or automated)
+        if contract_key in self.positions and self.positions[contract_key].get('is_automated', False):
+            if hasattr(self, '_last_automated_entry_direction'):
+                logger.info(f"🔓 Clearing entry tracking for closed automated position: was {self._last_automated_entry_direction}")
+                delattr(self, '_last_automated_entry_direction')
+        
         # Unsubscribe from market data for this position
         self.unsubscribe_position_market_data(contract_key)
         
@@ -6237,10 +6969,12 @@ class MainWindow(QMainWindow):
             del self.positions[contract_key]
             logger.info(f"Removed {contract_key} from positions tracking")
         
-        # Remove from market_data dict ONLY if not in the option chain
+        # Remove from market_data dict ONLY if not actively subscribed in a chain
         if contract_key in self.market_data:
-            if hasattr(self, 'option_chain') and contract_key in self.option_chain:
-                logger.debug(f"NOT removing market_data for {contract_key} - still in option chain")
+            # Check if this contract has an active market data subscription
+            still_subscribed = contract_key in self.app_state.get('market_data_map', {}).values()
+            if still_subscribed:
+                logger.debug(f"NOT removing market_data for {contract_key} - still has active subscription")
             else:
                 del self.market_data[contract_key]
                 logger.debug(f"Removed {contract_key} from market_data")
@@ -6254,9 +6988,10 @@ class MainWindow(QMainWindow):
         Cleans up resources by canceling the market data subscription.
         IMPORTANT: Don't unsubscribe if contract is still in the displayed option chain!
         """
-        # Check if this contract is in the current option chain (if chain exists)
-        if hasattr(self, 'option_chain') and contract_key in self.option_chain:
-            logger.debug(f"NOT unsubscribing from market data for {contract_key} - still in option chain")
+        # Check if this contract still has an active market data subscription (in any chain)
+        still_subscribed = contract_key in self.app_state.get('market_data_map', {}).values()
+        if still_subscribed:
+            logger.debug(f"NOT unsubscribing from market data for {contract_key} - still has active subscription")
             return
         
         # Find the req_id for this contract_key
@@ -6908,7 +7643,34 @@ class MainWindow(QMainWindow):
         timing_row.addStretch()
         auto_layout.addLayout(timing_row)
         
-        # Row 3: Master Enable/Status
+        # Row 3: Contract Type Strategy Selection
+        contract_strategy_row = QHBoxLayout()
+        contract_strategy_row.addWidget(QLabel("Contract Strategy:"))
+        
+        self.ts_pure_0dte_radio = QRadioButton("Pure 0DTE (Always use 0DTE)")
+        self.ts_pure_0dte_radio.setToolTip(
+            "Pure 0DTE Strategy:\n"
+            "• ALWAYS trade 0DTE contracts regardless of time\n"
+            "• Best for aggressive intraday strategies\n"
+            "• Maximum theta decay focus"
+        )
+        contract_strategy_row.addWidget(self.ts_pure_0dte_radio)
+        
+        self.ts_hybrid_radio = QRadioButton("Hybrid (0DTE→1DTE at 11am)")
+        self.ts_hybrid_radio.setToolTip(
+            "Hybrid Strategy (Default):\n"
+            "• 0DTE: 7:15 PM - 11:00 AM CT\n"
+            "• 1DTE: 11:00 AM - 4:00 PM CT\n"
+            "• Reduces gamma risk in afternoon\n"
+            "• Better liquidity in final hours"
+        )
+        self.ts_hybrid_radio.setChecked(True)  # Default to hybrid
+        contract_strategy_row.addWidget(self.ts_hybrid_radio)
+        
+        contract_strategy_row.addStretch()
+        auto_layout.addLayout(contract_strategy_row)
+        
+        # Row 4: Master Enable/Status
         master_row = QHBoxLayout()
         self.ts_auto_trading_checkbox = QCheckBox("🚀 MASTER: Enable Automated Trading")
         self.ts_auto_trading_checkbox.setToolTip(
@@ -6929,7 +7691,7 @@ class MainWindow(QMainWindow):
         
         auto_layout.addLayout(master_row)
         
-        # Row 4: Current Position Info
+        # Row 5: Current Position Info
         position_info_row = QHBoxLayout()
         position_info_row.addWidget(QLabel("Current Auto Position:"))
         
@@ -6957,6 +7719,8 @@ class MainWindow(QMainWindow):
         self.ts_immediate_join_checkbox.toggled.connect(self.on_immediate_join_toggled)
         self.ts_wait_for_next_entry_checkbox.toggled.connect(self.on_wait_for_entry_toggled)
         self.ts_auto_trading_checkbox.toggled.connect(self.on_auto_trading_toggled)
+        self.ts_pure_0dte_radio.toggled.connect(self.on_contract_strategy_changed)
+        self.ts_hybrid_radio.toggled.connect(self.on_contract_strategy_changed)
         
         # Load saved settings into UI controls after creating widgets
         self.sync_ts_automation_ui_from_settings()
@@ -7047,9 +7811,9 @@ class MainWindow(QMainWindow):
         ts_pos_layout = QVBoxLayout(ts_positions_group)
         
         self.ts_positions_table = QTableWidget()
-        self.ts_positions_table.setColumnCount(11)
+        self.ts_positions_table.setColumnCount(12)
         self.ts_positions_table.setHorizontalHeaderLabels([
-            "Contract", "Qty", "Entry", "Current", "P&L", "P&L %", "$ Cost Basis", "$ Mkt Value", "EntryTime", "TimeSpan", "Action"
+            "Contract", "Qty", "Entry", "Current", "P&L", "P&L %", "$ Cost Basis", "$ Mkt Value", "EntryTime", "TimeSpan", "Source", "Action"
         ])
         self.ts_positions_table.verticalHeader().setVisible(False)  # type: ignore[union-attr]
         self.ts_positions_table.setMaximumHeight(339)
@@ -7070,9 +7834,9 @@ class MainWindow(QMainWindow):
         ts_orders_layout = QVBoxLayout(ts_orders_group)
         
         self.ts_orders_table = QTableWidget()
-        self.ts_orders_table.setColumnCount(7)
+        self.ts_orders_table.setColumnCount(8)
         self.ts_orders_table.setHorizontalHeaderLabels([
-            "Order ID", "Contract", "Action", "Qty", "Price", "Status", "Action"
+            "Order ID", "Contract", "Action", "Qty", "Price", "Status", "Source", "Action"
         ])
         self.ts_orders_table.verticalHeader().setVisible(False)  # type: ignore[union-attr]
         self.ts_orders_table.setMaximumHeight(339)
@@ -8096,7 +8860,7 @@ class MainWindow(QMainWindow):
     # ========================================================================
     
     def place_order(self, contract_key: str, action: str, quantity: int, 
-                   limit_price: float = 0, enable_chasing: bool = False) -> Optional[int]:
+                   limit_price: float = 0, enable_chasing: bool = False, is_automated: bool = False) -> Optional[int]:
         """
         Universal order placement function with comprehensive validation and debugging
         
@@ -8106,6 +8870,7 @@ class MainWindow(QMainWindow):
             quantity: Number of contracts
             limit_price: Limit price (0 = market order)
             enable_chasing: Enable mid-price chasing for manual orders
+            is_automated: Whether this order is from automated trading (vs manual)
         
         Returns:
             order_id or None if failed
@@ -8268,7 +9033,8 @@ class MainWindow(QMainWindow):
                 'quantity': quantity,
                 'price': limit_price,
                 'status': 'Submitted',
-                'filled': 0
+                'filled': 0,
+                'is_automated': is_automated  # Track if order is from automation
             }
             
             # Track for chasing if enabled
@@ -8506,6 +9272,7 @@ class MainWindow(QMainWindow):
                 self._chasing_timer_running = False
             return
         
+        logger.debug(f"update_orders: Monitoring {len(self.chasing_orders)} chasing orders")
         orders_to_remove = []
         
         for order_id, order_info in list(self.chasing_orders.items()):
@@ -8520,6 +9287,7 @@ class MainWindow(QMainWindow):
             current_mid = self.calculate_mid_price(contract_key)
             
             if current_mid == 0:
+                logger.warning(f"Order #{order_id}: No valid mid-price for {contract_key} - skipping update")
                 continue  # No valid market data
             
             last_price = order_info.get('last_price', order_info['last_mid'])
@@ -8606,16 +9374,20 @@ class MainWindow(QMainWindow):
                     contract = order_info['contract']
                     order = order_info['order']
                     
-                    # Modify the order's limit price
+                    # CRITICAL: Modify the order's limit price IN THE ORDER OBJECT
+                    old_price = order.lmtPrice
                     order.lmtPrice = new_price
+                    logger.info(f"Order #{order_id}: Updating order object lmtPrice: ${old_price:.2f} → ${new_price:.2f}")
                     
                     # Modify order (use same order_id with original order object)
                     self.ibkr_client.placeOrder(order_id, contract, order)
+                    logger.info(f"Order #{order_id}: placeOrder() called successfully with new price ${new_price:.2f}")
                     
-                    # Update tracking
+                    # Update tracking (CRITICAL: Store updated order object back)
+                    order_info['order'] = order  # Store the modified order object
                     order_info['last_mid'] = current_mid  # Track current mid
                     order_info['last_price'] = new_price  # Track actual order price
-                    order_info['timestamp'] = datetime.now()  # Reset timer
+                    order_info['timestamp'] = datetime.now()  # Reset timer for IB rate limit compliance
                     order_info['attempts'] += 1
                     
                     # Update orders display
@@ -8630,6 +9402,7 @@ class MainWindow(QMainWindow):
                     
                 except Exception as e:
                     logger.error(f"Error updating order #{order_id}: {e}", exc_info=True)
+                    self.log_message(f"⚠️ Order #{order_id} update failed: {e}", "WARNING")
         
         # Remove filled/cancelled orders from monitoring
         for order_id in orders_to_remove:
@@ -8742,6 +9515,9 @@ class MainWindow(QMainWindow):
             else:
                 status_str = order_info.get('status', 'Working')
             
+            # Determine source
+            source_text = "Strategy" if order_info.get('is_automated', False) else "Manual"
+            
             # Populate row
             items = [
                 QTableWidgetItem(str(order_id)),
@@ -8750,6 +9526,7 @@ class MainWindow(QMainWindow):
                 QTableWidgetItem(str(order_info['quantity'])),
                 QTableWidgetItem(price_str),
                 QTableWidgetItem(status_str),
+                QTableWidgetItem(source_text),
                 QTableWidgetItem("Cancel")
             ]
             
@@ -8765,8 +9542,15 @@ class MainWindow(QMainWindow):
                         else:
                             item.setForeground(QColor("#FFA500"))  # Orange for giving in
                 
-                # Cancel button styling
+                # Source column - color code
                 if col == 6:
+                    if source_text == "Strategy":
+                        item.setForeground(QColor("#4CAF50"))  # Green
+                    else:
+                        item.setForeground(QColor("#FF9800"))  # Orange
+                
+                # Cancel button styling (now column 7)
+                if col == 7:
                     item.setBackground(QColor("#cc0000"))
                     item.setForeground(QColor("#ffffff"))
                 
@@ -9142,7 +9926,9 @@ class MainWindow(QMainWindow):
             total_cost_basis += cost_basis
             total_mkt_value += market_value
             
-            # Populate row (11 columns now: Contract, Qty, Entry, Current, P&L, P&L %, $ Cost Basis, $ Mkt Value, EntryTime, TimeSpan, Action)
+            # Populate row (12 columns now: Contract, Qty, Entry, Current, P&L, P&L %, $ Cost Basis, $ Mkt Value, EntryTime, TimeSpan, Source, Action)
+            source_text = "Strategy" if pos.get('is_automated', False) else "Manual"
+            
             items = [
                 QTableWidgetItem(contract_key),
                 QTableWidgetItem(f"{pos['position']:.0f}"),
@@ -9154,6 +9940,7 @@ class MainWindow(QMainWindow):
                 QTableWidgetItem(f"${market_value:.2f}"),
                 QTableWidgetItem(entry_time_str),
                 QTableWidgetItem(time_span_str),
+                QTableWidgetItem(source_text),
                 QTableWidgetItem("Close")
             ]
             
@@ -9167,8 +9954,15 @@ class MainWindow(QMainWindow):
                     elif pnl < 0:
                         item.setForeground(QColor("#ff0000"))
                 
-                # Close button styling (now column 10)
+                # Color Source column (column 10)
                 if col == 10:
+                    if source_text == "Strategy":
+                        item.setForeground(QColor("#4CAF50"))
+                    else:
+                        item.setForeground(QColor("#FF9800"))
+                
+                # Close button styling (now column 11)
+                if col == 11:
                     item.setBackground(QColor("#cc0000"))
                     item.setForeground(QColor("#ffffff"))
                 
@@ -9192,8 +9986,8 @@ class MainWindow(QMainWindow):
         logger.info(f"Position cell clicked: row={row}, col={col}")
         self.log_message(f"Position table click: row={row}, col={col}", "INFO")
         
-        if col != 10:  # Only handle Close button column (column 10)
-            logger.info(f"Click on column {col} - not Close button (column 10), ignoring")
+        if col != 11:  # Only handle Close button column (column 11 now with Source column added)
+            logger.info(f"Click on column {col} - not Close button (column 11), ignoring")
             return
         
         logger.info("Close button clicked - starting close position flow")
@@ -9276,7 +10070,7 @@ class MainWindow(QMainWindow):
     
     def on_order_cell_clicked(self, row: int, col: int):
         """Handle order table cell click"""
-        if col == 6:  # Cancel button
+        if col == 7:  # Cancel button (column 7 now with Source column added)
             # Get order ID from first column
             order_id_item = self.orders_table.item(row, 0)
             if not order_id_item:
@@ -9614,9 +10408,9 @@ class MainWindow(QMainWindow):
     
     def calculate_offset_from_historical_close(self):
         """
-        Calculate ES-to-cash offset from historical 3:00 PM CT close prices.
+        Calculate ES-to-cash offset from historical 4:00 PM CT futures close prices.
         Used when app starts after market hours and no offset was saved from today's session.
-        Fetches 5-minute historical data for both SPX and ES, compares their 3pm closes.
+        Fetches 5-minute historical data for both SPX and ES, compares their 4pm closes.
         """
         if self.connection_state != ConnectionState.CONNECTED:
             logger.warning("Cannot calculate historical offset - not connected")
@@ -9629,12 +10423,12 @@ class MainWindow(QMainWindow):
         # Determine today's date in CT
         today_ct = now_ct.date()
         
-        # Define 3:00 PM CT close time for today
-        close_time = datetime.combine(today_ct, datetime.min.time().replace(hour=15, minute=0))
+        # Define 4:00 PM CT close time for today (futures close)
+        close_time = datetime.combine(today_ct, datetime.min.time().replace(hour=16, minute=0))
         close_time_ct = ct_tz.localize(close_time)
         
-        logger.info(f"Fetching historical data to calculate offset from {close_time_ct.strftime('%Y-%m-%d 3:00 PM CT')} close")
-        self.log_message("Calculating offset from historical 3pm close...", "INFO")
+        logger.info(f"Fetching historical data to calculate offset from {close_time_ct.strftime('%Y-%m-%d 4:00 PM CT')} close")
+        self.log_message("Calculating offset from historical 4pm close...", "INFO")
         
         # Create temporary storage for historical close data
         self.historical_close_data = {
@@ -9708,18 +10502,18 @@ class MainWindow(QMainWindow):
             return
             
         if req_id == self.app_state.get('historical_close_spx_req_id'):
-            # SPX bar received - look for 3:00 PM bar
+            # SPX bar received - look for 4:00 PM bar (futures close time for comparison)
             bar_time_str = str(bar_data['date']).strip()
-            if '15:00' in bar_time_str or '1500' in bar_time_str:  # 3:00 PM bar
+            if '16:00' in bar_time_str or '1600' in bar_time_str:  # 4:00 PM bar
                 self.historical_close_data['spx_close'] = bar_data['close']
-                logger.info(f"SPX 3pm close: {bar_data['close']:.2f}")
+                logger.info(f"SPX 4pm close: {bar_data['close']:.2f}")
                 
         elif req_id == self.app_state.get('historical_close_es_req_id'):
-            # ES bar received - look for 3:00 PM bar
+            # ES bar received - look for 4:00 PM bar (futures close time)
             bar_time_str = str(bar_data['date']).strip()
-            if '15:00' in bar_time_str or '1500' in bar_time_str:  # 3:00 PM bar
+            if '16:00' in bar_time_str or '1600' in bar_time_str:  # 4:00 PM bar
                 self.historical_close_data['es_close'] = bar_data['close']
-                logger.info(f"ES 3pm close: {bar_data['close']:.2f}")
+                logger.info(f"ES 4pm close: {bar_data['close']:.2f}")
     
     def on_historical_close_data_complete(self, req_id: int):
         """Called when historical data request completes"""
@@ -9759,8 +10553,8 @@ class MainWindow(QMainWindow):
                     self.save_settings()
                 else:
                     symbol = self.instrument['underlying_symbol']
-                    logger.warning(f"Could not find 3pm close bars ({symbol}: {underlying_close}, ES: {es_close})")
-                    self.log_message("Could not calculate offset - missing 3pm close data", "WARNING")
+                    logger.warning(f"Could not find 4pm close bars ({symbol}: {underlying_close}, ES: {es_close})")
+                    self.log_message("Could not calculate offset - missing 4pm close data", "WARNING")
                 
                 # Cleanup
                 self.historical_close_data = None
@@ -9773,7 +10567,7 @@ class MainWindow(QMainWindow):
         Also monitor ES futures market state transitions (closed -> open).
         Called every minute to determine if offset updates should be enabled
         and if ES subscription needs to switch from snapshot to streaming mode.
-        Market hours: 8:30 AM - 3:00 PM Central Time (Monday-Friday)
+        Futures market hours: 8:30 AM - 4:00 PM Central Time (Monday-Friday)
         ES futures market: 23/6 except 4:00-5:00 PM CT daily, all day Sat/Sun
         """
         old_status = self.offset_update_enabled
@@ -9787,7 +10581,7 @@ class MainWindow(QMainWindow):
             
             if self.offset_update_enabled:
                 status_text = "STARTED"
-                detail = f"Now tracking ES-to-cash offset during market hours (8:30 AM - 3:00 PM CT). Current time: {now_ct}"
+                detail = f"Now tracking ES-to-cash offset during futures market hours (8:30 AM - 4:00 PM CT). Current time: {now_ct}"
             else:
                 status_text = "STOPPED"
                 detail = f"Offset tracking stopped (outside market hours). Using saved offset: {self.es_to_cash_offset:+.2f}. Current time: {now_ct}"
@@ -10006,6 +10800,8 @@ class MainWindow(QMainWindow):
                 'ts_immediate_join': self.ts_immediate_join,
                 'ts_wait_for_next_entry': self.ts_wait_for_next_entry,
                 'ts_last_strategy_state': self.ts_last_strategy_state,
+                'ts_use_pure_0dte': getattr(self, 'ts_use_pure_0dte', False),  # Contract strategy selection
+                'ts_use_pure_0dte': getattr(self, 'ts_use_pure_0dte', False),  # Contract strategy selection
                 
                 # Order Chasing Settings
                 'chase_give_in_interval': self.chase_give_in_interval,
@@ -10367,6 +11163,10 @@ class MainWindow(QMainWindow):
                     self._enter_automated_position(1)  # Enter CALL
                     logger.info("LONG-only mode: Entered CALL on LONG signal")
                 elif new_direction in [0, 2]:  # FLAT or SHORT signal
+                    # CRITICAL: Clear entry tracking flag when exiting (FLAT or SHORT with SHORT disabled)
+                    if hasattr(self, '_last_automated_entry_direction'):
+                        logger.info(f"🔓 Clearing entry tracking on exit signal: was {self._last_automated_entry_direction}")
+                        delattr(self, '_last_automated_entry_direction')
                     # Exit any CALL positions, don't enter anything
                     self._close_automated_positions(old_direction)
                     logger.info(f"LONG-only mode: Closed positions on {'FLAT' if new_direction == 0 else 'SHORT'} signal")
@@ -10380,6 +11180,10 @@ class MainWindow(QMainWindow):
                     self._enter_automated_position(2)  # Enter PUT
                     logger.info("SHORT-only mode: Entered PUT on SHORT signal")
                 elif new_direction in [0, 1]:  # FLAT or LONG signal
+                    # CRITICAL: Clear entry tracking flag when exiting (FLAT or LONG with LONG disabled)
+                    if hasattr(self, '_last_automated_entry_direction'):
+                        logger.info(f"🔓 Clearing entry tracking on exit signal: was {self._last_automated_entry_direction}")
+                        delattr(self, '_last_automated_entry_direction')
                     # Exit any PUT positions, don't enter anything
                     self._close_automated_positions(old_direction)
                     logger.info(f"SHORT-only mode: Closed positions on {'FLAT' if new_direction == 0 else 'LONG'} signal")
@@ -10398,6 +11202,10 @@ class MainWindow(QMainWindow):
                     self._enter_automated_position(2)  # Enter PUT
                     logger.info("BOTH mode: Entered PUT on SHORT signal")
                 elif new_direction == 0:  # FLAT signal
+                    # CRITICAL: Clear entry tracking flag when going FLAT
+                    if hasattr(self, '_last_automated_entry_direction'):
+                        logger.info(f"🔓 Clearing entry tracking on FLAT signal: was {self._last_automated_entry_direction}")
+                        delattr(self, '_last_automated_entry_direction')
                     # Close all positions, don't enter anything
                     self._close_automated_positions(old_direction)
                     logger.info("BOTH mode: Closed all positions on FLAT signal")
@@ -10519,10 +11327,15 @@ class MainWindow(QMainWindow):
             ask = market_data.get('ask', 0)
             
             if bid > 0 and ask > 0:
-                mid_price = round((bid + ask) / 2, 2)
+                mid_price = (bid + ask) / 2
+                # CRITICAL: Round to proper tick size for the instrument
+                mid_price = self.round_to_option_tick(mid_price)
             else:
                 logger.warning(f"No bid/ask for {contract_key}, using last price")
                 mid_price = market_data.get('last', 0)
+                if mid_price > 0:
+                    # CRITICAL: Round to proper tick size
+                    mid_price = self.round_to_option_tick(mid_price)
             
             if mid_price <= 0:
                 logger.error(f"No valid price for {contract_key}, cannot close")
@@ -10546,7 +11359,8 @@ class MainWindow(QMainWindow):
                 action=action,
                 quantity=abs_quantity,
                 limit_price=mid_price,
-                enable_chasing=True  # Enable mid-price chasing for automated exits
+                enable_chasing=True,  # Enable mid-price chasing for automated exits
+                is_automated=True  # Mark as automated order
             )
             
             if order_id:
@@ -10603,11 +11417,15 @@ class MainWindow(QMainWindow):
                     self.log_message(f"⚠️ Already have {position_type} position open - entry blocked", "WARNING")
                     return
             
-            # Check if we have any pending orders OF THIS TYPE (call or put)
+            # Check if we have any AUTOMATED pending orders OF THIS TYPE (call or put)
+            # CRITICAL: Only block on automated orders, not manual orders
             if self.pending_orders:
-                # Count pending entry orders (BUY orders) of the same type
+                # Count pending AUTOMATED entry orders (BUY orders) of the same type
                 same_type_orders = []
                 for order_id, order in self.pending_orders.items():
+                    # Only check automated orders
+                    if not order.get('is_automated', False):
+                        continue
                     if order.get('action') == 'BUY':
                         order_contract = order.get('contract_key', '')
                         # Parse to check type
@@ -10617,8 +11435,8 @@ class MainWindow(QMainWindow):
                                 same_type_orders.append(order_id)
                 
                 if same_type_orders:
-                    logger.warning(f"⚠️ SAFETY: Already have {len(same_type_orders)} pending {position_type} entry order(s) - skipping entry")
-                    self.log_message(f"⚠️ Already have pending {position_type} order - entry blocked", "WARNING")
+                    logger.warning(f"⚠️ SAFETY: Already have {len(same_type_orders)} pending automated {position_type} entry order(s) - skipping entry")
+                    self.log_message(f"⚠️ Already have pending automated {position_type} order - entry blocked", "WARNING")
                     return
             
             # NOTE: Checkbox validation is done by caller (process_strategy_direction_change)
@@ -10697,7 +11515,8 @@ class MainWindow(QMainWindow):
                 action="BUY",
                 quantity=quantity,
                 limit_price=mid_price,
-                enable_chasing=True  # Enable mid-price chasing for automated entries
+                enable_chasing=True,  # Enable mid-price chasing for automated entries
+                is_automated=True  # Mark as automated order
             )
             
             if order_id:
@@ -10769,8 +11588,14 @@ class MainWindow(QMainWindow):
     # ═══════════════════════════════════════════════════════════════════════════
     
     def get_ts_active_contract_type(self) -> str:
-        """Determine which contract type (0DTE or 1DTE) to use based on current time"""
+        """Determine which contract type (0DTE or 1DTE) to use based on strategy setting and current time"""
         try:
+            # Check if Pure 0DTE strategy is selected
+            if hasattr(self, 'ts_pure_0dte_radio') and self.ts_pure_0dte_radio.isChecked():
+                logger.info(f"📌 Pure 0DTE Strategy: Always using 0DTE contracts")
+                return "0DTE"
+            
+            # Hybrid strategy: time-based selection
             import pytz
             from datetime import time as dt_time
             ct_tz = pytz.timezone('America/Chicago')
@@ -10783,10 +11608,10 @@ class MainWindow(QMainWindow):
             time_4pm = dt_time(16, 0)
             
             if time_11am <= current_time < time_4pm:
-                logger.info(f"⏰ Time-based selection: {current_time.strftime('%H:%M:%S')} CT → Using 1DTE (11AM-4PM window)")
+                logger.info(f"⏰ Hybrid Strategy: {current_time.strftime('%H:%M:%S')} CT → Using 1DTE (11AM-4PM window)")
                 return "1DTE"
             else:
-                logger.info(f"⏰ Time-based selection: {current_time.strftime('%H:%M:%S')} CT → Using 0DTE (outside 11AM-4PM window)")
+                logger.info(f"⏰ Hybrid Strategy: {current_time.strftime('%H:%M:%S')} CT → Using 0DTE (outside 11AM-4PM window)")
                 return "0DTE"
                 
         except Exception as e:
@@ -10949,6 +11774,27 @@ class MainWindow(QMainWindow):
         self.save_settings()
         logger.info(f"💾 Settings saved with ts_auto_trading_enabled={self.ts_auto_trading_enabled}")
     
+    def on_contract_strategy_changed(self, checked: bool):
+        """Handle contract strategy selection (Pure 0DTE vs Hybrid)"""
+        if not checked:  # Only act on the newly checked radio
+            return
+            
+        if self.ts_pure_0dte_radio.isChecked():
+            self.ts_use_pure_0dte = True
+            self.log_message("📌 Contract Strategy: PURE 0DTE - Always using 0DTE contracts", "INFO")
+            logger.info("📌 User selected Pure 0DTE strategy")
+        else:
+            self.ts_use_pure_0dte = False
+            self.log_message("🔄 Contract Strategy: HYBRID - 0DTE→1DTE at 11am CT", "INFO")
+            logger.info("🔄 User selected Hybrid strategy")
+        
+        # Update the active contract type display
+        self.update_ts_active_contract()
+        
+        # Save settings
+        self.save_settings()
+        logger.info(f"💾 Settings saved with ts_use_pure_0dte={self.ts_use_pure_0dte}")
+    
     def check_immediate_entry_on_startup(self):
         """Check if we should immediately enter a trade based on current TS strategy state"""
         try:
@@ -10967,45 +11813,70 @@ class MainWindow(QMainWindow):
             
             # Read current StrategyDirection from GlobalDictionary
             try:
-                import GlobalDictionary as gd
-                dictionary_name = 'IBKR-TRADER'
+                # Use the ts_manager's GlobalDictionary instance
+                direction_value = self.ts_manager.gd.get('StrategyDirection')  # type: ignore
+                logger.info(f"IMMEDIATE JOIN: Read StrategyDirection = {direction_value}")
                 
-                # Try to get StrategyDirection value
-                try:
-                    direction = gd.GetValue(dictionary_name, 'StrategyDirection')  # type: ignore
-                    logger.info(f"IMMEDIATE JOIN: Read StrategyDirection = {direction}")
+                # Convert to int (defensive) - handle various return types from GlobalDictionary
+                raw_direction = 0
+                if direction_value is None:
+                    raw_direction = 0
+                elif isinstance(direction_value, (int, float)):
+                    raw_direction = int(direction_value)
+                elif isinstance(direction_value, str):
+                    try:
+                        raw_direction = int(direction_value)
+                    except ValueError:
+                        raw_direction = 0
+                else:
+                    raw_direction = 0
+                
+                # Convert TradeStation format to internal format
+                # TradeStation: 1=LONG, -1=SHORT, 0=FLAT
+                # Internal: 0=FLAT, 1=LONG, 2=SHORT
+                if raw_direction == 1:
+                    direction = 1  # LONG
+                    direction_str = "LONG"
+                elif raw_direction == -1:
+                    direction = 2  # SHORT (convert -1 to 2)
+                    direction_str = "SHORT"
+                elif raw_direction == 0:
+                    direction = 0  # FLAT
+                    direction_str = "FLAT"
+                elif raw_direction == 2:
+                    # Future-proof: if TS sends 2, accept it as SHORT
+                    direction = 2
+                    direction_str = "SHORT"
+                else:
+                    direction = 0  # Unknown values default to FLAT
+                    direction_str = f"UNKNOWN({raw_direction})->FLAT"
+                    logger.warning(f"Unknown StrategyDirection value {raw_direction}, defaulting to FLAT")
+                
+                # Store current direction
+                previous_direction = self.ts_strategy_direction
+                self.ts_strategy_direction = direction
+                
+                # Update UI to show current direction
+                self.on_ts_strategy_state_changed(direction_str)
+                
+                self.log_message(f"📊 Current TS Strategy: {direction_str}", "INFO")
+                logger.info(f"IMMEDIATE JOIN: StrategyDirection = {direction_str} (TS={raw_direction} → Python={direction})")
+                
+                # If strategy is not FLAT, process it to enter immediately
+                if direction != 0:  # Not FLAT
+                    logger.info(f"IMMEDIATE JOIN: Strategy is {direction_str} - will attempt entry")
+                    self.log_message(f"🚀 Immediate join: Attempting to enter {direction_str} position...", "INFO")
                     
-                    # Convert to int (defensive)
-                    direction = int(direction) if direction else 0
+                    # Call strategy processing with old_direction=0 to ensure entry logic runs
+                    # (We pretend we're coming from FLAT state to trigger entry)
+                    self.process_strategy_direction_change(direction, 0)
+                else:
+                    logger.info("IMMEDIATE JOIN: Strategy is FLAT - no immediate entry needed")
+                    self.log_message("ℹ️ Strategy is FLAT - waiting for signal", "INFO")
                     
-                    # Store current direction
-                    previous_direction = self.ts_strategy_direction
-                    self.ts_strategy_direction = direction
-                    
-                    # Convert to string for logging
-                    direction_str = "LONG" if direction == 1 else "SHORT" if direction == 2 else "FLAT"
-                    self.log_message(f"� Current TS Strategy: {direction_str}", "INFO")
-                    logger.info(f"IMMEDIATE JOIN: StrategyDirection = {direction_str} ({direction})")
-                    
-                    # If strategy is not FLAT, process it to enter immediately
-                    if direction != 0:  # Not FLAT
-                        logger.info(f"IMMEDIATE JOIN: Strategy is {direction_str} - will attempt entry")
-                        self.log_message(f"🚀 Immediate join: Attempting to enter {direction_str} position...", "INFO")
-                        
-                        # Call strategy processing with old_direction=0 to ensure entry logic runs
-                        # (We pretend we're coming from FLAT state to trigger entry)
-                        self.process_strategy_direction_change(direction, 0)
-                    else:
-                        logger.info("IMMEDIATE JOIN: Strategy is FLAT - no immediate entry needed")
-                        self.log_message("ℹ️ Strategy is FLAT - waiting for signal", "INFO")
-                    
-                except Exception as gd_error:
-                    logger.error(f"Error reading StrategyDirection: {gd_error}")
-                    self.log_message(f"⚠️ Could not read TS strategy direction: {gd_error}", "WARNING")
-                    
-            except Exception as import_error:
-                logger.error(f"Error importing GlobalDictionary: {import_error}")
-                self.log_message(f"⚠️ Error accessing GlobalDictionary: {import_error}", "WARNING")
+            except Exception as gd_error:
+                logger.error(f"Error reading StrategyDirection: {gd_error}", exc_info=True)
+                self.log_message(f"⚠️ Could not read TS strategy direction: {gd_error}", "WARNING")
             
         except Exception as e:
             logger.error(f"Error checking immediate entry: {e}", exc_info=True)
@@ -11020,6 +11891,8 @@ class MainWindow(QMainWindow):
             self.ts_immediate_join_checkbox.blockSignals(True)
             self.ts_wait_for_next_entry_checkbox.blockSignals(True)
             self.ts_auto_trading_checkbox.blockSignals(True)
+            self.ts_pure_0dte_radio.blockSignals(True)
+            self.ts_hybrid_radio.blockSignals(True)
             
             # Set checkbox states from loaded settings (widget.setChecked(boolean_value))
             self.ts_auto_long_checkbox.setChecked(self.ts_auto_long_enabled)
@@ -11027,6 +11900,12 @@ class MainWindow(QMainWindow):
             self.ts_immediate_join_checkbox.setChecked(self.ts_immediate_join)
             self.ts_wait_for_next_entry_checkbox.setChecked(self.ts_wait_for_next_entry)
             self.ts_auto_trading_checkbox.setChecked(self.ts_auto_trading_enabled)
+            
+            # Set contract strategy radio buttons
+            if getattr(self, 'ts_use_pure_0dte', False):
+                self.ts_pure_0dte_radio.setChecked(True)
+            else:
+                self.ts_hybrid_radio.setChecked(True)
             
             # Update status display
             if self.ts_auto_trading_enabled:
@@ -11045,10 +11924,13 @@ class MainWindow(QMainWindow):
             self.ts_immediate_join_checkbox.blockSignals(False)
             self.ts_wait_for_next_entry_checkbox.blockSignals(False)
             self.ts_auto_trading_checkbox.blockSignals(False)
+            self.ts_pure_0dte_radio.blockSignals(False)
+            self.ts_hybrid_radio.blockSignals(False)
             
             logger.info(f"TS automation UI synced: enabled={self.ts_auto_trading_enabled}, "
                        f"long={self.ts_auto_long_enabled}, short={self.ts_auto_short_enabled}, "
-                       f"immediate={self.ts_immediate_join}, wait={self.ts_wait_for_next_entry}")
+                       f"immediate={self.ts_immediate_join}, wait={self.ts_wait_for_next_entry}, "
+                       f"pure_0dte={getattr(self, 'ts_use_pure_0dte', False)}")
             
         except Exception as e:
             logger.error(f"Error syncing TS automation UI: {e}", exc_info=True)
@@ -11514,8 +12396,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'ts_signals'):
             self.ts_signals.ts_activity.emit(f"📍 Position table clicked: row={row}, col={col}")
         
-        if col != 10:  # Only handle Close button column (column 10)
-            logger.info(f"Click on column {col} - not Close button (column 10), ignoring")
+        if col != 11:  # Only handle Close button column (column 11 now with Source column added)
+            logger.info(f"Click on column {col} - not Close button (column 11), ignoring")
             if hasattr(self, 'ts_signals'):
                 self.ts_signals.ts_activity.emit(f"   ↳ Column {col} ignored (not Close button)")
             return
@@ -11616,7 +12498,7 @@ class MainWindow(QMainWindow):
     
     def on_ts_order_cell_clicked(self, row: int, col: int):
         """Handle TS order table cell click - Cancel button"""
-        if col == 6:  # Cancel button
+        if col == 7:  # Cancel button (column 7 now with Source column added)
             # Get order ID from first column
             order_id_item = self.ts_orders_table.item(row, 0)
             if not order_id_item:
@@ -11699,6 +12581,8 @@ class MainWindow(QMainWindow):
             total_mkt_value += market_value
             
             # Populate row
+            source_text = "Strategy" if pos.get('is_automated', False) else "Manual"
+            
             items = [
                 QTableWidgetItem(contract_key),
                 QTableWidgetItem(f"{pos['position']:.0f}"),
@@ -11710,6 +12594,7 @@ class MainWindow(QMainWindow):
                 QTableWidgetItem(f"${market_value:.2f}"),
                 QTableWidgetItem(entry_time_str),
                 QTableWidgetItem(time_span_str),
+                QTableWidgetItem(source_text),
                 QTableWidgetItem("Close")
             ]
             
@@ -11723,8 +12608,15 @@ class MainWindow(QMainWindow):
                     elif pnl < 0:
                         item.setForeground(QColor("#ff0000"))
                 
-                # Close button styling
+                # Color Source column (column 10)
                 if col == 10:
+                    if source_text == "Strategy":
+                        item.setForeground(QColor("#4CAF50"))
+                    else:
+                        item.setForeground(QColor("#FF9800"))
+                
+                # Close button styling (now column 11)
+                if col == 11:
                     item.setBackground(QColor("#cc0000"))
                     item.setForeground(QColor("#ffffff"))
                 
@@ -11765,6 +12657,9 @@ class MainWindow(QMainWindow):
             else:
                 status_str = order_info.get('status', 'Working')
             
+            # Determine source
+            source_text = "Strategy" if order_info.get('is_automated', False) else "Manual"
+            
             # Populate row
             items = [
                 QTableWidgetItem(str(order_id)),
@@ -11773,6 +12668,7 @@ class MainWindow(QMainWindow):
                 QTableWidgetItem(str(order_info['quantity'])),
                 QTableWidgetItem(price_str),
                 QTableWidgetItem(status_str),
+                QTableWidgetItem(source_text),
                 QTableWidgetItem("Cancel")
             ]
             
@@ -11788,8 +12684,15 @@ class MainWindow(QMainWindow):
                         else:
                             item.setForeground(QColor("#FFA500"))  # Orange for giving in
                 
-                # Cancel button styling
+                # Source column - color code
                 if col == 6:
+                    if source_text == "Strategy":
+                        item.setForeground(QColor("#4CAF50"))  # Green
+                    else:
+                        item.setForeground(QColor("#FF9800"))  # Orange
+                
+                # Cancel button styling (now column 7)
+                if col == 7:
                     item.setBackground(QColor("#cc0000"))
                     item.setForeground(QColor("#ffffff"))
                 
@@ -11908,6 +12811,7 @@ class MainWindow(QMainWindow):
                 self.ts_immediate_join = settings.get('ts_immediate_join', False)
                 self.ts_wait_for_next_entry = settings.get('ts_wait_for_next_entry', True)
                 self.ts_last_strategy_state = settings.get('ts_last_strategy_state', 'FLAT')
+                self.ts_use_pure_0dte = settings.get('ts_use_pure_0dte', False)  # Default to Hybrid
                 
                 # Order Chasing Settings
                 self.chase_give_in_interval = settings.get('chase_give_in_interval', 3.0)
