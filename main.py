@@ -6868,47 +6868,49 @@ class MainWindow(QMainWindow):
                             # This is an exit order - match with entries and log P&L
                             logger.info(f"   ✅ Proceeding with FIFO matching for {contract_key}")
                             ct_tz = pytz.timezone('America/Chicago')
-                            now_ct = datetime.now(ct_tz)                        # Process SELL quantity - may need to match multiple BUY entries
-                        remaining_qty = qty
-                        entries_to_remove = []
-                        
-                        for idx, entry_data in enumerate(self.trade_entries[contract_key]):
-                            if remaining_qty <= 0:
-                                break
+                            now_ct = datetime.now(ct_tz)
                             
-                            entry_qty = entry_data['quantity']
-                            exit_qty = min(remaining_qty, entry_qty)
+                            # Process SELL quantity - may need to match multiple BUY entries
+                            remaining_qty = qty
+                            entries_to_remove = []
                             
-                            # Create exit data for this portion
-                            exit_data = {
-                                'datetime': now_ct.strftime('%Y-%m-%d %H:%M:%S'),
-                                'order_id': order_id,
-                                'action': action,
-                                'quantity': exit_qty,
-                                'avg_price': avg_fill_price
-                            }
+                            for idx, entry_data in enumerate(self.trade_entries[contract_key]):
+                                if remaining_qty <= 0:
+                                    break
+                                
+                                entry_qty = entry_data['quantity']
+                                exit_qty = min(remaining_qty, entry_qty)
+                                
+                                # Create exit data for this portion
+                                exit_data = {
+                                    'datetime': now_ct.strftime('%Y-%m-%d %H:%M:%S'),
+                                    'order_id': order_id,
+                                    'action': action,
+                                    'quantity': exit_qty,
+                                    'avg_price': avg_fill_price
+                                }
+                                
+                                # Log P&L for this matched pair
+                                self.log_pnl_to_csv(contract_key, entry_data, exit_data)
+                                logger.info(f"   📊 Logged P&L: Entry Order #{entry_data['order_id']} → Exit Order #{order_id}, Qty={exit_qty}")
+                                
+                                # Track which entries to remove or update
+                                if exit_qty >= entry_qty:
+                                    # Fully closed this entry
+                                    entries_to_remove.append(idx)
+                                    remaining_qty -= entry_qty
+                                else:
+                                    # Partially closed - update the entry quantity
+                                    self.trade_entries[contract_key][idx]['quantity'] -= exit_qty
+                                    remaining_qty = 0
                             
-                            # Log P&L for this matched pair
-                            self.log_pnl_to_csv(contract_key, entry_data, exit_data)
-                            logger.info(f"   📊 Logged P&L: Entry Order #{entry_data['order_id']} → Exit Order #{order_id}, Qty={exit_qty}")
+                            # Remove fully closed entries (in reverse order to maintain indices)
+                            for idx in reversed(entries_to_remove):
+                                del self.trade_entries[contract_key][idx]
                             
-                            # Track which entries to remove or update
-                            if exit_qty >= entry_qty:
-                                # Fully closed this entry
-                                entries_to_remove.append(idx)
-                                remaining_qty -= entry_qty
-                            else:
-                                # Partially closed - update the entry quantity
-                                self.trade_entries[contract_key][idx]['quantity'] -= exit_qty
-                                remaining_qty = 0
-                        
-                        # Remove fully closed entries (in reverse order to maintain indices)
-                        for idx in reversed(entries_to_remove):
-                            del self.trade_entries[contract_key][idx]
-                        
-                        # Clean up if no entries left
-                        if len(self.trade_entries[contract_key]) == 0:
-                            del self.trade_entries[contract_key]
+                            # Clean up if no entries left
+                            if len(self.trade_entries[contract_key]) == 0:
+                                del self.trade_entries[contract_key]
                 elif status == 'Cancelled':
                     self.ts_signals.ts_activity.emit(f"🚫 ORDER CANCELLED: #{order_id} | {contract_key}")
                 elif status == 'PartiallyFilled':
