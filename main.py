@@ -11377,6 +11377,43 @@ class MainWindow(QMainWindow):
             logger.error(f"Error closing position {contract_key}: {e}", exc_info=True)
             self.log_message(f"❌ Error closing {contract_key}: {e}", "ERROR")
     
+    def _get_strategy_positions_by_type(self, right: str) -> list:
+        """
+        Get all Strategy (automated) positions of a specific type (Call or Put)
+        
+        CRASH RECOVERY HELPER: Used to detect existing Strategy positions after restart
+        
+        Args:
+            right: 'C' for calls, 'P' for puts
+            
+        Returns:
+            List of contract_keys that are Strategy positions of the specified type
+        """
+        strategy_positions = []
+        
+        if not self.positions:
+            return strategy_positions
+        
+        for contract_key, pos in self.positions.items():
+            # Check if position has quantity > 0 (actually open)
+            if pos.get('position', 0) <= 0:
+                continue
+            
+            # Check if this is a Strategy position (is_automated flag)
+            if not pos.get('is_automated', False):
+                continue
+            
+            # Parse contract to check type
+            try:
+                symbol, strike, pos_right, expiry = self.parse_contract_key(contract_key)
+                if pos_right == right:
+                    strategy_positions.append(contract_key)
+            except Exception as e:
+                logger.warning(f"Could not parse contract_key {contract_key}: {e}")
+                continue
+        
+        return strategy_positions
+    
     def _enter_automated_position(self, direction: int):
         """
         Enter a new automated position based on direction
@@ -11384,17 +11421,12 @@ class MainWindow(QMainWindow):
         CRITICAL SAFETY: Only enters if no existing position or pending order exists FOR THIS DIRECTION
         Allows simultaneous call and put positions (for straddles/strangles)
         
+        CRASH RECOVERY: Checks for existing Strategy positions to prevent duplicates after restart
+        
         Args:
             direction: 1=LONG (buy call), 2=SHORT (buy put)
         """
         try:
-            # ⚠️ CRITICAL SAFETY CHECK: Prevent duplicate orders FOR THIS DIRECTION
-            # Check if we already have an open position or pending order for this specific direction
-            if hasattr(self, '_last_automated_entry_direction'):
-                if self._last_automated_entry_direction == direction:
-                    logger.info(f"⛔ SAFETY: Already have {direction} position/order - skipping duplicate entry")
-                    return
-            
             # Determine which type we're entering (CALL or PUT)
             if direction == 1:  # LONG: Buy CALL
                 right = 'C'
@@ -11403,12 +11435,34 @@ class MainWindow(QMainWindow):
                 right = 'P'
                 position_type = "PUT"
             
-            # Check if we have any open positions OF THIS TYPE (call or put)
+            # ⚠️ CRASH RECOVERY CHECK #1: Check for existing Strategy positions of this type
+            # This prevents duplicate entries after app restart when TS is still LONG/SHORT
+            strategy_positions = self._get_strategy_positions_by_type(right)
+            if strategy_positions:
+                logger.info(f"🔄 CRASH RECOVERY: Found {len(strategy_positions)} existing Strategy {position_type} position(s)")
+                for contract_key in strategy_positions:
+                    pos = self.positions[contract_key]
+                    logger.info(f"   Existing: {contract_key}, Qty={pos.get('position', 0)}, Source=Strategy")
+                self.log_message(f"🔄 Already have Strategy {position_type} position - entry blocked (crash recovery)", "INFO")
+                
+                # Track this direction to prevent future duplicate attempts
+                self._last_automated_entry_direction = direction
+                return
+            
+            # ⚠️ CRITICAL SAFETY CHECK #2: Prevent duplicate orders FOR THIS DIRECTION
+            # Check if we already have an open position or pending order for this specific direction
+            if hasattr(self, '_last_automated_entry_direction'):
+                if self._last_automated_entry_direction == direction:
+                    logger.info(f"⛔ SAFETY: Already have {direction} position/order - skipping duplicate entry")
+                    return
+            
+            # ⚠️ SAFETY CHECK #3: Check if we have any open positions OF THIS TYPE (call or put)
+            # This catches ANY positions (Strategy or Manual) to prevent overlapping trades
             if self.positions:
                 # Count positions of the same type (call/put) we're trying to enter
                 same_type_positions = []
                 for contract_key, pos in self.positions.items():
-                    if pos.get('quantity', 0) > 0:
+                    if pos.get('position', 0) > 0:
                         # Parse contract to check if it's same type
                         symbol, strike, pos_right, expiry = self.parse_contract_key(contract_key)
                         if pos_right == right:  # Same type (both calls or both puts)
@@ -11419,7 +11473,7 @@ class MainWindow(QMainWindow):
                     self.log_message(f"⚠️ Already have {position_type} position open - entry blocked", "WARNING")
                     return
             
-            # Check if we have any AUTOMATED pending orders OF THIS TYPE (call or put)
+            # ⚠️ SAFETY CHECK #4: Check if we have any AUTOMATED pending orders OF THIS TYPE (call or put)
             # CRITICAL: Only block on automated orders, not manual orders
             if self.pending_orders:
                 # Count pending AUTOMATED entry orders (BUY orders) of the same type
