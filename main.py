@@ -3312,6 +3312,7 @@ class MainWindow(QMainWindow):
         # Load settings
         self.load_settings()
         self.load_positions()  # Load saved positions to preserve entryTime
+        self.reconstruct_trade_entries_from_log()  # Reconstruct open trades for P&L tracking
         
         # Log ES offset tracking status at startup
         if self.is_market_hours():
@@ -3566,6 +3567,133 @@ class MainWindow(QMainWindow):
             
         except Exception as e:
             logger.error(f"Error logging P&L to CSV: {e}", exc_info=True)
+    
+    def reconstruct_trade_entries_from_log(self):
+        """
+        Reconstruct trade_entries dictionary from trade log at startup
+        
+        CRASH RECOVERY: This allows P&L tracking to work across app restarts.
+        Reads the trade log and rebuilds the open BUY entries that haven't been closed yet.
+        """
+        try:
+            csv_file = self.get_environment_file_path('trade_log.csv')
+            if not Path(csv_file).exists():
+                logger.info("📝 No trade log found - starting fresh")
+                return
+            
+            logger.info(f"🔄 Reconstructing trade entries from {csv_file}...")
+            
+            # Read all trades from CSV
+            with open(csv_file, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                trades = list(reader)
+            
+            if not trades:
+                logger.info("📝 Trade log is empty")
+                return
+            
+            # Process trades to build entry/exit pairs
+            # Dictionary to track: {contract_key: [list of BUY entries]}
+            temp_entries = {}
+            matched_count = 0
+            unmatched_buys = 0
+            
+            for trade in trades:
+                try:
+                    order_id = int(trade['OrderID'])
+                    action = trade['Action']
+                    side = trade['Side']  # e.g., "MES 6870.0P 20251113"
+                    qty = float(trade['Qty'])
+                    price = float(trade['AvgFillPrc'])
+                    datetime_str = trade['DateTime']
+                    source = trade.get('Source', 'Manual')
+                    is_automated = (source == 'Strategy')
+                    
+                    # Convert side to contract_key format
+                    # Side format: "MES 6870.0P 20251113"
+                    # Contract key format: "MES_6870.0_P_20251113"
+                    parts = side.split()
+                    if len(parts) >= 3:
+                        symbol = parts[0]
+                        strike_right = parts[1]  # e.g., "6870.0P"
+                        expiry = parts[2]
+                        
+                        # Extract strike and right
+                        if strike_right[-1] in ['C', 'P']:
+                            right = strike_right[-1]
+                            strike = strike_right[:-1]
+                            contract_key = f"{symbol}_{strike}_{right}_{expiry}"
+                        else:
+                            logger.warning(f"Could not parse side format: {side}")
+                            continue
+                    else:
+                        logger.warning(f"Unexpected side format: {side}")
+                        continue
+                    
+                    if action == 'BUY':
+                        # Add BUY entry
+                        entry_data = {
+                            'datetime': datetime_str,
+                            'order_id': order_id,
+                            'action': action,
+                            'quantity': qty,
+                            'avg_price': price,
+                            'is_automated': is_automated
+                        }
+                        if contract_key not in temp_entries:
+                            temp_entries[contract_key] = []
+                        temp_entries[contract_key].append(entry_data)
+                        
+                    elif action == 'SELL':
+                        # Match with BUY entries (FIFO)
+                        if contract_key in temp_entries and len(temp_entries[contract_key]) > 0:
+                            remaining_qty = qty
+                            entries_to_remove = []
+                            
+                            for idx, entry in enumerate(temp_entries[contract_key]):
+                                if remaining_qty <= 0:
+                                    break
+                                
+                                entry_qty = entry['quantity']
+                                matched_qty = min(remaining_qty, entry_qty)
+                                
+                                if matched_qty >= entry_qty:
+                                    # Fully matched this entry
+                                    entries_to_remove.append(idx)
+                                    remaining_qty -= entry_qty
+                                    matched_count += 1
+                                else:
+                                    # Partially matched
+                                    temp_entries[contract_key][idx]['quantity'] -= matched_qty
+                                    remaining_qty = 0
+                                    matched_count += 1
+                            
+                            # Remove fully matched entries
+                            for idx in reversed(entries_to_remove):
+                                del temp_entries[contract_key][idx]
+                            
+                            # Clean up if no entries left
+                            if len(temp_entries[contract_key]) == 0:
+                                del temp_entries[contract_key]
+                
+                except Exception as e:
+                    logger.warning(f"Error processing trade log entry: {e}")
+                    continue
+            
+            # Now temp_entries contains only unmatched BUY entries
+            # Copy these to self.trade_entries
+            self.trade_entries = temp_entries
+            
+            # Count unmatched entries
+            for contract_key, entries in self.trade_entries.items():
+                for entry in entries:
+                    unmatched_buys += 1
+                    logger.info(f"   📌 Unmatched BUY: {contract_key}, Order #{entry['order_id']}, Qty={entry['quantity']}, Price={entry['avg_price']}, Source={'Strategy' if entry['is_automated'] else 'Manual'}")
+            
+            logger.info(f"✅ Trade entries reconstructed: {matched_count} matched pairs, {unmatched_buys} open BUY entries")
+            
+        except Exception as e:
+            logger.error(f"Error reconstructing trade entries: {e}", exc_info=True)
     
     # ========================================================================
     # SIGNAL CONNECTIONS
