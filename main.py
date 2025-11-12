@@ -726,6 +726,7 @@ class IBKRWrapper(EWrapper):
         logger.info(f"✓ openOrder callback received for order #{orderId}")
         logger.info(f"   Contract: {contract_key}")
         logger.info(f"   Action: {order.action} {order.totalQuantity}")
+        logger.info(f"   OrderRef (Source): {order.orderRef}")
         logger.info(f"   OrderState status: {orderState.status}")
         self.signals.connection_message.emit(
             f"✓ TWS received Order #{orderId}: {contract_key} {order.action} {order.totalQuantity} (Status: {orderState.status})",
@@ -755,12 +756,21 @@ class IBKRWrapper(EWrapper):
                 self._main_window.positions_confirmed_by_ibkr.add(contract_key)
             
             # Check if this position came from an automated order
-            # We track contract_keys of automated entries, not just order IDs
+            # Look for the most recent order for this contract and check its orderRef tag
             is_automated = False
-            if self._main_window and hasattr(self._main_window, '_automated_entry_contracts'):
-                # Check if this contract was entered via automation
+            if self._main_window and hasattr(self._main_window, 'pending_orders'):
+                # Find the most recent BUY order for this contract
+                for order_id, order_info in sorted(self._main_window.pending_orders.items(), reverse=True):
+                    if order_info.get('contract_key') == contract_key and order_info.get('action') == 'BUY':
+                        # Check if order has orderRef tag from place_order
+                        is_automated = order_info.get('is_automated', False)
+                        logger.debug(f"Position {contract_key}: is_automated={is_automated} from order #{order_id}")
+                        break
+            
+            # Fallback: check the tracking set (for backwards compatibility)
+            if not is_automated and self._main_window and hasattr(self._main_window, '_automated_entry_contracts'):
                 is_automated = contract_key in self._main_window._automated_entry_contracts
-                logger.debug(f"Position {contract_key}: is_automated={is_automated} (in tracking set: {is_automated})")
+                logger.debug(f"Position {contract_key}: is_automated={is_automated} (fallback from tracking set)")
             
             position_data = {
                 'contract': contract,
@@ -9078,6 +9088,9 @@ class MainWindow(QMainWindow):
             order.outsideRth = True  # CRITICAL: Enable "Fill outside RTH" for after-hours trading
             order.eTradeOnly = False  # CRITICAL: Disable eTradeOnly to prevent TWS rejection (error 10268)
             order.firmQuoteOnly = False  # CRITICAL: Disable firmQuoteOnly for better fill rates
+            
+            # CRITICAL: Tag order with source (Strategy vs Manual) using orderRef
+            order.orderRef = "STRATEGY" if is_automated else "MANUAL"
             
             # Set account if available
             if self.app_state.get('account'):
