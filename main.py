@@ -755,11 +755,12 @@ class IBKRWrapper(EWrapper):
                 self._main_window.positions_confirmed_by_ibkr.add(contract_key)
             
             # Check if this position came from an automated order
+            # We track contract_keys of automated entries, not just order IDs
             is_automated = False
-            if self._main_window and hasattr(self._main_window, '_automated_order_ids'):
-                # Check recent fills - this is a simplified check
-                # In production, you'd track order_id -> contract_key mapping more precisely
-                is_automated = len(self._main_window._automated_order_ids) > 0
+            if self._main_window and hasattr(self._main_window, '_automated_entry_contracts'):
+                # Check if this contract was entered via automation
+                is_automated = contract_key in self._main_window._automated_entry_contracts
+                logger.debug(f"Position {contract_key}: is_automated={is_automated} (in tracking set: {is_automated})")
             
             position_data = {
                 'contract': contract,
@@ -7090,6 +7091,11 @@ class MainWindow(QMainWindow):
             if hasattr(self, '_last_automated_entry_direction'):
                 logger.info(f"🔓 Clearing entry tracking for closed automated position: was {self._last_automated_entry_direction}")
                 delattr(self, '_last_automated_entry_direction')
+            
+            # Remove from automated entry contracts tracking
+            if hasattr(self, '_automated_entry_contracts'):
+                self._automated_entry_contracts.discard(contract_key)
+                logger.info(f"🔓 Removed {contract_key} from automated entry contracts tracking")
         
         # Unsubscribe from market data for this position
         self.unsubscribe_position_market_data(contract_key)
@@ -11724,6 +11730,12 @@ class MainWindow(QMainWindow):
                 if not hasattr(self, '_automated_order_ids'):
                     self._automated_order_ids = set()
                 self._automated_order_ids.add(order_id)
+                
+                # Track the contract_key for position identification
+                if not hasattr(self, '_automated_entry_contracts'):
+                    self._automated_entry_contracts = set()
+                self._automated_entry_contracts.add(contract_key)
+                logger.info(f"✅ Tracked automated entry contract: {contract_key}")
                 
                 # ⚠️ CRITICAL: Track that we entered this direction to prevent duplicates
                 self._last_automated_entry_direction = direction
