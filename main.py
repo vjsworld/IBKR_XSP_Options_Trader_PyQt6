@@ -11956,6 +11956,12 @@ class MainWindow(QMainWindow):
             self.ts_trading_status.setStyleSheet("color: #4CAF50; font-weight: bold;")
             self.log_message("🚀 AUTOMATED TRADING ENABLED - System will respond to TS strategy signals", "SUCCESS")
             
+            # CRITICAL: Reset first signal flag when enabling automation
+            # This ensures immediate join treats it as a fresh start
+            if hasattr(self, '_ts_first_signal_received'):
+                delattr(self, '_ts_first_signal_received')
+                logger.info("🔄 Reset _ts_first_signal_received flag for fresh start")
+            
             # If immediate join is enabled, check current strategy state and enter if needed
             if self.ts_immediate_join_checkbox.isChecked():
                 QTimer.singleShot(1000, self.check_immediate_entry_on_startup)
