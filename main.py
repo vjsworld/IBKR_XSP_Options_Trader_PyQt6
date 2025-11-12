@@ -11431,11 +11431,27 @@ class MainWindow(QMainWindow):
             if direction == 1:  # LONG: Buy CALL
                 right = 'C'
                 position_type = "CALL"
+                opposite_right = 'P'
+                opposite_type = "PUT"
             else:  # direction == 2, SHORT: Buy PUT
                 right = 'P'
                 position_type = "PUT"
+                opposite_right = 'C'
+                opposite_type = "CALL"
             
-            # ⚠️ CRASH RECOVERY CHECK #1: Check for existing Strategy positions of this type
+            # ⚠️ CRASH RECOVERY CHECK #1: Check for existing Strategy positions of OPPOSITE type
+            # If we're going LONG but have a Strategy PUT, close it first
+            # If we're going SHORT but have a Strategy CALL, close it first
+            opposite_positions = self._get_strategy_positions_by_type(opposite_right)
+            if opposite_positions:
+                logger.info(f"🔄 CRASH RECOVERY: Found {len(opposite_positions)} Strategy {opposite_type} position(s) - closing before entering {position_type}")
+                for contract_key in opposite_positions:
+                    pos = self.positions[contract_key]
+                    logger.info(f"   Closing opposite position: {contract_key}, Qty={pos.get('position', 0)}")
+                    self.close_position_by_key(contract_key)
+                self.log_message(f"🔄 Closed opposite Strategy {opposite_type} position(s) (crash recovery)", "INFO")
+            
+            # ⚠️ CRASH RECOVERY CHECK #2: Check for existing Strategy positions of SAME type
             # This prevents duplicate entries after app restart when TS is still LONG/SHORT
             strategy_positions = self._get_strategy_positions_by_type(right)
             if strategy_positions:
@@ -11449,14 +11465,14 @@ class MainWindow(QMainWindow):
                 self._last_automated_entry_direction = direction
                 return
             
-            # ⚠️ CRITICAL SAFETY CHECK #2: Prevent duplicate orders FOR THIS DIRECTION
+            # ⚠️ CRITICAL SAFETY CHECK #3: Prevent duplicate orders FOR THIS DIRECTION
             # Check if we already have an open position or pending order for this specific direction
             if hasattr(self, '_last_automated_entry_direction'):
                 if self._last_automated_entry_direction == direction:
                     logger.info(f"⛔ SAFETY: Already have {direction} position/order - skipping duplicate entry")
                     return
             
-            # ⚠️ SAFETY CHECK #3: Check if we have any open positions OF THIS TYPE (call or put)
+            # ⚠️ SAFETY CHECK #4: Check if we have any open positions OF THIS TYPE (call or put)
             # This catches ANY positions (Strategy or Manual) to prevent overlapping trades
             if self.positions:
                 # Count positions of the same type (call/put) we're trying to enter
@@ -11473,7 +11489,7 @@ class MainWindow(QMainWindow):
                     self.log_message(f"⚠️ Already have {position_type} position open - entry blocked", "WARNING")
                     return
             
-            # ⚠️ SAFETY CHECK #4: Check if we have any AUTOMATED pending orders OF THIS TYPE (call or put)
+            # ⚠️ SAFETY CHECK #5: Check if we have any AUTOMATED pending orders OF THIS TYPE (call or put)
             # CRITICAL: Only block on automated orders, not manual orders
             if self.pending_orders:
                 # Count pending AUTOMATED entry orders (BUY orders) of the same type
