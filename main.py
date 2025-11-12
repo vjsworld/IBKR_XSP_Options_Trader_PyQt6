@@ -13049,7 +13049,8 @@ class MainWindow(QMainWindow):
                 positions_data[contract_key] = {
                     'position': pos['position'],
                     'avgCost': pos['avgCost'],
-                    'entryTime': pos.get('entryTime', datetime.now()).isoformat()
+                    'entryTime': pos.get('entryTime', datetime.now()).isoformat(),
+                    'is_automated': pos.get('is_automated', False)  # Preserve Strategy/Manual source
                 }
             
             positions_file = self.get_environment_file_path('positions.json')
@@ -13077,7 +13078,8 @@ class MainWindow(QMainWindow):
                     self.saved_positions[contract_key] = {
                         'position': pos_data['position'],
                         'avgCost': pos_data['avgCost'],
-                        'entryTime': entry_time
+                        'entryTime': entry_time,
+                        'is_automated': pos_data.get('is_automated', False)  # Restore Strategy/Manual source
                     }
                 
                 logger.debug(f"Saved positions loaded: {list(self.saved_positions.keys())}")
@@ -13093,9 +13095,11 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'saved_positions') and contract_key in self.saved_positions:
             saved_pos = self.saved_positions[contract_key]
             if contract_key in self.positions:
-                # Preserve entryTime from saved data
+                # Preserve entryTime and is_automated from saved data
                 self.positions[contract_key]['entryTime'] = saved_pos['entryTime']
-                logger.info(f"Restored entryTime for {contract_key}: {saved_pos['entryTime'].strftime('%Y-%m-%d %H:%M:%S')}")
+                self.positions[contract_key]['is_automated'] = saved_pos.get('is_automated', False)
+                source = 'Strategy' if saved_pos.get('is_automated', False) else 'Manual'
+                logger.info(f"Restored {contract_key}: entryTime={saved_pos['entryTime'].strftime('%Y-%m-%d %H:%M:%S')}, Source={source}")
     
     # ========================================================================
     # WINDOW LIFECYCLE
