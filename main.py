@@ -728,6 +728,23 @@ class IBKRWrapper(EWrapper):
         logger.info(f"   Action: {order.action} {order.totalQuantity}")
         logger.info(f"   OrderRef (Source): {order.orderRef}")
         logger.info(f"   OrderState status: {orderState.status}")
+        
+        # CRITICAL: Sync is_automated flag from orderRef to pending_orders
+        # This ensures the flag is correct even if there were any issues during order placement
+        if self._main_window and hasattr(self._main_window, 'pending_orders'):
+            if orderId in self._main_window.pending_orders:
+                # Read is_automated from orderRef (the authoritative source)
+                is_automated_from_ref = (order.orderRef == "STRATEGY")
+                current_flag = self._main_window.pending_orders[orderId].get('is_automated', False)
+                
+                # Update if they don't match
+                if is_automated_from_ref != current_flag:
+                    logger.warning(f"⚠️ Order #{orderId}: is_automated mismatch! pending_orders={current_flag}, orderRef={is_automated_from_ref}")
+                    logger.warning(f"   Correcting pending_orders to match orderRef={order.orderRef}")
+                    self._main_window.pending_orders[orderId]['is_automated'] = is_automated_from_ref
+                else:
+                    logger.debug(f"✓ Order #{orderId}: is_automated={is_automated_from_ref} matches orderRef")
+        
         self.signals.connection_message.emit(
             f"✓ TWS received Order #{orderId}: {contract_key} {order.action} {order.totalQuantity} (Status: {orderState.status})",
             "SUCCESS"
@@ -756,9 +773,15 @@ class IBKRWrapper(EWrapper):
                 self._main_window.positions_confirmed_by_ibkr.add(contract_key)
             
             # Check if this position came from an automated order
-            # Look for the most recent order for this contract and check its orderRef tag
+            # CRITICAL: Check persistent mapping first (stores flag before order is deleted)
             is_automated = False
-            if self._main_window and hasattr(self._main_window, 'pending_orders'):
+            if self._main_window and hasattr(self._main_window, '_position_source_map'):
+                if contract_key in self._main_window._position_source_map:
+                    is_automated = self._main_window._position_source_map[contract_key]
+                    logger.info(f"🔵 Position {contract_key}: is_automated={is_automated} from persistent mapping")
+            
+            # Fallback 1: Check pending_orders (for in-flight orders not yet deleted)
+            if not is_automated and self._main_window and hasattr(self._main_window, 'pending_orders'):
                 # Find the most recent BUY order for this contract
                 for order_id, order_info in sorted(self._main_window.pending_orders.items(), reverse=True):
                     if order_info.get('contract_key') == contract_key and order_info.get('action') == 'BUY':
@@ -767,7 +790,7 @@ class IBKRWrapper(EWrapper):
                         logger.debug(f"Position {contract_key}: is_automated={is_automated} from order #{order_id}")
                         break
             
-            # Fallback: check the tracking set (for backwards compatibility)
+            # Fallback 2: check the tracking set (for backwards compatibility)
             if not is_automated and self._main_window and hasattr(self._main_window, '_automated_entry_contracts'):
                 is_automated = contract_key in self._main_window._automated_entry_contracts
                 logger.debug(f"Position {contract_key}: is_automated={is_automated} (fallback from tracking set)")
@@ -1258,18 +1281,6 @@ class TradeStationManager(QObject):
                 self.signals.ts_activity.emit(f"[CLEAR] GlobalDictionary cleared")
         except Exception as e:
             logger.error(f"Error processing clear event: {e}", exc_info=True)
-    
-    def update_status(self, status):
-        """Update Python status in GlobalDictionary
-        NOTE: Cannot be called from main thread - COM marshaling issue.
-        Status updates should be sent via the callback thread."""
-        logger.warning("update_status() called - this method is deprecated due to COM threading")
-    
-    def send_trade_confirmation(self, signal_id, result):
-        """Send trade result back to TradeStation
-        NOTE: Cannot be called from main thread - COM marshaling issue.
-        Confirmations are sent directly in the callbacks."""
-        logger.warning("send_trade_confirmation() called - this method is deprecated due to COM threading")
     
     def stop(self):
         """Stop the COM message pump and cleanup"""
@@ -2870,9 +2881,10 @@ class PnLWindow(QMainWindow):
                             pnl = float(cell_data.replace('$', '').replace(',', ''))
                             pnl_values.append(pnl)
                             
-                            # Track strategy vs manual
+                            # Track strategy vs manual (handle combined sources like "Strategy/Manual")
                             source = row_data.get('Source', 'Manual')
-                            if source == 'Strategy':
+                            # Count as Strategy if entry was Strategy (even if exit was Manual)
+                            if 'Strategy' in source:
                                 strategy_pnls.append(pnl)
                             else:
                                 manual_pnls.append(pnl)
@@ -2884,12 +2896,15 @@ class PnLWindow(QMainWindow):
                         except:
                             pass
                     
-                    # Color code Source column
+                    # Color code Source column (handle combined sources)
                     if header == 'Source':
-                        if cell_data == 'Strategy':
-                            item.setForeground(QColor("#4CAF50"))
-                        elif cell_data == 'Manual':
-                            item.setForeground(QColor("#FF9800"))
+                        if 'Strategy' in cell_data and 'Manual' in cell_data:
+                            # Mixed: Strategy entry, Manual exit or vice versa
+                            item.setForeground(QColor("#FFA726"))  # Orange-ish for mixed
+                        elif 'Strategy' in cell_data:
+                            item.setForeground(QColor("#4CAF50"))  # Green for Strategy
+                        elif 'Manual' in cell_data:
+                            item.setForeground(QColor("#FF9800"))  # Orange for Manual
                     
                     self.table.setItem(row_idx, col_idx, item)
             
@@ -3040,6 +3055,7 @@ class MainWindow(QMainWindow):
         self.positions = {}  # contract_key -> position_data
         self.saved_positions = {}  # Loaded from positions.json for entryTime persistence
         self.positions_confirmed_by_ibkr = set()  # Track which positions IBKR confirmed (for stale detection)
+        self._position_source_map = {}  # CRITICAL: contract_key -> is_automated (persists after order deletion)
         self.market_data = {}  # contract_key -> market_data
         self.pending_orders = {}  # order_id -> (contract_key, action, quantity)
         self.chasing_orders = {}  # order_id -> chasing_order_info (for all orders with mid-price chasing enabled)
@@ -3170,7 +3186,16 @@ class MainWindow(QMainWindow):
             'ts_0dte': [],
             'ts_1dte': []
         }
+        # CRITICAL: Global subscription tracker to prevent duplicate subscriptions
+        # Format: {contract_key: req_id} where contract_key = "SYMBOL_STRIKE_RIGHT_EXPIRY"
+        # This prevents subscribing to the same contract multiple times across chains or recenters
+        self._subscribed_contracts = {}
+        # CRITICAL: Reference counting for shared subscriptions
+        # Format: {req_id: set(chain_types)} tracks which chains are using each subscription
+        # Prevents canceling a subscription that's still needed by another chain
+        self._subscription_refcount = {}
         logger.info("✓ Request ID tracking initialized (ranges: main=1000-1999, ts_0dte=2000-2999, ts_1dte=3000-3999)")
+        logger.info("✓ Global subscription tracker initialized (_subscribed_contracts + _subscription_refcount)")
         
         # Strategy parameters - reduced strikes for efficient auto-load under 100 data line limit
         self.strikes_above = 10  # Reduced from 20 to 10 for streamlined chain loading
@@ -3480,6 +3505,36 @@ class MainWindow(QMainWindow):
             csv_file = self.get_environment_file_path('trade_log.csv')
             file_exists = Path(csv_file).exists()
             
+            # CRITICAL: Check if existing file needs Source column migration
+            if file_exists:
+                with open(csv_file, 'r', encoding='utf-8') as f:
+                    first_line = f.readline().strip()
+                    # Check if header has Source column
+                    if 'Source' not in first_line:
+                        logger.info(f"📝 Migrating {csv_file} to add Source column...")
+                        # Read all existing data
+                        f.seek(0)
+                        reader = csv.DictReader(f)
+                        existing_rows = list(reader)
+                        
+                        # Rewrite file with new header and Source column
+                        with open(csv_file, 'w', newline='', encoding='utf-8') as fw:
+                            writer = csv.writer(fw)
+                            writer.writerow(['DateTime', 'OrderID', 'Action', 'Side', 'Qty', 'AvgFillPrc', 'Source'])
+                            
+                            # Write existing rows with 'Manual' as default source
+                            for row in existing_rows:
+                                writer.writerow([
+                                    row.get('DateTime', ''),
+                                    row.get('OrderID', ''),
+                                    row.get('Action', ''),
+                                    row.get('Side', ''),
+                                    row.get('Qty', ''),
+                                    row.get('AvgFillPrc', ''),
+                                    'Manual'  # Default for old entries
+                                ])
+                        logger.info(f"✅ Migration complete: {len(existing_rows)} rows updated")
+            
             # Get Central Time
             ct_tz = pytz.timezone('America/Chicago')
             now_ct = datetime.now(ct_tz)
@@ -3499,7 +3554,7 @@ class MainWindow(QMainWindow):
             with open(csv_file, 'a', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
                 
-                # Write header if file is new
+                # Write header if file is new (only happens if file didn't exist before)
                 if not file_exists:
                     writer.writerow(['DateTime', 'OrderID', 'Action', 'Side', 'Qty', 'AvgFillPrc', 'Source'])
                 
@@ -3532,7 +3587,8 @@ class MainWindow(QMainWindow):
             exit_price = exit_data.get('avg_price', 0)
             
             # P&L calculation (for options, multiplier is typically 100)
-            multiplier = self.instrument.get('multiplier', 100)
+            # CRITICAL: Convert multiplier to int (stored as string in config)
+            multiplier = int(self.instrument.get('multiplier', 100))
             
             if entry_data.get('action') == 'BUY':
                 # Bought then sold
@@ -3543,8 +3599,11 @@ class MainWindow(QMainWindow):
                 pnl_dollars = (entry_price - exit_price) * entry_qty * multiplier
                 pnl_percent = ((entry_price - exit_price) / entry_price * 100) if entry_price > 0 else 0
             
-            # Determine source
-            source = 'Strategy' if entry_data.get('is_automated', False) else 'Manual'
+            # Determine source for both entry and exit
+            entry_source = 'Strategy' if entry_data.get('is_automated', False) else 'Manual'
+            exit_source = 'Strategy' if exit_data.get('is_automated', False) else 'Manual'
+            # Combined source for display (e.g., "Strategy/Manual" when entry was automated but exit was manual)
+            combined_source = f"{entry_source}/{exit_source}" if entry_source != exit_source else entry_source
             
             with open(csv_file, 'a', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
@@ -3554,7 +3613,7 @@ class MainWindow(QMainWindow):
                     writer.writerow([
                         'EntryDateTime', 'EntryAction', 'EntrySide', 'EntryQty', 'EntryAvgFillPrc',
                         'ExitDateTime', 'ExitAction', 'ExitSide', 'ExitQty', 'ExitAvgFillPrc',
-                        'TradePnL$', 'TradePnL%', 'Source'
+                        'TradePnL$', 'TradePnL%', 'EntrySource', 'ExitSource', 'Source'
                     ])
                 
                 # Write P&L data
@@ -3571,10 +3630,12 @@ class MainWindow(QMainWindow):
                     f"{exit_price:.2f}",
                     f"{pnl_dollars:.2f}",
                     f"{pnl_percent:.2f}",
-                    source
+                    entry_source,
+                    exit_source,
+                    combined_source
                 ])
             
-            logger.info(f"💰 P&L logged to {csv_file}: {side} - ${pnl_dollars:.2f} ({pnl_percent:.2f}%)")
+            logger.info(f"💰 P&L logged to {csv_file}: {side} - ${pnl_dollars:.2f} ({pnl_percent:.2f}%) [{combined_source}]")
             
         except Exception as e:
             logger.error(f"Error logging P&L to CSV: {e}", exc_info=True)
@@ -3745,6 +3806,81 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
         layout.setContentsMargins(5, 5, 5, 5)
+        
+        # Global button toolbar (above tabs)
+        global_toolbar = QWidget()
+        global_toolbar_layout = QHBoxLayout(global_toolbar)
+        global_toolbar_layout.setContentsMargins(5, 5, 5, 5)
+        
+        global_toolbar_layout.addStretch()
+        
+        # Show Charts button
+        self.show_charts_btn = QPushButton("Show Charts")
+        self.show_charts_btn.clicked.connect(self.toggle_chart_window)
+        self.show_charts_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                font-weight: bold;
+                font-size: 10pt;
+                padding: 5px 15px;
+                border: none;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+            QPushButton:pressed {
+                background-color: #3d8b40;
+            }
+        """)
+        global_toolbar_layout.addWidget(self.show_charts_btn)
+        
+        # Show TradeLog button
+        self.show_tradelog_btn = QPushButton("Show TradeLog")
+        self.show_tradelog_btn.clicked.connect(self.show_tradelog_window)
+        self.show_tradelog_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2196F3;
+                color: white;
+                font-weight: bold;
+                font-size: 10pt;
+                padding: 5px 15px;
+                border: none;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #1976D2;
+            }
+            QPushButton:pressed {
+                background-color: #0D47A1;
+            }
+        """)
+        global_toolbar_layout.addWidget(self.show_tradelog_btn)
+        
+        # Show PnL button
+        self.show_pnl_btn = QPushButton("Show PnL")
+        self.show_pnl_btn.clicked.connect(self.show_pnl_window)
+        self.show_pnl_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #FF9800;
+                color: white;
+                font-weight: bold;
+                font-size: 10pt;
+                padding: 5px 15px;
+                border: none;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #F57C00;
+            }
+            QPushButton:pressed {
+                background-color: #E65100;
+            }
+        """)
+        global_toolbar_layout.addWidget(self.show_pnl_btn)
+        
+        layout.addWidget(global_toolbar)
         
         # Tab widget
         self.tabs = QTabWidget()
@@ -4777,72 +4913,6 @@ class MainWindow(QMainWindow):
         
         header_layout.addStretch()
         
-        # Show Charts button (before Expiration controls)
-        self.show_charts_btn = QPushButton("Show Charts")
-        self.show_charts_btn.clicked.connect(self.toggle_chart_window)
-        self.show_charts_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #4CAF50;
-                color: white;
-                font-weight: bold;
-                font-size: 10pt;
-                padding: 5px 15px;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #45a049;
-            }
-            QPushButton:pressed {
-                background-color: #3d8b40;
-            }
-        """)
-        header_layout.addWidget(self.show_charts_btn)
-        
-        # Show TradeLog button
-        self.show_tradelog_btn = QPushButton("Show TradeLog")
-        self.show_tradelog_btn.clicked.connect(self.show_tradelog_window)
-        self.show_tradelog_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #2196F3;
-                color: white;
-                font-weight: bold;
-                font-size: 10pt;
-                padding: 5px 15px;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #1976D2;
-            }
-            QPushButton:pressed {
-                background-color: #0D47A1;
-            }
-        """)
-        header_layout.addWidget(self.show_tradelog_btn)
-        
-        # Show PnL button
-        self.show_pnl_btn = QPushButton("Show PnL")
-        self.show_pnl_btn.clicked.connect(self.show_pnl_window)
-        self.show_pnl_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #FF9800;
-                color: white;
-                font-weight: bold;
-                font-size: 10pt;
-                padding: 5px 15px;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #F57C00;
-            }
-            QPushButton:pressed {
-                background-color: #E65100;
-            }
-        """)
-        header_layout.addWidget(self.show_pnl_btn)
-        
         # Add spacing before Expiration label
         header_layout.addSpacing(20)
         
@@ -4953,6 +5023,7 @@ class MainWindow(QMainWindow):
         self.positions_table.cellClicked.connect(self.on_position_cell_clicked)
         # Set Contract column width (increased by 20px for full contract_key visibility)
         self.positions_table.setColumnWidth(0, 170)  # Contract column
+        self.positions_table.setColumnWidth(10, 60)  # Source column - narrower to fit without scrollbar
         # Reduce row height by 25%
         self.positions_table.setStyleSheet("""
             QTableWidget::item { 
@@ -4978,6 +5049,7 @@ class MainWindow(QMainWindow):
         self.orders_table.cellClicked.connect(self.on_order_cell_clicked)
         # Set Contract column width (increased by 20px for full contract_key visibility)
         self.orders_table.setColumnWidth(1, 170)  # Contract column
+        self.orders_table.setColumnWidth(6, 60)  # Source column - narrower to fit without scrollbar
         # Reduce row height by 25%
         self.orders_table.setStyleSheet("""
             QTableWidget::item { 
@@ -6258,15 +6330,41 @@ class MainWindow(QMainWindow):
         
         req_ids = self.active_req_ids[chain_type]
         if req_ids:
-            logger.info(f"Canceling {len(req_ids)} subscriptions for {chain_type} chain")
+            logger.info(f"Canceling subscriptions for {chain_type} chain ({len(req_ids)} req_ids)")
+            actually_canceled = 0
             for req_id in req_ids:
                 try:
-                    self.ibkr_client.cancelMktData(req_id)
-                    # Remove from market_data_map
-                    if req_id in self.app_state.get('market_data_map', {}):
-                        del self.app_state['market_data_map'][req_id]
+                    # CRITICAL: Check if other chains are still using this subscription
+                    if req_id in self._subscription_refcount:
+                        # Remove this chain from the ref count
+                        self._subscription_refcount[req_id].discard(chain_type)
+                        
+                        # Only cancel if no chains are using it anymore
+                        if len(self._subscription_refcount[req_id]) == 0:
+                            self.ibkr_client.cancelMktData(req_id)
+                            del self._subscription_refcount[req_id]
+                            actually_canceled += 1
+                            
+                            # Remove from market_data_map and subscription tracker
+                            if req_id in self.app_state.get('market_data_map', {}):
+                                contract_key = self.app_state['market_data_map'][req_id]
+                                del self.app_state['market_data_map'][req_id]
+                                if contract_key in self._subscribed_contracts:
+                                    del self._subscribed_contracts[contract_key]
+                                    logger.debug(f"Removed {contract_key} (reqId={req_id}) - no longer used")
+                        else:
+                            # Still used by other chains
+                            remaining_chains = ', '.join(self._subscription_refcount[req_id])
+                            logger.debug(f"Keeping reqId={req_id} - still used by: {remaining_chains}")
+                    else:
+                        # No ref count entry - shouldn't happen but cancel anyway
+                        logger.warning(f"reqId={req_id} has no ref count entry - canceling anyway")
+                        self.ibkr_client.cancelMktData(req_id)
+                        actually_canceled += 1
                 except Exception as e:
                     logger.debug(f"Error canceling reqId {req_id}: {e}")
+            
+            logger.info(f"  Actually canceled: {actually_canceled}, kept (shared): {len(req_ids) - actually_canceled}")
             self.active_req_ids[chain_type] = []
 
     def calculate_atm_strike(self) -> float:
@@ -6458,6 +6556,7 @@ class MainWindow(QMainWindow):
         
         # Subscribe to each strike
         new_req_ids = []
+        skipped_count = 0
         
         for row, strike in enumerate(strikes):
             # CRITICAL: IB API CONVENTION - Strikes MUST be FLOAT type
@@ -6465,33 +6564,75 @@ class MainWindow(QMainWindow):
             # Never convert to int - this causes contract key mismatches and data overwriting
             # IBKR sends strikes as floats (684.0, 685.0, etc.), so our keys must match exactly
             
-            # Call option - USE INSTRUMENT-AWARE CONTRACT BUILDER
-            call_contract = self.create_instrument_option_contract(
-                strike=strike,
-                right='C',
-                expiry=expiry
-            )
-            
-            call_req_id = self.get_next_request_id(chain_type)
+            # Call option - CHECK IF ALREADY SUBSCRIBED
             call_key = f"{symbol}_{strike}_C_{expiry}"  # Keep strike as FLOAT
             
-            self.app_state['market_data_map'][call_req_id] = call_key
-            self.ibkr_client.reqMktData(call_req_id, call_contract, "", False, False, [])
-            new_req_ids.append(call_req_id)
+            if call_key in self._subscribed_contracts:
+                # Already subscribed - reuse existing req_id
+                existing_req_id = self._subscribed_contracts[call_key]
+                new_req_ids.append(existing_req_id)
+                skipped_count += 1
+                
+                # CRITICAL: Add this chain to the reference count for shared subscription
+                if existing_req_id not in self._subscription_refcount:
+                    self._subscription_refcount[existing_req_id] = set()
+                self._subscription_refcount[existing_req_id].add(chain_type)
+                
+                logger.debug(f"Reusing {call_key} - reqId={existing_req_id} (used by: {', '.join(self._subscription_refcount[existing_req_id])})")
+            else:
+                # New subscription needed
+                call_contract = self.create_instrument_option_contract(
+                    strike=strike,
+                    right='C',
+                    expiry=expiry
+                )
+                
+                call_req_id = self.get_next_request_id(chain_type)
+                
+                self.app_state['market_data_map'][call_req_id] = call_key
+                self._subscribed_contracts[call_key] = call_req_id
+                
+                # CRITICAL: Initialize reference count for new subscription
+                self._subscription_refcount[call_req_id] = {chain_type}
+                
+                self.ibkr_client.reqMktData(call_req_id, call_contract, "", False, False, [])
+                new_req_ids.append(call_req_id)
+                logger.debug(f"New subscription: {call_key} with reqId={call_req_id}")
             
-            # Put option - USE INSTRUMENT-AWARE CONTRACT BUILDER
-            put_contract = self.create_instrument_option_contract(
-                strike=strike,
-                right='P',
-                expiry=expiry
-            )
-            
-            put_req_id = self.get_next_request_id(chain_type)
+            # Put option - CHECK IF ALREADY SUBSCRIBED
             put_key = f"{symbol}_{strike}_P_{expiry}"  # Keep strike as FLOAT
             
-            self.app_state['market_data_map'][put_req_id] = put_key
-            self.ibkr_client.reqMktData(put_req_id, put_contract, "", False, False, [])
-            new_req_ids.append(put_req_id)
+            if put_key in self._subscribed_contracts:
+                # Already subscribed - reuse existing req_id
+                existing_req_id = self._subscribed_contracts[put_key]
+                new_req_ids.append(existing_req_id)
+                skipped_count += 1
+                
+                # CRITICAL: Add this chain to the reference count for shared subscription
+                if existing_req_id not in self._subscription_refcount:
+                    self._subscription_refcount[existing_req_id] = set()
+                self._subscription_refcount[existing_req_id].add(chain_type)
+                
+                logger.debug(f"Reusing {put_key} - reqId={existing_req_id} (used by: {', '.join(self._subscription_refcount[existing_req_id])})")
+            else:
+                # New subscription needed
+                put_contract = self.create_instrument_option_contract(
+                    strike=strike,
+                    right='P',
+                    expiry=expiry
+                )
+                
+                put_req_id = self.get_next_request_id(chain_type)
+                
+                self.app_state['market_data_map'][put_req_id] = put_key
+                self._subscribed_contracts[put_key] = put_req_id
+                
+                # CRITICAL: Initialize reference count for new subscription
+                self._subscription_refcount[put_req_id] = {chain_type}
+                
+                self.ibkr_client.reqMktData(put_req_id, put_contract, "", False, False, [])
+                new_req_ids.append(put_req_id)
+                logger.debug(f"New subscription: {put_key} with reqId={put_req_id}")
             
             # Set strike in table
             strike_item = QTableWidgetItem(f"{strike:.0f}")
@@ -6524,7 +6665,9 @@ class MainWindow(QMainWindow):
             self.ts_1dte_is_recentering = False
             self.ts_1dte_delta_calibration_done = False  # Allow initial calibration check
         
-        logger.info(f"✓ {chain_type} chain: subscribed to {len(new_req_ids)} contracts ({len(strikes)} strikes × 2)")
+        new_subscriptions = len(new_req_ids) - skipped_count
+        logger.info(f"✓ {chain_type} chain: {new_subscriptions} new subscriptions, {skipped_count} reused ({len(strikes)} strikes × 2)")
+        logger.info(f"  Total subscriptions tracked: {len(self._subscribed_contracts)}")
 
     def monitor_chain_drift(self):
         """
@@ -6972,6 +7115,14 @@ class MainWindow(QMainWindow):
                     # Get is_automated flag
                     is_automated = self.pending_orders[order_id].get('is_automated', False)
                     
+                    # CRITICAL: Store is_automated flag in persistent mapping BEFORE removing order
+                    # This allows position() callback (which fires AFTER this) to read the flag
+                    if action == 'BUY':
+                        if not hasattr(self, '_position_source_map'):
+                            self._position_source_map = {}
+                        self._position_source_map[contract_key] = is_automated
+                        logger.info(f"🔵 STORED is_automated={is_automated} for {contract_key} (Order #{order_id})")
+                    
                     # Log trade to CSV
                     self.log_trade_to_csv(order_id, contract_key, action, qty, avg_fill_price, is_automated)
                     
@@ -7026,7 +7177,8 @@ class MainWindow(QMainWindow):
                                     'order_id': order_id,
                                     'action': action,
                                     'quantity': exit_qty,
-                                    'avg_price': avg_fill_price
+                                    'avg_price': avg_fill_price,
+                                    'is_automated': is_automated  # Track if exit was automated or manual
                                 }
                                 
                                 # Log P&L for this matched pair
@@ -7094,6 +7246,11 @@ class MainWindow(QMainWindow):
         Unsubscribes from market data and removes position from tracking.
         """
         logger.info(f"Handling position close for {contract_key}")
+        
+        # CRITICAL: Clean up persistent source mapping
+        if hasattr(self, '_position_source_map') and contract_key in self._position_source_map:
+            del self._position_source_map[contract_key]
+            logger.info(f"🧹 Cleaned up _position_source_map for closed position: {contract_key}")
         
         # CRITICAL: If closing an automated position, clear the entry tracking flag
         # This allows new automated entries after any position is closed (manual or automated)
@@ -7965,6 +8122,7 @@ class MainWindow(QMainWindow):
         self.ts_positions_table.setMaximumHeight(339)
         self.ts_positions_table.cellClicked.connect(self.on_ts_position_cell_clicked)
         self.ts_positions_table.setColumnWidth(0, 170)  # Contract column
+        self.ts_positions_table.setColumnWidth(10, 60)  # Source column - narrower to fit without scrollbar
         self.ts_positions_table.setStyleSheet("""
             QTableWidget::item { 
                 height: 18px; 
@@ -7988,6 +8146,7 @@ class MainWindow(QMainWindow):
         self.ts_orders_table.setMaximumHeight(339)
         self.ts_orders_table.cellClicked.connect(self.on_ts_order_cell_clicked)
         self.ts_orders_table.setColumnWidth(1, 170)  # Contract column
+        self.ts_orders_table.setColumnWidth(6, 60)  # Source column - narrower to fit without scrollbar
         self.ts_orders_table.setStyleSheet("""
             QTableWidget::item { 
                 height: 18px; 
@@ -8404,26 +8563,37 @@ class MainWindow(QMainWindow):
                         
                         if right == 'C':  # Call options (left side)
                             # Columns: Imp Vol, Delta, Theta, Vega, Gamma, Volume, CHANGE %, Last, Ask, Bid
-                            items = [
-                                QTableWidgetItem(f"{(data.get('iv') or 0):.2f}"),
-                                QTableWidgetItem(f"{(data.get('delta') or 0):.3f}"),
-                                QTableWidgetItem(f"{(data.get('theta') or 0):.2f}"),
-                                QTableWidgetItem(f"{(data.get('vega') or 0):.2f}"),
-                                QTableWidgetItem(f"{(data.get('gamma') or 0):.4f}"),
-                                QTableWidgetItem(f"{int(data.get('volume') or 0)}")
+                            # CRITICAL: Update existing items in-place to prevent flickering
+                            values = [
+                                (0, f"{(data.get('iv') or 0):.2f}"),
+                                (1, f"{(data.get('delta') or 0):.3f}"),
+                                (2, f"{(data.get('theta') or 0):.2f}"),
+                                (3, f"{(data.get('vega') or 0):.2f}"),
+                                (4, f"{(data.get('gamma') or 0):.4f}"),
+                                (5, f"{int(data.get('volume') or 0)}")
                             ]
-                            for col, item in enumerate(items):
-                                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                                self.option_table.setItem(row, col, item)
+                            for col, text in values:
+                                item = self.option_table.item(row, col)
+                                if item:
+                                    item.setText(text)
+                                else:
+                                    item = QTableWidgetItem(text)
+                                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                                    self.option_table.setItem(row, col, item)
                             
                             # Calculate change %
                             last = data.get('last') or 0
                             prev = data.get('prev_close') or 0
                             change_pct = ((last - prev) / prev * 100) if prev > 0 else 0
-                            change_item = QTableWidgetItem(f"{change_pct:.1f}%")
-                            change_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                            change_item.setForeground(QColor("#00ff00" if change_pct >= 0 else "#ff0000"))
-                            self.option_table.setItem(row, 6, change_item)
+                            change_item = self.option_table.item(row, 6)
+                            if change_item:
+                                change_item.setText(f"{change_pct:.1f}%")
+                                change_item.setForeground(QColor("#00ff00" if change_pct >= 0 else "#ff0000"))
+                            else:
+                                change_item = QTableWidgetItem(f"{change_pct:.1f}%")
+                                change_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                                change_item.setForeground(QColor("#00ff00" if change_pct >= 0 else "#ff0000"))
+                                self.option_table.setItem(row, 6, change_item)
                             
                             price_items = [
                                 (7, f"{(last):.2f}"),
@@ -8431,30 +8601,44 @@ class MainWindow(QMainWindow):
                                 (9, f"{(data.get('ask') or 0):.2f}")
                             ]
                             for col, text in price_items:
-                                item = QTableWidgetItem(text)
-                                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                                self.option_table.setItem(row, col, item)
+                                item = self.option_table.item(row, col)
+                                if item:
+                                    item.setText(text)
+                                else:
+                                    item = QTableWidgetItem(text)
+                                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                                    self.option_table.setItem(row, col, item)
                         
                         elif right == 'P':  # Put options (right side)
                             # Columns: Bid, Ask, Last, CHANGE %, Volume, Gamma, Vega, Theta, Delta, Imp Vol
+                            # CRITICAL: Update existing items in-place to prevent flickering
                             price_items = [
                                 (11, f"{(data.get('bid') or 0):.2f}"),
                                 (12, f"{(data.get('ask') or 0):.2f}"),
                                 (13, f"{(data.get('last') or 0):.2f}")
                             ]
                             for col, text in price_items:
-                                item = QTableWidgetItem(text)
-                                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                                self.option_table.setItem(row, col, item)
+                                item = self.option_table.item(row, col)
+                                if item:
+                                    item.setText(text)
+                                else:
+                                    item = QTableWidgetItem(text)
+                                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                                    self.option_table.setItem(row, col, item)
                             
                             # Calculate change %
                             last = data.get('last') or 0
                             prev = data.get('prev_close') or 0
                             change_pct = ((last - prev) / prev * 100) if prev > 0 else 0
-                            change_item = QTableWidgetItem(f"{change_pct:.1f}%")
-                            change_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                            change_item.setForeground(QColor("#00ff00" if change_pct >= 0 else "#ff0000"))
-                            self.option_table.setItem(row, 14, change_item)
+                            change_item = self.option_table.item(row, 14)
+                            if change_item:
+                                change_item.setText(f"{change_pct:.1f}%")
+                                change_item.setForeground(QColor("#00ff00" if change_pct >= 0 else "#ff0000"))
+                            else:
+                                change_item = QTableWidgetItem(f"{change_pct:.1f}%")
+                                change_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                                change_item.setForeground(QColor("#00ff00" if change_pct >= 0 else "#ff0000"))
+                                self.option_table.setItem(row, 14, change_item)
                             
                             # Handle None values gracefully
                             volume = data.get('volume') or 0
@@ -8473,9 +8657,13 @@ class MainWindow(QMainWindow):
                                 (20, f"{iv:.2f}")
                             ]
                             for col, text in greeks_items:
-                                item = QTableWidgetItem(text)
-                                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                                self.option_table.setItem(row, col, item)
+                                item = self.option_table.item(row, col)
+                                if item:
+                                    item.setText(text)
+                                else:
+                                    item = QTableWidgetItem(text)
+                                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                                    self.option_table.setItem(row, col, item)
                         
                         break
         
@@ -10080,7 +10268,7 @@ class MainWindow(QMainWindow):
             
             items = [
                 QTableWidgetItem(contract_key),
-                QTableWidgetItem(f"{pos['position']:.0f}"),
+                QTableWidgetItem(str(int(pos['position']))),  # Convert to int to remove decimals
                 QTableWidgetItem(f"${pos['avgCost']:.2f}"),
                 QTableWidgetItem(f"${pos['currentPrice']:.2f}"),
                 QTableWidgetItem(f"${pnl:.2f}"),
@@ -12236,57 +12424,91 @@ class MainWindow(QMainWindow):
             # Column layout: Call Δ(0), Call Γ(1), Call Bid(2), Call Ask(3), Strike(4), Put Bid(5), Put Ask(6), Put Γ(7), Put Δ(8)
             
             if right == 'C':  # Call option - update CALL columns only (0-3)
+                # CRITICAL: Update existing items in-place to prevent flickering
                 # Call Delta (column 0)
                 delta_val = data.get('delta', 0.0) or 0.0
-                item = QTableWidgetItem(f"{delta_val:.3f}")
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                table_to_update.setItem(row_to_update, 0, item)
+                item = table_to_update.item(row_to_update, 0)
+                if item:
+                    item.setText(f"{delta_val:.3f}")
+                else:
+                    item = QTableWidgetItem(f"{delta_val:.3f}")
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    table_to_update.setItem(row_to_update, 0, item)
                 
                 # Call Gamma (column 1)
                 gamma_val = data.get('gamma', 0.0) or 0.0
-                item = QTableWidgetItem(f"{gamma_val:.4f}")
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                table_to_update.setItem(row_to_update, 1, item)
+                item = table_to_update.item(row_to_update, 1)
+                if item:
+                    item.setText(f"{gamma_val:.4f}")
+                else:
+                    item = QTableWidgetItem(f"{gamma_val:.4f}")
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    table_to_update.setItem(row_to_update, 1, item)
                 
                 # Call Bid (column 2)
                 bid_val = data.get('bid', 0.0) or 0.0
-                item = QTableWidgetItem(f"{bid_val:.2f}")
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                table_to_update.setItem(row_to_update, 2, item)
+                item = table_to_update.item(row_to_update, 2)
+                if item:
+                    item.setText(f"{bid_val:.2f}")
+                else:
+                    item = QTableWidgetItem(f"{bid_val:.2f}")
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    table_to_update.setItem(row_to_update, 2, item)
                 
                 # Call Ask (column 3)
                 ask_val = data.get('ask', 0.0) or 0.0
-                item = QTableWidgetItem(f"{ask_val:.2f}")
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                table_to_update.setItem(row_to_update, 3, item)
+                item = table_to_update.item(row_to_update, 3)
+                if item:
+                    item.setText(f"{ask_val:.2f}")
+                else:
+                    item = QTableWidgetItem(f"{ask_val:.2f}")
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    table_to_update.setItem(row_to_update, 3, item)
                 
                 logger.debug(f"Updated {contract_type} CALL row {row_to_update} strike {strike:.0f}: "
                            f"Δ={delta_val:.3f} Γ={gamma_val:.4f} Bid={bid_val:.2f} Ask={ask_val:.2f}")
                 
             elif right == 'P':  # Put option - update PUT columns only (5-8)
+                # CRITICAL: Update existing items in-place to prevent flickering
                 # Put Bid (column 5)
                 bid_val = data.get('bid', 0.0) or 0.0
-                item = QTableWidgetItem(f"{bid_val:.2f}")
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                table_to_update.setItem(row_to_update, 5, item)
+                item = table_to_update.item(row_to_update, 5)
+                if item:
+                    item.setText(f"{bid_val:.2f}")
+                else:
+                    item = QTableWidgetItem(f"{bid_val:.2f}")
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    table_to_update.setItem(row_to_update, 5, item)
                 
                 # Put Ask (column 6)
                 ask_val = data.get('ask', 0.0) or 0.0
-                item = QTableWidgetItem(f"{ask_val:.2f}")
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                table_to_update.setItem(row_to_update, 6, item)
+                item = table_to_update.item(row_to_update, 6)
+                if item:
+                    item.setText(f"{ask_val:.2f}")
+                else:
+                    item = QTableWidgetItem(f"{ask_val:.2f}")
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    table_to_update.setItem(row_to_update, 6, item)
                 
                 # Put Gamma (column 7)
                 gamma_val = data.get('gamma', 0.0) or 0.0
-                item = QTableWidgetItem(f"{gamma_val:.4f}")
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                table_to_update.setItem(row_to_update, 7, item)
+                item = table_to_update.item(row_to_update, 7)
+                if item:
+                    item.setText(f"{gamma_val:.4f}")
+                else:
+                    item = QTableWidgetItem(f"{gamma_val:.4f}")
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    table_to_update.setItem(row_to_update, 7, item)
                 
                 # Put Delta (column 8)
                 delta_val = data.get('delta', 0.0) or 0.0
-                item = QTableWidgetItem(f"{delta_val:.3f}")
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                table_to_update.setItem(row_to_update, 8, item)
+                item = table_to_update.item(row_to_update, 8)
+                if item:
+                    item.setText(f"{delta_val:.3f}")
+                else:
+                    item = QTableWidgetItem(f"{delta_val:.3f}")
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    table_to_update.setItem(row_to_update, 8, item)
                 
                 logger.debug(f"Updated {contract_type} PUT row {row_to_update} strike {strike:.0f}: "
                            f"Bid={bid_val:.2f} Ask={ask_val:.2f} Γ={gamma_val:.4f} Δ={delta_val:.3f}")
@@ -12299,78 +12521,10 @@ class MainWindow(QMainWindow):
     # Replaced by: Sequential loading system handles all chain recentering
     # ═══════════════════════════════════════════════════════════════════════════
     
-    def update_ts_chain_table(self, contract_type: str):
-        """Update the option chain table for specified contract type"""
-        try:
-            # Select the appropriate table and data
-            if contract_type == "0DTE":
-                table = self.ts_0dte_table
-                expiry = self.ts_0dte_expiry
-            else:  # 1DTE
-                table = self.ts_1dte_table
-                expiry = self.ts_1dte_expiry
-            
-            if not expiry:
-                return
-            
-            # Get all strikes for this expiry from app_state
-            chain_data = {}
-            for contract_key, data in self.app_state.get('option_chain', {}).items():
-                parts = contract_key.split('_')
-                if len(parts) >= 4 and parts[3] == expiry:
-                    strike = float(parts[1])
-                    if strike not in chain_data:
-                        chain_data[strike] = {'call': {}, 'put': {}}
-                    
-                    if parts[2] == 'C':
-                        chain_data[strike]['call'] = data
-                    else:
-                        chain_data[strike]['put'] = data
-            
-            # Sort strikes
-            sorted_strikes = sorted(chain_data.keys(), reverse=True)
-            
-            # Update table
-            table.setRowCount(len(sorted_strikes))
-            
-            for row, strike in enumerate(sorted_strikes):
-                call_data = chain_data[strike]['call']
-                put_data = chain_data[strike]['put']
-                
-                # Column layout: Call Δ, Call Γ, Call Bid, Call Ask, Strike, Put Bid, Put Ask, Put Γ, Put Δ
-                
-                # Call Delta (column 0)
-                table.setItem(row, 0, QTableWidgetItem(f"{call_data.get('delta', 0.0):.3f}"))
-                
-                # Call Gamma (column 1)
-                table.setItem(row, 1, QTableWidgetItem(f"{call_data.get('gamma', 0.0):.4f}"))
-                
-                # Call Bid (column 2)
-                table.setItem(row, 2, QTableWidgetItem(f"{call_data.get('bid', 0.0):.2f}"))
-                
-                # Call Ask (column 3)
-                table.setItem(row, 3, QTableWidgetItem(f"{call_data.get('ask', 0.0):.2f}"))
-                
-                # Strike (column 4 - center)
-                strike_item = QTableWidgetItem(f"{strike:.2f}")
-                strike_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                strike_item.setBackground(QColor(60, 60, 60))  # Highlight strike column
-                table.setItem(row, 4, strike_item)
-                
-                # Put Bid (column 5)
-                table.setItem(row, 5, QTableWidgetItem(f"{put_data.get('bid', 0.0):.2f}"))
-                
-                # Put Ask (column 6)
-                table.setItem(row, 6, QTableWidgetItem(f"{put_data.get('ask', 0.0):.2f}"))
-                
-                # Put Gamma (column 7)
-                table.setItem(row, 7, QTableWidgetItem(f"{put_data.get('gamma', 0.0):.4f}"))
-                
-                # Put Delta (column 8)
-                table.setItem(row, 8, QTableWidgetItem(f"{put_data.get('delta', 0.0):.3f}"))
-            
-        except Exception as e:
-            logger.error(f"Error updating {contract_type} chain table: {e}", exc_info=True)
+    # ═══════════════════════════════════════════════════════════════════════════
+    # DELETED: update_ts_chain_table()
+    # Replaced by: update_ts_chain_cell() for live cell-by-cell updates
+    # ═══════════════════════════════════════════════════════════════════════════
     
     def execute_ts_buy_call(self, symbol: str, quantity: int, contract_type: str, signal_id: str):
         """Execute buy call order from TradeStation signal"""
