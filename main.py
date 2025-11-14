@@ -8139,7 +8139,7 @@ class MainWindow(QMainWindow):
         top_settings_row.addWidget(master_group)
         
         # 7. Profit Targets & Stop Loss
-        risk_mgmt_group = QGroupBox("💰 Risk Management")
+        risk_mgmt_group = QGroupBox("🎯 Targets & Stop")
         risk_mgmt_layout = QVBoxLayout(risk_mgmt_group)
         
         # Position Profit Target
@@ -12398,12 +12398,15 @@ class MainWindow(QMainWindow):
                     # Calculate position value: % of account
                     target_dollar_amount = account_value * (self.ts_percent_of_account / 100.0)
                     # Calculate contracts: target $ / (option price * multiplier)
+                    # Option price is per point, multiplier converts to total contract value
+                    # Example: XSP option at $3.00 with multiplier 100 = $300 per contract
                     option_value_per_contract = mid_price * float(self.instrument['multiplier'])
                     calculated_qty = target_dollar_amount / option_value_per_contract
                     # Round to whole contracts, minimum 1
                     quantity = max(1, int(calculated_qty))
                     logger.info(f"📊 Position sizing: Account=${account_value:.2f}, Target={self.ts_percent_of_account}% (${target_dollar_amount:.2f}), "
-                                f"Option=${mid_price:.2f}, Multiplier={self.instrument['multiplier']}, Calculated={calculated_qty:.2f}, Rounded={quantity}")
+                                f"Option=${mid_price:.2f}/point, Multiplier={self.instrument['multiplier']}, "
+                                f"Value/Contract=${option_value_per_contract:.2f}, Calculated={calculated_qty:.2f}, Rounded={quantity}")
                 else:
                     # Fallback to 1 contract if can't calculate
                     quantity = 1
