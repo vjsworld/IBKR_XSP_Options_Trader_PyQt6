@@ -189,10 +189,11 @@ try:
     QLineEdit, QComboBox, QTextEdit, QSplitter, QFrame, QGridLayout,
     QHeaderView, QMessageBox, QDialog, QFormLayout, QDialogButtonBox,
     QStatusBar, QGroupBox, QSpinBox, QDoubleSpinBox, QRadioButton, QButtonGroup, QScrollArea, QCheckBox,
-    QSizePolicy
+    QSizePolicy, QDateTimeEdit, QTimeEdit
 )
     from PyQt6.QtCore import (  # type: ignore[import-untyped]
-        Qt, QTimer, pyqtSignal, QObject, QThread, pyqtSlot, QMargins, QMetaObject, Q_ARG
+        Qt, QTimer, pyqtSignal, QObject, QThread, pyqtSlot, QMargins, QMetaObject, Q_ARG,
+        QDateTime, QTime
     )
     from PyQt6.QtGui import QColor, QFont, QPalette, QPainter  # type: ignore[import-untyped]
     logger.info("PyQt6 loaded successfully")
@@ -851,6 +852,24 @@ class IBKRWrapper(EWrapper):
             logger.info(f"Position closed: {contract_key}")
             self.signals.position_closed.emit(contract_key)
             self.signals.connection_message.emit(f"Position closed: {contract_key}", "INFO")
+    
+    def accountSummary(self, reqId: int, account: str, tag: str, value: str, currency: str):
+        """
+        Receive account summary values from IBKR.
+        We specifically track NetLiquidation for account balance.
+        """
+        if tag == "NetLiquidation":
+            try:
+                net_liq = float(value)
+                if self._main_window:
+                    self._main_window.net_liquidation = net_liq
+                    logger.debug(f"Account NetLiquidation updated: ${net_liq:.2f}")
+            except ValueError:
+                logger.error(f"Failed to parse NetLiquidation value: {value}")
+    
+    def accountSummaryEnd(self, reqId: int):
+        """Called when account summary data is complete"""
+        logger.debug(f"Account summary complete for reqId={reqId}")
     
     def positionEnd(self):
         """
@@ -2896,6 +2915,17 @@ class PnLWindow(QMainWindow):
                         except:
                             pass
                     
+                    # Color code % column
+                    if header == '%':
+                        try:
+                            pct = float(cell_data.replace('%', '').replace(',', ''))
+                            if pct > 0:
+                                item.setForeground(QColor("#00ff00"))
+                            elif pct < 0:
+                                item.setForeground(QColor("#ff0000"))
+                        except:
+                            pass
+                    
                     # Color code Source column (handle combined sources)
                     if header == 'Source':
                         if 'Strategy' in cell_data and 'Manual' in cell_data:
@@ -3238,6 +3268,11 @@ class MainWindow(QMainWindow):
         self.offset_save_timer.timeout.connect(self.save_offset_to_settings)
         self.offset_save_timer.start(60000)  # Save every 60 seconds
         
+        # TS automation schedule timer (check start/stop datetime every 30 seconds)
+        self.ts_schedule_timer = QTimer()
+        self.ts_schedule_timer.timeout.connect(self.check_ts_schedule)
+        self.ts_schedule_timer.start(30000)  # Check every 30 seconds
+        
         # Manual trading settings - Chase give-in logic (time-based tick progression)
         self.chase_give_in_interval = 3.0  # Seconds between give-in adjustments (will be loaded from settings)
         self.min_order_modification_interval = 2.0  # HARD LIMIT: IB compliance - never modify order faster than 2 seconds
@@ -3275,6 +3310,31 @@ class MainWindow(QMainWindow):
         self.ts_current_auto_position_contract = None  # Track current automated position contract
         self.ts_automation_initialized = False  # Track if automation has been initialized
         self.ts_use_pure_0dte = False  # Default: Hybrid strategy (0DTE→1DTE at 11am)
+        
+        # TradeStation Start/Stop Time Automation (Daily Recurring)
+        self.ts_use_start_time = False  # Enable start time restriction
+        self.ts_start_time = QTime(17, 0, 10)  # Default: 5:00:10 PM
+        self.ts_use_stop_time = False   # Enable stop time restriction
+        self.ts_stop_time = QTime(15, 55, 0)   # Default: 3:55:00 PM
+        self.ts_auto_stopped_by_time = False  # Flag: True if auto-stopped by stop time
+        
+        # TradeStation Profit Targets & Stop Loss
+        self.ts_use_position_profit_target = False  # Enable position % profit target
+        self.ts_position_profit_target_pct = 50.0   # Default: 50% gain on position
+        self.ts_use_account_profit_target = False   # Enable account % profit target
+        self.ts_account_profit_target_pct = 4.0     # Default: 4% gain on account
+        self.ts_use_account_stop_loss = False       # Enable account % stop loss
+        self.ts_account_stop_loss_pct = 2.0         # Default: 2% loss on account
+        self.ts_account_start_balance = 0.0         # Account balance at start of day
+        self.ts_account_current_balance = 0.0       # Current account balance
+        self.ts_profit_target_hit = False           # Flag: True if profit target hit today
+        self.net_liquidation = 0.0                  # NetLiquidation from IBKR account summary
+        
+        # TradeStation Position Sizing
+        self.ts_use_fixed_quantity = True           # True: fixed qty, False: % of account
+        self.ts_fixed_quantity = 1                  # Default: 1 contract
+        self.ts_percent_of_account = 15.0           # Default: 15% of account
+        self.ts_entry_delta = 30                    # Target delta for TS automated entries (default: 30)
         self.vega_positions = {}  # Track vega strategy positions: {trade_id: position_data}
         self.vega_scan_results = []  # Store scanner results
         self.last_vega_scan_time = None  # Last scan timestamp
@@ -3559,7 +3619,7 @@ class MainWindow(QMainWindow):
                     writer.writerow(['DateTime', 'OrderID', 'Action', 'Side', 'Qty', 'AvgFillPrc', 'Source'])
                 
                 # Write trade data
-                writer.writerow([datetime_str, order_id, action, side, quantity, f"{avg_fill_price:.2f}", source])
+                writer.writerow([datetime_str, order_id, action, side, int(quantity), f"{avg_fill_price:.2f}", source])
             
             logger.info(f"📊 Trade logged to {csv_file}: {action} {quantity} {side} @ ${avg_fill_price:.2f}")
             
@@ -3621,12 +3681,12 @@ class MainWindow(QMainWindow):
                     entry_data.get('datetime', ''),
                     entry_data.get('action', ''),
                     side,
-                    entry_qty,
+                    int(entry_qty),
                     f"{entry_price:.2f}",
                     exit_data.get('datetime', ''),
                     exit_data.get('action', ''),
                     side,
-                    exit_qty,
+                    int(exit_qty),
                     f"{exit_price:.2f}",
                     f"{pnl_dollars:.2f}",
                     f"{pnl_percent:.2f}",
@@ -5989,6 +6049,12 @@ class MainWindow(QMainWindow):
             # Initialize after connection
             self.ibkr_client.reqAccountUpdates(True, "")
             self.ibkr_client.reqPositions()  # This will trigger position() callbacks, which auto-subscribe to market data
+            
+            # Request account summary for NetLiquidation (account balance)
+            # reqId=9999 is used for account summary (arbitrary but unique)
+            self.ibkr_client.reqAccountSummary(9999, "All", "NetLiquidation")
+            logger.info("Requested account summary (NetLiquidation)")
+            
             self.subscribe_underlying_price()  # Subscribe to underlying instrument (SPX, XSP, etc.) for display
             self.subscribe_es_price()   # ES for strike calculations (23/6 trading)
             self.subscribe_mes_price()  # MES for vega strategy delta hedging
@@ -6798,6 +6864,61 @@ class MainWindow(QMainWindow):
             # No delta data yet - fallback to simple price-based ATM
             return self.calculate_master_atm_strike()
     
+    def find_strike_by_target_delta(self, expiry: str, right: str, target_delta: float) -> float:
+        """
+        Find the strike with delta closest to the target delta for a given expiry and option type.
+        
+        Args:
+            expiry: Expiry date in YYYYMMDD format
+            right: 'C' for call or 'P' for put
+            target_delta: Target delta as decimal (e.g., 0.30 for 30 delta)
+        
+        Returns:
+            float: Strike price with delta closest to target, or 0 if not found
+        """
+        min_diff = float('inf')
+        best_strike = 0
+        
+        # Search through all option market data for the specified expiry and type
+        for contract_key, data in self.market_data.items():
+            # Filter by expiry and option type
+            if expiry not in contract_key:
+                continue
+            if f'_{right}_' not in contract_key:
+                continue
+            
+            delta = data.get('delta', None)
+            if delta is None or delta == 0:
+                continue
+            
+            # Parse strike from contract_key
+            symbol, strike, right_parsed, expiry_parsed = self.parse_contract_key(contract_key)
+            if strike is None or strike <= 0:
+                continue
+            
+            # For calls: delta should be positive (0 to 1)
+            # For puts: delta should be negative (-1 to 0), use absolute value
+            if right == 'C':
+                if 0 < delta < 1:
+                    diff = abs(delta - target_delta)
+                    if diff < min_diff:
+                        min_diff = diff
+                        best_strike = strike
+            else:  # right == 'P'
+                if -1 < delta < 0:
+                    # Use absolute value of put delta
+                    diff = abs(abs(delta) - target_delta)
+                    if diff < min_diff:
+                        min_diff = diff
+                        best_strike = strike
+        
+        if best_strike > 0:
+            logger.info(f"✅ Found strike {best_strike} with delta closest to {target_delta:.2f} (diff={min_diff:.4f}) for {right} {expiry}")
+        else:
+            logger.warning(f"⚠️ No strike found for target delta {target_delta:.2f} ({right} {expiry})")
+        
+        return best_strike
+    
     def get_es_front_month(self):
         """
         Calculate ES futures front month contract based on CME rollover rules.
@@ -6943,6 +7064,13 @@ class MainWindow(QMainWindow):
     @pyqtSlot(str, str, float)
     def on_market_data_tick(self, contract_key: str, tick_type: str, value: float):
         """Handle market data tick updates"""
+        # CRITICAL: Filter out invalid IBKR placeholder values (-1)
+        # IBKR API returns -1 when data is not available, pending, or during brief disconnections
+        # Displaying -1 causes flickering and confuses users
+        if value == -1:
+            logger.debug(f"Ignoring invalid tick value -1 for {contract_key} {tick_type}")
+            return
+        
         if contract_key not in self.market_data:
             self.market_data[contract_key] = {
                 'bid': 0, 'ask': 0, 'last': 0, 'prev_close': 0, 'volume': 0,
@@ -7807,95 +7935,55 @@ class MainWindow(QMainWindow):
         main_layout.setSpacing(10)
         main_layout.setContentsMargins(10, 10, 10, 10)
         
-        # Top row: Strategy Monitor + Connection Controls
-        top_row = QHBoxLayout()
+        # ================================================================
+        # TOP ROW: All settings controls in horizontal layout
+        # ================================================================
+        top_settings_row = QHBoxLayout()
         
-        # Strategy Monitor Panel
-        monitor_group = QGroupBox("Strategy Monitor")
+        # 1. TradeStation Position Monitor (combined Strategy Monitor + TS Connection)
+        monitor_group = QGroupBox("📊 TradeStation Position Monitor")
         monitor_layout = QGridLayout(monitor_group)
+        monitor_layout.setSpacing(2)
+        monitor_layout.setContentsMargins(4, 4, 4, 4)
         
-        monitor_layout.addWidget(QLabel("Strategy State:"), 0, 0)
+        # Row 0: Strategy State | Position Count
+        monitor_layout.addWidget(QLabel("State:"), 0, 0)
         self.ts_state_label = QLabel("FLAT")
-        self.ts_state_label.setStyleSheet("font-weight: bold; font-size: 14px; color: #FFFF00;")
+        self.ts_state_label.setStyleSheet("font-weight: bold; font-size: 12px; color: #FFFF00;")
         monitor_layout.addWidget(self.ts_state_label, 0, 1)
         
-        monitor_layout.addWidget(QLabel("Position Count:"), 1, 0)
+        monitor_layout.addWidget(QLabel("Pos:"), 0, 2)
         self.ts_position_count_label = QLabel("0")
-        monitor_layout.addWidget(self.ts_position_count_label, 1, 1)
+        monitor_layout.addWidget(self.ts_position_count_label, 0, 3)
         
-        monitor_layout.addWidget(QLabel("Last Signal:"), 2, 0)
+        # Row 1: Last Signal | Active Contract
+        monitor_layout.addWidget(QLabel("Signal:"), 1, 0)
         self.ts_last_signal_label = QLabel("None")
-        monitor_layout.addWidget(self.ts_last_signal_label, 2, 1)
+        monitor_layout.addWidget(self.ts_last_signal_label, 1, 1)
         
-        monitor_layout.addWidget(QLabel("Active Contract:"), 3, 0)
+        monitor_layout.addWidget(QLabel("Contract:"), 1, 2)
         self.ts_active_contract_label = QLabel("0DTE")
-        monitor_layout.addWidget(self.ts_active_contract_label, 3, 1)
+        monitor_layout.addWidget(self.ts_active_contract_label, 1, 3)
         
-        top_row.addWidget(monitor_group)
+        # Row 2: Auto-Connect | Status | Sync button
+        monitor_layout.addWidget(QLabel("Auto-Conn:"), 2, 0)
+        monitor_layout.addWidget(QLabel("ON"), 2, 1)
         
-        # Connection Controls Panel
-        controls_group = QGroupBox("TradeStation Connection")
-        controls_layout = QVBoxLayout(controls_group)
+        self.ts_status_label = QLabel("Disconnected")
+        self.ts_status_label.setStyleSheet("color: #FF6B6B; font-size: 10px;")
+        monitor_layout.addWidget(self.ts_status_label, 2, 2)
         
-        # Connection status (auto-managed - no manual buttons)
-        status_layout = QHBoxLayout()
-        status_layout.addWidget(QLabel("Auto-Connection:"))
-        status_layout.addWidget(QLabel("Enabled"))
-        status_layout.addStretch()
-        
-        self.sync_ts_btn = QPushButton("Sync Strategy")
+        self.sync_ts_btn = QPushButton("Sync")
         self.sync_ts_btn.clicked.connect(self.sync_with_ts_strategy)
         self.sync_ts_btn.setEnabled(False)
-        status_layout.addWidget(self.sync_ts_btn)
+        self.sync_ts_btn.setMaximumHeight(20)
+        monitor_layout.addWidget(self.sync_ts_btn, 2, 3)
         
-        controls_layout.addLayout(status_layout)
+        top_settings_row.addWidget(monitor_group)
         
-        self.ts_status_label = QLabel("Status: Disconnected")
-        self.ts_status_label.setStyleSheet("color: #FF6B6B;")
-        controls_layout.addWidget(self.ts_status_label)
-        
-        top_row.addWidget(controls_group)
-        main_layout.addLayout(top_row)
-        
-        # ================================================================
-        # AUTOMATED TRADING CONTROLS
-        # ================================================================
-        # This section creates the comprehensive automated trading system that responds to 
-        # TradeStation strategy signals. The system includes:
-        #
-        # 1. SIDE SELECTION (Long/Short checkboxes):
-        #    - Controls which trading directions are enabled
-        #    - Must have at least one side enabled to activate auto-trading
-        #    - Each side can be independently enabled/disabled
-        #
-        # 2. ENTRY TIMING STRATEGY (Radio-button style mutual exclusivity):
-        #    - Immediate Join: Enter trades immediately based on current TS strategy state
-        #    - Wait for Next Entry: Only enter on new strategy state changes after FLAT
-        #
-        # 3. MASTER ENABLE/DISABLE:
-        #    - Main toggle that activates the entire automation system
-        #    - Validates that at least one side and one timing option is selected
-        #    - Shows clear visual feedback of system status
-        #
-        # 4. POSITION TRACKING:
-        #    - Shows current automated position information
-        #    - Displays which contract type is currently being traded
-        #
-        # 5. SETTINGS PERSISTENCE:
-        #    - All automation settings are automatically saved to settings JSON
-        #    - Settings are restored when the application starts
-        #    - Uses separate boolean variables (ts_auto_long_enabled, etc.) vs UI widgets
-        # ================================================================
-        
-        auto_trading_group = QGroupBox("🤖 Automated Trading Controls")
-        auto_trading_group.setStyleSheet("QGroupBox { font-weight: bold; color: #4CAF50; }")
-        auto_layout = QVBoxLayout(auto_trading_group)
-        
-        # Row 1: Strategy Side Enablement
-        side_row = QHBoxLayout()
-        side_label = QLabel("Strategy Side Enablement:")
-        side_label.setToolTip("Enable which market directions the automation will trade")
-        side_row.addWidget(side_label)
+        # 2. Side Enablement (Long/Short checkboxes)
+        side_group = QGroupBox("Strategy Sides")
+        side_layout = QVBoxLayout(side_group)
         
         self.ts_auto_long_checkbox = QCheckBox("✅ Long")
         self.ts_auto_long_checkbox.setToolTip(
@@ -7903,7 +7991,7 @@ class MainWindow(QMainWindow):
             "• Entry: Buy call 1 strike above ATM using chase give-in logic\n"
             "• Exit: Sell call immediately when strategy switches to SHORT or FLAT"
         )
-        side_row.addWidget(self.ts_auto_long_checkbox)
+        side_layout.addWidget(self.ts_auto_long_checkbox)
         
         self.ts_auto_short_checkbox = QCheckBox("✅ Short") 
         self.ts_auto_short_checkbox.setToolTip(
@@ -7911,18 +7999,15 @@ class MainWindow(QMainWindow):
             "• Entry: Buy put 1 strike below ATM using chase give-in logic\n"
             "• Exit: Sell put immediately when strategy switches to LONG or FLAT"
         )
-        side_row.addWidget(self.ts_auto_short_checkbox)
+        side_layout.addWidget(self.ts_auto_short_checkbox)
         
-        side_row.addStretch()
-        auto_layout.addLayout(side_row)
+        top_settings_row.addWidget(side_group)
         
-        # Row 2: Entry Timing Strategy
-        timing_row = QHBoxLayout()
-        timing_label = QLabel("Entry Timing Strategy:")
-        timing_label.setToolTip("Control when automation enters trades based on strategy signals")
-        timing_row.addWidget(timing_label)
+        # 3. Entry Timing Strategy
+        timing_group = QGroupBox("Entry Timing")
+        timing_layout = QVBoxLayout(timing_group)
         
-        self.ts_immediate_join_checkbox = QCheckBox("⚡ Immediately Join Side")
+        self.ts_immediate_join_checkbox = QCheckBox("⚡ Immediate Join")
         self.ts_immediate_join_checkbox.setToolTip(
             "IMMEDIATE ENTRY MODE:\n"
             "• On startup: If strategy shows LONG/SHORT, enter trade immediately\n"
@@ -7930,9 +8015,9 @@ class MainWindow(QMainWindow):
             "• Good for joining an existing trend\n"
             "• Risk: May enter at end of a move"
         )
-        timing_row.addWidget(self.ts_immediate_join_checkbox)
+        timing_layout.addWidget(self.ts_immediate_join_checkbox)
         
-        self.ts_wait_for_next_entry_checkbox = QCheckBox("⏳ Wait for Next Entry")
+        self.ts_wait_for_next_entry_checkbox = QCheckBox("⏳ Wait for Entry")
         self.ts_wait_for_next_entry_checkbox.setToolTip(
             "WAIT FOR SIGNAL CHANGE MODE:\n"
             "• On startup: Wait and observe, don't trade current state\n"
@@ -7941,25 +8026,24 @@ class MainWindow(QMainWindow):
             "• Good for catching fresh signals\n"
             "• Lower risk: Avoids stale signals"
         )
-        timing_row.addWidget(self.ts_wait_for_next_entry_checkbox)
+        timing_layout.addWidget(self.ts_wait_for_next_entry_checkbox)
         
-        timing_row.addStretch()
-        auto_layout.addLayout(timing_row)
+        top_settings_row.addWidget(timing_group)
         
-        # Row 3: Contract Type Strategy Selection
-        contract_strategy_row = QHBoxLayout()
-        contract_strategy_row.addWidget(QLabel("Contract Strategy:"))
+        # 4. Contract Strategy
+        contract_group = QGroupBox("Contract Type")
+        contract_layout = QVBoxLayout(contract_group)
         
-        self.ts_pure_0dte_radio = QRadioButton("Pure 0DTE (Always use 0DTE)")
+        self.ts_pure_0dte_radio = QRadioButton("Pure 0DTE")
         self.ts_pure_0dte_radio.setToolTip(
             "Pure 0DTE Strategy:\n"
             "• ALWAYS trade 0DTE contracts regardless of time\n"
             "• Best for aggressive intraday strategies\n"
             "• Maximum theta decay focus"
         )
-        contract_strategy_row.addWidget(self.ts_pure_0dte_radio)
+        contract_layout.addWidget(self.ts_pure_0dte_radio)
         
-        self.ts_hybrid_radio = QRadioButton("Hybrid (0DTE→1DTE at 11am)")
+        self.ts_hybrid_radio = QRadioButton("Hybrid 0DTE→1DTE")
         self.ts_hybrid_radio.setToolTip(
             "Hybrid Strategy (Default):\n"
             "• 0DTE: 7:15 PM - 11:00 AM CT\n"
@@ -7968,14 +8052,62 @@ class MainWindow(QMainWindow):
             "• Better liquidity in final hours"
         )
         self.ts_hybrid_radio.setChecked(True)  # Default to hybrid
-        contract_strategy_row.addWidget(self.ts_hybrid_radio)
+        contract_layout.addWidget(self.ts_hybrid_radio)
         
-        contract_strategy_row.addStretch()
-        auto_layout.addLayout(contract_strategy_row)
+        top_settings_row.addWidget(contract_group)
         
-        # Row 4: Master Enable/Status
-        master_row = QHBoxLayout()
-        self.ts_auto_trading_checkbox = QCheckBox("🚀 MASTER: Enable Automated Trading")
+        # 5. Schedule Automation
+        schedule_group = QGroupBox("⏰ Schedule")
+        schedule_layout = QVBoxLayout(schedule_group)
+        
+        # Start Time Row
+        start_row = QHBoxLayout()
+        self.ts_use_start_checkbox = QCheckBox("▶️ Start:")
+        self.ts_use_start_checkbox.setToolTip(
+            "Enable automatic start at specified time (DAILY)\n"
+            "• When enabled, automation starts at this time every day\n"
+            "• Follows 'Immediately Join' or 'Wait for Entry' settings\n"
+            "• Uses Central Time (America/Chicago)"
+        )
+        start_row.addWidget(self.ts_use_start_checkbox)
+        
+        self.ts_start_time_edit = QTimeEdit()
+        self.ts_start_time_edit.setDisplayFormat("hh:mm:ss AP")
+        self.ts_start_time_edit.setTime(self.ts_start_time)  # Set default 5:00:10 PM
+        self.ts_start_time_edit.setToolTip("Select start time (Central Time) - runs daily at this time")
+        start_row.addWidget(self.ts_start_time_edit)
+        schedule_layout.addLayout(start_row)
+        
+        # Stop Time Row
+        stop_row = QHBoxLayout()
+        self.ts_use_stop_checkbox = QCheckBox("⏹️ Stop:")
+        self.ts_use_stop_checkbox.setToolTip(
+            "Enable automatic stop at specified time (DAILY)\n"
+            "• When enabled, automation stops at this time every day\n"
+            "• If in position, will CLOSE POSITION and stop trading\n"
+            "• Uses Central Time (America/Chicago)"
+        )
+        stop_row.addWidget(self.ts_use_stop_checkbox)
+        
+        self.ts_stop_time_edit = QTimeEdit()
+        self.ts_stop_time_edit.setDisplayFormat("hh:mm:ss AP")
+        self.ts_stop_time_edit.setTime(self.ts_stop_time)  # Set default 3:55:00 PM
+        self.ts_stop_time_edit.setToolTip("Select stop time (Central Time) - runs daily at this time")
+        stop_row.addWidget(self.ts_stop_time_edit)
+        schedule_layout.addLayout(stop_row)
+        
+        # Status indicator for schedule
+        self.ts_schedule_status_label = QLabel("Inactive")
+        self.ts_schedule_status_label.setStyleSheet("color: #9E9E9E; font-style: italic; font-size: 10px;")
+        schedule_layout.addWidget(self.ts_schedule_status_label)
+        
+        top_settings_row.addWidget(schedule_group)
+        
+        # 7. Master Enable/Status
+        master_group = QGroupBox("🚀 Master Control")
+        master_layout = QVBoxLayout(master_group)
+        
+        self.ts_auto_trading_checkbox = QCheckBox("Enable Auto-Trading")
         self.ts_auto_trading_checkbox.setToolTip(
             "MASTER SWITCH: Enables/disables all automated trading\n"
             "• When ON: System will place trades based on strategy signals\n"
@@ -7983,40 +8115,152 @@ class MainWindow(QMainWindow):
             "• Safety: Always check your settings before enabling!"
         )
         self.ts_auto_trading_checkbox.setStyleSheet("QCheckBox { font-weight: bold; color: #FF9800; }")
-        master_row.addWidget(self.ts_auto_trading_checkbox)
-        
-        master_row.addStretch()
+        master_layout.addWidget(self.ts_auto_trading_checkbox)
         
         # Trading Status Indicator
-        self.ts_trading_status = QLabel("Status: 🔴 DISABLED")
+        self.ts_trading_status = QLabel("🔴 DISABLED")
         self.ts_trading_status.setStyleSheet("color: #FF5722; font-weight: bold;")
-        master_row.addWidget(self.ts_trading_status)
+        master_layout.addWidget(self.ts_trading_status)
         
-        auto_layout.addLayout(master_row)
+        # Account Balance Display
+        self.ts_account_balance_label = QLabel("Bal: $0.00")
+        self.ts_account_balance_label.setStyleSheet("font-size: 10px; color: #2196F3;")
+        master_layout.addWidget(self.ts_account_balance_label)
         
-        # Row 5: Current Position Info
-        position_info_row = QHBoxLayout()
-        position_info_row.addWidget(QLabel("Current Auto Position:"))
+        self.ts_account_pnl_label = QLabel("P&L: $0.00 (0.00%)")
+        self.ts_account_pnl_label.setStyleSheet("font-size: 10px; color: #9E9E9E;")
+        master_layout.addWidget(self.ts_account_pnl_label)
         
-        self.ts_current_auto_position_label = QLabel("None")
-        self.ts_current_auto_position_label.setStyleSheet("font-weight: bold; color: #2196F3;")
-        position_info_row.addWidget(self.ts_current_auto_position_label)
+        # Current Position Info
+        self.ts_current_auto_position_label = QLabel("No Position")
+        self.ts_current_auto_position_label.setStyleSheet("font-weight: bold; color: #2196F3; font-size: 10px;")
+        master_layout.addWidget(self.ts_current_auto_position_label)
         
-        position_info_row.addStretch()
-        auto_layout.addLayout(position_info_row)
+        top_settings_row.addWidget(master_group)
         
-        # Add explanatory note
-        note_label = QLabel(
-            "💡 NOTE: Automation uses 'chase give-in' logic (same as manual trading) to improve fill rates. "
-            "Strategy signals come from TradeStation GlobalDictionary. Ensure strategy is running in TS before enabling."
+        # 7. Profit Targets & Stop Loss
+        risk_mgmt_group = QGroupBox("💰 Risk Management")
+        risk_mgmt_layout = QVBoxLayout(risk_mgmt_group)
+        
+        # Position Profit Target
+        pos_target_row = QHBoxLayout()
+        self.ts_use_position_profit_checkbox = QCheckBox("Pos %:")
+        self.ts_use_position_profit_checkbox.setToolTip(
+            "Exit position when profit % reached\n"
+            "• Calculates: (current value - entry cost) / entry cost\n"
+            "• Exits position and disables automation for the day"
         )
-        note_label.setStyleSheet("color: #9E9E9E; font-size: 11px; font-style: italic;")
-        note_label.setWordWrap(True)
-        auto_layout.addWidget(note_label)
+        pos_target_row.addWidget(self.ts_use_position_profit_checkbox)
         
-        main_layout.addWidget(auto_trading_group)
+        self.ts_position_profit_target_spin = QDoubleSpinBox()
+        self.ts_position_profit_target_spin.setRange(1.0, 1000.0)
+        self.ts_position_profit_target_spin.setValue(self.ts_position_profit_target_pct)
+        self.ts_position_profit_target_spin.setSuffix("%")
+        self.ts_position_profit_target_spin.setToolTip("Position profit target percentage")
+        pos_target_row.addWidget(self.ts_position_profit_target_spin)
+        risk_mgmt_layout.addLayout(pos_target_row)
         
-        # Connect checkbox logic (mutual exclusivity for timing)
+        # Account Profit Target
+        acct_target_row = QHBoxLayout()
+        self.ts_use_account_profit_checkbox = QCheckBox("Acct %:")
+        self.ts_use_account_profit_checkbox.setToolTip(
+            "Exit when account profit % reached\n"
+            "• Calculates: (current - start) / start\n"
+            "• Exits all positions and disables automation for the day"
+        )
+        acct_target_row.addWidget(self.ts_use_account_profit_checkbox)
+        
+        self.ts_account_profit_target_spin = QDoubleSpinBox()
+        self.ts_account_profit_target_spin.setRange(0.1, 100.0)
+        self.ts_account_profit_target_spin.setValue(self.ts_account_profit_target_pct)
+        self.ts_account_profit_target_spin.setSuffix("%")
+        self.ts_account_profit_target_spin.setToolTip("Account profit target percentage")
+        acct_target_row.addWidget(self.ts_account_profit_target_spin)
+        risk_mgmt_layout.addLayout(acct_target_row)
+        
+        # Account Stop Loss
+        acct_stop_row = QHBoxLayout()
+        self.ts_use_account_stop_checkbox = QCheckBox("Stop %:")
+        self.ts_use_account_stop_checkbox.setToolTip(
+            "Exit when account loss % reached\n"
+            "• Calculates: (start - current) / start\n"
+            "• Exits all positions and disables automation for the day"
+        )
+        acct_stop_row.addWidget(self.ts_use_account_stop_checkbox)
+        
+        self.ts_account_stop_loss_spin = QDoubleSpinBox()
+        self.ts_account_stop_loss_spin.setRange(0.1, 50.0)
+        self.ts_account_stop_loss_spin.setValue(self.ts_account_stop_loss_pct)
+        self.ts_account_stop_loss_spin.setSuffix("%")
+        self.ts_account_stop_loss_spin.setToolTip("Account stop loss percentage")
+        acct_stop_row.addWidget(self.ts_account_stop_loss_spin)
+        risk_mgmt_layout.addLayout(acct_stop_row)
+        
+        top_settings_row.addWidget(risk_mgmt_group)
+        
+        # 8. Position Sizing
+        position_sizing_group = QGroupBox("📊 Position Sizing")
+        position_sizing_layout = QVBoxLayout(position_sizing_group)
+        
+        # Fixed Quantity Radio
+        fixed_qty_row = QHBoxLayout()
+        self.ts_fixed_qty_radio = QRadioButton("Qty:")
+        self.ts_fixed_qty_radio.setChecked(True)  # Default
+        self.ts_fixed_qty_radio.setToolTip(
+            "Use fixed quantity for all TS automated entries\n"
+            "• Same number of contracts every trade\n"
+            "• Predictable position sizing"
+        )
+        fixed_qty_row.addWidget(self.ts_fixed_qty_radio)
+        
+        self.ts_fixed_qty_spin = QSpinBox()
+        self.ts_fixed_qty_spin.setRange(1, 100)
+        self.ts_fixed_qty_spin.setValue(self.ts_fixed_quantity)
+        self.ts_fixed_qty_spin.setToolTip("Number of contracts per trade")
+        fixed_qty_row.addWidget(self.ts_fixed_qty_spin)
+        position_sizing_layout.addLayout(fixed_qty_row)
+        
+        # Percent of Account Radio
+        pct_account_row = QHBoxLayout()
+        self.ts_pct_account_radio = QRadioButton("Acct %:")
+        self.ts_pct_account_radio.setToolTip(
+            "Calculate quantity based on account balance\n"
+            "• Scales with account size\n"
+            "• Qty = (Account × %) / Option Price"
+        )
+        pct_account_row.addWidget(self.ts_pct_account_radio)
+        
+        self.ts_pct_account_spin = QDoubleSpinBox()
+        self.ts_pct_account_spin.setRange(1.0, 100.0)
+        self.ts_pct_account_spin.setValue(self.ts_percent_of_account)
+        self.ts_pct_account_spin.setSuffix("%")
+        self.ts_pct_account_spin.setToolTip("Percentage of account balance to risk")
+        pct_account_row.addWidget(self.ts_pct_account_spin)
+        position_sizing_layout.addLayout(pct_account_row)
+        
+        # Entry Delta
+        delta_row = QHBoxLayout()
+        delta_label = QLabel("Entry Delta:")
+        delta_label.setToolTip("Target delta for automated option entries")
+        delta_row.addWidget(delta_label)
+        
+        self.ts_entry_delta_spin = QSpinBox()
+        self.ts_entry_delta_spin.setRange(5, 50)
+        self.ts_entry_delta_spin.setValue(self.ts_entry_delta)
+        self.ts_entry_delta_spin.setToolTip(
+            "Target delta for TS automated entries\n"
+            "• 30 = First OTM strike (default)\n"
+            "• Lower delta = Further OTM\n"
+            "• Higher delta = Closer to ATM"
+        )
+        delta_row.addWidget(self.ts_entry_delta_spin)
+        position_sizing_layout.addLayout(delta_row)
+        
+        top_settings_row.addWidget(position_sizing_group)
+        
+        main_layout.addLayout(top_settings_row)
+        
+        # Connect signal handlers
         self.ts_auto_long_checkbox.toggled.connect(self.on_auto_long_toggled)
         self.ts_auto_short_checkbox.toggled.connect(self.on_auto_short_toggled)
         self.ts_immediate_join_checkbox.toggled.connect(self.on_immediate_join_toggled)
@@ -8024,9 +8268,36 @@ class MainWindow(QMainWindow):
         self.ts_auto_trading_checkbox.toggled.connect(self.on_auto_trading_toggled)
         self.ts_pure_0dte_radio.toggled.connect(self.on_contract_strategy_changed)
         self.ts_hybrid_radio.toggled.connect(self.on_contract_strategy_changed)
+        self.ts_use_start_checkbox.toggled.connect(self.on_ts_use_start_toggled)
+        self.ts_use_stop_checkbox.toggled.connect(self.on_ts_use_stop_toggled)
+        self.ts_start_time_edit.timeChanged.connect(self.on_ts_start_time_changed)
+        self.ts_stop_time_edit.timeChanged.connect(self.on_ts_stop_time_changed)
+        
+        # Connect profit targets & stop loss
+        self.ts_use_position_profit_checkbox.toggled.connect(self.on_ts_position_profit_toggled)
+        self.ts_position_profit_target_spin.valueChanged.connect(self.on_ts_position_profit_changed)
+        self.ts_use_account_profit_checkbox.toggled.connect(self.on_ts_account_profit_toggled)
+        self.ts_account_profit_target_spin.valueChanged.connect(self.on_ts_account_profit_changed)
+        self.ts_use_account_stop_checkbox.toggled.connect(self.on_ts_account_stop_toggled)
+        self.ts_account_stop_loss_spin.valueChanged.connect(self.on_ts_account_stop_changed)
+        
+        # Connect position sizing
+        self.ts_fixed_qty_radio.toggled.connect(self.on_ts_position_sizing_changed)
+        self.ts_pct_account_radio.toggled.connect(self.on_ts_position_sizing_changed)
+        self.ts_fixed_qty_spin.valueChanged.connect(self.on_ts_fixed_qty_changed)
+        self.ts_pct_account_spin.valueChanged.connect(self.on_ts_pct_account_changed)
+        self.ts_entry_delta_spin.valueChanged.connect(self.on_ts_entry_delta_changed)
         
         # Load saved settings into UI controls after creating widgets
         self.sync_ts_automation_ui_from_settings()
+        
+        # Explanatory note
+        note_label = QLabel(
+            "💡 Automation uses 'chase give-in' logic for fills. Signals from TradeStation GlobalDictionary."
+        )
+        note_label.setStyleSheet("color: #9E9E9E; font-size: 11px; font-style: italic;")
+        note_label.setWordWrap(True)
+        main_layout.addWidget(note_label)
         
         # Refresh Chains Button
         refresh_layout = QHBoxLayout()
@@ -10313,6 +10584,178 @@ class MainWindow(QMainWindow):
         # Update total cost basis and market value labels
         self.cost_basis_label.setText(f"Total Cost Basis: ${total_cost_basis:.2f}")
         self.mkt_value_label.setText(f"Total Mkt Value: ${total_mkt_value:.2f}")
+        
+        # Check profit targets and stop loss
+        self.check_profit_targets_and_stop_loss()
+    
+    def check_profit_targets_and_stop_loss(self):
+        """
+        Check if profit targets or stop loss have been hit.
+        Called every second from update_positions_display.
+        When target hit: exit all positions and disable automation for the day.
+        """
+        # Skip if already hit target today
+        if self.ts_profit_target_hit:
+            return
+        
+        # Skip if no positions
+        if not self.positions:
+            # Still update display even with no positions
+            self.update_ts_account_display()
+            return
+        
+        # Use NetLiquidation from IBKR if available
+        if self.net_liquidation > 0:
+            self.ts_account_current_balance = self.net_liquidation
+        else:
+            # Fallback: calculate from positions only
+            total_mkt_value = 0
+            for pos in self.positions.values():
+                multiplier = int(self.instrument['multiplier'])
+                market_value = pos['currentPrice'] * abs(pos['position']) * multiplier
+                total_mkt_value += market_value
+            self.ts_account_current_balance = total_mkt_value
+        
+        # Update account balance display
+        self.update_ts_account_display()
+        
+        # Check position profit target (if enabled)
+        if self.ts_use_position_profit_target:
+            for contract_key, pos in self.positions.items():
+                pnl = pos.get('pnl', 0)
+                cost = pos['avgCost'] * abs(pos['position']) * int(self.instrument['multiplier'])
+                if cost > 0:
+                    pnl_pct = (pnl / cost) * 100
+                    if pnl_pct >= self.ts_position_profit_target_pct:
+                        self.log_message(
+                            f"💰 PROFIT TARGET HIT! Position {contract_key} up {pnl_pct:.2f}% "
+                            f"(target: {self.ts_position_profit_target_pct}%)",
+                            "SUCCESS"
+                        )
+                        logger.info(f"Position profit target hit: {contract_key} at {pnl_pct:.2f}%")
+                        self.handle_profit_target_hit(f"Position profit {pnl_pct:.2f}%")
+                        return
+        
+        # Check account profit target (if enabled and have start balance)
+        if self.ts_use_account_profit_target and self.ts_account_start_balance > 0:
+            account_pnl = self.ts_account_current_balance - self.ts_account_start_balance
+            account_pnl_pct = (account_pnl / self.ts_account_start_balance) * 100
+            
+            if account_pnl_pct >= self.ts_account_profit_target_pct:
+                self.log_message(
+                    f"📈 ACCOUNT PROFIT TARGET HIT! Account up {account_pnl_pct:.2f}% "
+                    f"(target: {self.ts_account_profit_target_pct}%)",
+                    "SUCCESS"
+                )
+                logger.info(f"Account profit target hit: {account_pnl_pct:.2f}%")
+                self.handle_profit_target_hit(f"Account profit {account_pnl_pct:.2f}%")
+                return
+        
+        # Check account stop loss (if enabled and have start balance)
+        if self.ts_use_account_stop_loss and self.ts_account_start_balance > 0:
+            account_pnl = self.ts_account_current_balance - self.ts_account_start_balance
+            account_loss_pct = abs(account_pnl / self.ts_account_start_balance) * 100
+            
+            if account_pnl < 0 and account_loss_pct >= self.ts_account_stop_loss_pct:
+                self.log_message(
+                    f"📉 STOP LOSS HIT! Account down {account_loss_pct:.2f}% "
+                    f"(stop: {self.ts_account_stop_loss_pct}%)",
+                    "ERROR"
+                )
+                logger.info(f"Account stop loss hit: {account_loss_pct:.2f}%")
+                self.handle_profit_target_hit(f"Stop loss {account_loss_pct:.2f}%")
+                return
+    
+    def handle_profit_target_hit(self, reason: str):
+        """
+        Handle profit target or stop loss hit:
+        1. Close all positions
+        2. Disable automation for the day
+        3. Set flag to prevent repeated triggers
+        """
+        self.log_message("=" * 60, "INFO")
+        self.log_message(f"🎯 RISK MANAGEMENT TRIGGER: {reason}", "SUCCESS")
+        self.log_message("Closing all positions and disabling automation for the day", "INFO")
+        self.log_message("=" * 60, "INFO")
+        
+        # Close all positions
+        positions_to_close = list(self.positions.keys())
+        for contract_key in positions_to_close:
+            if contract_key in self.positions:
+                pos = self.positions[contract_key]
+                position_size = pos['position']
+                
+                if position_size != 0:
+                    # Determine action
+                    if position_size > 0:
+                        action = "SELL"
+                        qty = int(abs(position_size))
+                    else:
+                        action = "BUY"
+                        qty = int(abs(position_size))
+                    
+                    # Get mid price
+                    mid_price = self.calculate_mid_price(contract_key)
+                    if mid_price == 0:
+                        mid_price = pos['currentPrice']
+                    
+                    self.log_message(f"Closing {contract_key}: {action} {qty} @ ${mid_price:.2f}", "INFO")
+                    self.place_manual_order(contract_key, action, qty, mid_price)
+        
+        # Disable automation
+        if self.ts_auto_trading_checkbox.isChecked():
+            self.ts_auto_trading_checkbox.setChecked(False)
+            self.log_message("✅ Automation disabled", "INFO")
+        
+        # Set flag to prevent repeated triggers today
+        self.ts_profit_target_hit = True
+        
+        self.log_message(f"🎯 Risk management complete: {reason}", "SUCCESS")
+        logger.info(f"Risk management triggered: {reason}")
+    
+    def update_ts_account_display(self):
+        """Update the account balance and P&L display in Risk Management groupbox"""
+        if not hasattr(self, 'ts_account_balance_label'):
+            return
+        
+        # Use NetLiquidation from IBKR if available, otherwise calculate from positions
+        if self.net_liquidation > 0:
+            # Use actual account value from IBKR
+            self.ts_account_current_balance = self.net_liquidation
+        else:
+            # Fallback: calculate from positions only (less accurate)
+            total_mkt_value = 0
+            for pos in self.positions.values():
+                multiplier = int(self.instrument['multiplier'])
+                market_value = pos['currentPrice'] * abs(pos['position']) * multiplier
+                total_mkt_value += market_value
+            self.ts_account_current_balance = total_mkt_value
+        
+        # Update balance label
+        self.ts_account_balance_label.setText(f"Bal: ${self.ts_account_current_balance:.2f}")
+        
+        # Calculate P&L if we have start balance
+        if self.ts_account_start_balance > 0:
+            pnl = self.ts_account_current_balance - self.ts_account_start_balance
+            pnl_pct = (pnl / self.ts_account_start_balance) * 100
+            
+            # Color based on profit/loss
+            if pnl > 0:
+                color = "#4CAF50"  # Green
+                sign = "+"
+            elif pnl < 0:
+                color = "#F44336"  # Red
+                sign = ""
+            else:
+                color = "#9E9E9E"  # Gray
+                sign = ""
+            
+            self.ts_account_pnl_label.setText(f"P&L: {sign}${pnl:.2f} ({sign}{pnl_pct:.2f}%)")
+            self.ts_account_pnl_label.setStyleSheet(f"font-size: 10px; color: {color}; font-weight: bold;")
+        else:
+            # No start balance yet
+            self.ts_account_pnl_label.setText("P&L: $0.00 (0.00%)")
+            self.ts_account_pnl_label.setStyleSheet("font-size: 10px; color: #9E9E9E;")
     
     def on_position_cell_clicked(self, row: int, col: int):
         """
@@ -11138,7 +11581,27 @@ class MainWindow(QMainWindow):
                 'ts_wait_for_next_entry': self.ts_wait_for_next_entry,
                 'ts_last_strategy_state': self.ts_last_strategy_state,
                 'ts_use_pure_0dte': getattr(self, 'ts_use_pure_0dte', False),  # Contract strategy selection
-                'ts_use_pure_0dte': getattr(self, 'ts_use_pure_0dte', False),  # Contract strategy selection
+                
+                # TradeStation Start/Stop Time Settings (Daily Recurring)
+                'ts_use_start_time': self.ts_use_start_time,
+                'ts_start_time': self.ts_start_time.toString('hh:mm:ss'),
+                'ts_use_stop_time': self.ts_use_stop_time,
+                'ts_stop_time': self.ts_stop_time.toString('hh:mm:ss'),
+                
+                # TradeStation Profit Targets & Stop Loss
+                'ts_use_position_profit_target': self.ts_use_position_profit_target,
+                'ts_position_profit_target_pct': self.ts_position_profit_target_pct,
+                'ts_use_account_profit_target': self.ts_use_account_profit_target,
+                'ts_account_profit_target_pct': self.ts_account_profit_target_pct,
+                'ts_use_account_stop_loss': self.ts_use_account_stop_loss,
+                'ts_account_stop_loss_pct': self.ts_account_stop_loss_pct,
+                'ts_account_start_balance': self.ts_account_start_balance,
+                
+                # TradeStation Position Sizing
+                'ts_use_fixed_quantity': self.ts_use_fixed_quantity,
+                'ts_fixed_quantity': self.ts_fixed_quantity,
+                'ts_percent_of_account': self.ts_percent_of_account,
+                'ts_entry_delta': self.ts_entry_delta,
                 
                 # Order Chasing Settings
                 'chase_give_in_interval': self.chase_give_in_interval,
@@ -11373,23 +11836,8 @@ class MainWindow(QMainWindow):
         Args:
             direction: 0=FLAT, 1=LONG, 2=SHORT (per user specification)
         """
-        # NUCLEAR OPTION: Check ACTUAL checkbox state, not just the variable
-        # This prevents any state mismatch between UI and variable
         if not hasattr(self, 'ts_auto_trading_checkbox'):
             logger.debug("Auto-trading checkbox not initialized yet")
-            return
-            
-        is_checkbox_checked = self.ts_auto_trading_checkbox.isChecked()
-        
-        # CRITICAL: Check master switch FIRST before any processing
-        if not is_checkbox_checked:
-            logger.debug(f"Auto-trading CHECKBOX unchecked - ignoring TS signal (direction={direction})")
-            return
-        
-        # Also check the variable for consistency
-        if not self.ts_auto_trading_enabled:
-            logger.warning(f"Auto-trading variable is False but checkbox is checked - MISMATCH!")
-            logger.warning(f"Using checkbox state (checked={is_checkbox_checked})")
             return
         
         # Convert numeric direction to text
@@ -11414,20 +11862,39 @@ class MainWindow(QMainWindow):
         # Check if direction actually changed
         direction_changed = (direction != self.ts_strategy_direction)
         
+        # ⚠️ EARLY RETURN: Ignore duplicate signals (prevents spam)
+        if not direction_changed:
+            return
+        
         # Store current strategy direction
         self.ts_strategy_direction = direction
         
-        # Only update UI and log if direction changed (reduces spam)
-        if direction_changed:
-            # Update strategy state display to show direction
-            self.on_ts_strategy_state_changed(direction_str)
-            
-            # Log the change
-            self.log_message(f"📡 TS Strategy: {previous_direction_str} → {direction_str}", "INFO")
-            logger.info(f"TS Strategy direction changed: {previous_direction_str} ({previous_direction}) → {direction_str} ({direction})")
+        # ALWAYS update UI to show current strategy state (even when automation is OFF)
+        # Update strategy state display to show direction
+        self.on_ts_strategy_state_changed(direction_str)
+        
+        # Log the change
+        self.log_message(f"📡 TS Strategy: {previous_direction_str} → {direction_str}", "INFO")
+        logger.info(f"TS Strategy direction changed: {previous_direction_str} ({previous_direction}) → {direction_str} ({direction})")
         
         # ===== AUTOMATED TRADING LOGIC =====
-        # Execute trades (master switch already checked at top of function)
+        # Only execute trades if automation is enabled
+        is_checkbox_checked = self.ts_auto_trading_checkbox.isChecked()
+        
+        logger.info(f"🔍 AUTOMATION CHECK: Checkbox={is_checkbox_checked}, Variable={self.ts_auto_trading_enabled}")
+        
+        if not is_checkbox_checked:
+            logger.info(f"⛔ Auto-trading DISABLED (checkbox unchecked) - monitoring only (direction={direction_str})")
+            return
+        
+        # Also check the variable for consistency
+        if not self.ts_auto_trading_enabled:
+            logger.warning(f"⚠️ Auto-trading variable is False but checkbox is checked - MISMATCH!")
+            return
+        
+        logger.info(f"✅ Auto-trading ENABLED - executing trades for {direction_str}")
+        
+        # Execute trades (master switch is checked and enabled)
         self.process_strategy_direction_change(direction, previous_direction)
     
     def process_strategy_direction_change(self, new_direction: int, old_direction: int):
@@ -11867,17 +12334,22 @@ class MainWindow(QMainWindow):
                 self.log_message("❌ Cannot enter trade - no ATM strike", "ERROR")
                 return
             
-            # Determine strike and right based on direction
-            strike_increment = self.instrument['strike_increment']
-            
-            if direction == 1:  # LONG: Buy 1st OTM CALL
-                strike = atm_strike + strike_increment  # 1 strike above ATM
+            # Determine strike and right based on direction and target delta
+            if direction == 1:  # LONG: Buy CALL at target delta
                 right = 'C'
                 direction_str = "LONG (Call)"
-            else:  # direction == 2, SHORT: Buy 1st OTM PUT
-                strike = atm_strike - strike_increment  # 1 strike below ATM
+                target_delta = self.ts_entry_delta / 100.0  # Convert to decimal (e.g., 30 -> 0.30)
+            else:  # direction == 2, SHORT: Buy PUT at target delta
                 right = 'P'
                 direction_str = "SHORT (Put)"
+                target_delta = self.ts_entry_delta / 100.0  # Convert to decimal (e.g., 30 -> 0.30)
+            
+            # Find strike closest to target delta
+            strike = self.find_strike_by_target_delta(expiry, right, target_delta)
+            if strike <= 0:
+                logger.error(f"Could not find strike with target delta {self.ts_entry_delta}")
+                self.log_message(f"❌ Cannot find {direction_str} at {self.ts_entry_delta}Δ", "ERROR")
+                return
             
             # CRITICAL: IB API CONVENTION - Strikes MUST remain as FLOAT type
             # Market data keys use FLOAT strikes (e.g., "XSP_686.0_C_20251111")
@@ -11914,8 +12386,28 @@ class MainWindow(QMainWindow):
                 self.log_message(f"❌ Cannot enter {direction_str} - no market data for {contract_key}", "ERROR")
                 return
             
-            # Place entry order
-            quantity = 1  # Buy 1 contract
+            # Calculate position size based on user settings
+            if self.ts_use_fixed_quantity:
+                # Use fixed quantity setting
+                quantity = self.ts_fixed_quantity
+                logger.info(f"📊 Using fixed quantity: {quantity} contracts")
+            else:
+                # Calculate quantity based on % of account
+                account_value = self.ts_account_current_balance
+                if account_value > 0 and mid_price > 0:
+                    # Calculate position value: % of account
+                    target_dollar_amount = account_value * (self.ts_percent_of_account / 100.0)
+                    # Calculate contracts: target $ / (option price * multiplier)
+                    option_value_per_contract = mid_price * float(self.instrument['multiplier'])
+                    calculated_qty = target_dollar_amount / option_value_per_contract
+                    # Round to whole contracts, minimum 1
+                    quantity = max(1, int(calculated_qty))
+                    logger.info(f"📊 Position sizing: Account=${account_value:.2f}, Target={self.ts_percent_of_account}% (${target_dollar_amount:.2f}), "
+                                f"Option=${mid_price:.2f}, Multiplier={self.instrument['multiplier']}, Calculated={calculated_qty:.2f}, Rounded={quantity}")
+                else:
+                    # Fallback to 1 contract if can't calculate
+                    quantity = 1
+                    logger.warning(f"⚠️ Cannot calculate position size (account={account_value}, price={mid_price}), using 1 contract")
             
             order_id = self.place_order(
                 contract_key=contract_key,
@@ -12118,11 +12610,20 @@ class MainWindow(QMainWindow):
             self.ts_wait_for_next_entry_checkbox.setChecked(False)
             self.ts_wait_for_next_entry_checkbox.blockSignals(False)
             
+            self.ts_immediate_join = True
+            self.ts_wait_for_next_entry = False
+            
             self.log_message("✅ Auto-trading mode: IMMEDIATE JOIN - Will enter trades based on current strategy state", "INFO")
-        
-        # Update settings values 
-        self.ts_immediate_join = checked
-        self.ts_wait_for_next_entry = not checked if checked else self.ts_wait_for_next_entry
+        else:
+            # If immediate join is unchecked, check wait for entry (one must be selected)
+            self.ts_wait_for_next_entry_checkbox.blockSignals(True)
+            self.ts_wait_for_next_entry_checkbox.setChecked(True)
+            self.ts_wait_for_next_entry_checkbox.blockSignals(False)
+            
+            self.ts_immediate_join = False
+            self.ts_wait_for_next_entry = True
+            
+            self.log_message("⏳ Auto-trading mode: WAIT FOR NEXT ENTRY - Will wait for strategy signal changes", "INFO")
         
         # Save settings
         self.save_settings()
@@ -12135,11 +12636,20 @@ class MainWindow(QMainWindow):
             self.ts_immediate_join_checkbox.setChecked(False)
             self.ts_immediate_join_checkbox.blockSignals(False)
             
+            self.ts_wait_for_next_entry = True
+            self.ts_immediate_join = False
+            
             self.log_message("⏳ Auto-trading mode: WAIT FOR NEXT ENTRY - Will wait for strategy signal changes", "INFO")
-        
-        # Update settings values
-        self.ts_wait_for_next_entry = checked
-        self.ts_immediate_join = not checked if checked else self.ts_immediate_join
+        else:
+            # If wait for entry is unchecked, check immediate join (one must be selected)
+            self.ts_immediate_join_checkbox.blockSignals(True)
+            self.ts_immediate_join_checkbox.setChecked(True)
+            self.ts_immediate_join_checkbox.blockSignals(False)
+            
+            self.ts_wait_for_next_entry = False
+            self.ts_immediate_join = True
+            
+            self.log_message("✅ Auto-trading mode: IMMEDIATE JOIN - Will enter trades based on current strategy state", "INFO")
         
         # Save settings
         self.save_settings()
@@ -12168,6 +12678,23 @@ class MainWindow(QMainWindow):
             self.ts_trading_status.setText("Status: 🟢 ENABLED")
             self.ts_trading_status.setStyleSheet("color: #4CAF50; font-weight: bold;")
             self.log_message("🚀 AUTOMATED TRADING ENABLED - System will respond to TS strategy signals", "SUCCESS")
+            
+            # Set account start balance for profit/loss tracking
+            # Use NetLiquidation if available, otherwise calculate from positions
+            if self.net_liquidation > 0:
+                start_balance = self.net_liquidation
+            else:
+                total_mkt_value = 0
+                for pos in self.positions.values():
+                    multiplier = int(self.instrument['multiplier'])
+                    market_value = pos['currentPrice'] * abs(pos['position']) * multiplier
+                    total_mkt_value += market_value
+                start_balance = total_mkt_value
+            
+            self.ts_account_start_balance = start_balance
+            self.ts_profit_target_hit = False  # Reset target hit flag
+            self.log_message(f"💼 Account start balance set: ${start_balance:.2f}", "INFO")
+            logger.info(f"Account start balance: ${start_balance:.2f}")
             
             # CRITICAL: Reset first signal flag when enabling automation
             # This ensures immediate join treats it as a fresh start
@@ -12213,6 +12740,261 @@ class MainWindow(QMainWindow):
         # Save settings
         self.save_settings()
         logger.info(f"💾 Settings saved with ts_use_pure_0dte={self.ts_use_pure_0dte}")
+    
+    def on_ts_use_start_toggled(self, checked: bool):
+        """Handle start time checkbox toggle"""
+        self.ts_use_start_time = checked
+        # Don't disable the time edit - allow editing anytime
+        
+        if checked:
+            # Store the time when enabled
+            self.ts_start_time = self.ts_start_time_edit.time()
+            self.log_message(f"⏰ Auto-Start enabled: {self.ts_start_time.toString('hh:mm:ss AP')} CT (daily)", "INFO")
+            logger.info(f"Auto-start enabled at {self.ts_start_time.toString('hh:mm:ss AP')} daily")
+        else:
+            self.log_message("⏰ Auto-Start disabled", "INFO")
+            logger.info("Auto-start disabled")
+        
+        self.update_ts_schedule_status()
+        self.save_settings()
+    
+    def on_ts_use_stop_toggled(self, checked: bool):
+        """Handle stop time checkbox toggle"""
+        self.ts_use_stop_time = checked
+        # Don't disable the time edit - allow editing anytime
+        
+        if checked:
+            # Store the time when enabled
+            self.ts_stop_time = self.ts_stop_time_edit.time()
+            self.log_message(f"⏰ Auto-Stop enabled: {self.ts_stop_time.toString('hh:mm:ss AP')} CT (daily)", "INFO")
+            logger.info(f"Auto-stop enabled at {self.ts_stop_time.toString('hh:mm:ss AP')} daily")
+        else:
+            self.ts_auto_stopped_by_time = False  # Reset flag when disabled
+            self.log_message("⏰ Auto-Stop disabled", "INFO")
+            logger.info("Auto-stop disabled")
+        
+        self.update_ts_schedule_status()
+        self.save_settings()
+    
+    def on_ts_start_time_changed(self, qtime: QTime):
+        """Handle start time picker value change"""
+        self.ts_start_time = qtime
+        if self.ts_use_start_time:
+            self.log_message(f"⏰ Auto-Start time updated: {self.ts_start_time.toString('hh:mm:ss AP')} CT (daily)", "INFO")
+            logger.info(f"Auto-start time changed to {self.ts_start_time.toString('hh:mm:ss AP')}")
+        self.update_ts_schedule_status()
+        self.save_settings()
+    
+    def on_ts_stop_time_changed(self, qtime: QTime):
+        """Handle stop time picker value change"""
+        self.ts_stop_time = qtime
+        self.ts_auto_stopped_by_time = False  # Reset flag when stop time changes
+        if self.ts_use_stop_time:
+            self.log_message(f"⏰ Auto-Stop time updated: {self.ts_stop_time.toString('hh:mm:ss AP')} CT (daily)", "INFO")
+            logger.info(f"Auto-stop time changed to {self.ts_stop_time.toString('hh:mm:ss AP')}")
+        self.update_ts_schedule_status()
+        self.save_settings()
+    
+    def on_ts_position_profit_toggled(self, checked: bool):
+        """Handle position profit target checkbox toggle"""
+        self.ts_use_position_profit_target = checked
+        if checked:
+            self.log_message(f"💰 Position profit target enabled: {self.ts_position_profit_target_pct}%", "INFO")
+            logger.info(f"Position profit target enabled at {self.ts_position_profit_target_pct}%")
+        else:
+            self.log_message("💰 Position profit target disabled", "INFO")
+            logger.info("Position profit target disabled")
+        self.save_settings()
+    
+    def on_ts_position_profit_changed(self, value: float):
+        """Handle position profit target percentage change"""
+        self.ts_position_profit_target_pct = value
+        if self.ts_use_position_profit_target:
+            self.log_message(f"💰 Position profit target updated: {value}%", "INFO")
+            logger.info(f"Position profit target changed to {value}%")
+        self.save_settings()
+    
+    def on_ts_account_profit_toggled(self, checked: bool):
+        """Handle account profit target checkbox toggle"""
+        self.ts_use_account_profit_target = checked
+        if checked:
+            self.log_message(f"📈 Account profit target enabled: {self.ts_account_profit_target_pct}%", "INFO")
+            logger.info(f"Account profit target enabled at {self.ts_account_profit_target_pct}%")
+        else:
+            self.log_message("📈 Account profit target disabled", "INFO")
+            logger.info("Account profit target disabled")
+        self.save_settings()
+    
+    def on_ts_account_profit_changed(self, value: float):
+        """Handle account profit target percentage change"""
+        self.ts_account_profit_target_pct = value
+        if self.ts_use_account_profit_target:
+            self.log_message(f"📈 Account profit target updated: {value}%", "INFO")
+            logger.info(f"Account profit target changed to {value}%")
+        self.save_settings()
+    
+    def on_ts_account_stop_toggled(self, checked: bool):
+        """Handle account stop loss checkbox toggle"""
+        self.ts_use_account_stop_loss = checked
+        if checked:
+            self.log_message(f"📉 Account stop loss enabled: {self.ts_account_stop_loss_pct}%", "INFO")
+            logger.info(f"Account stop loss enabled at {self.ts_account_stop_loss_pct}%")
+        else:
+            self.log_message("📉 Account stop loss disabled", "INFO")
+            logger.info("Account stop loss disabled")
+        self.save_settings()
+    
+    def on_ts_account_stop_changed(self, value: float):
+        """Handle account stop loss percentage change"""
+        self.ts_account_stop_loss_pct = value
+        if self.ts_use_account_stop_loss:
+            self.log_message(f"📉 Account stop loss updated: {value}%", "INFO")
+            logger.info(f"Account stop loss changed to {value}%")
+        self.save_settings()
+    
+    def on_ts_position_sizing_changed(self, checked: bool):
+        """Handle position sizing radio button toggle"""
+        if self.ts_fixed_qty_radio.isChecked():
+            self.ts_use_fixed_quantity = True
+            self.log_message(f"📊 Position sizing: Fixed quantity ({self.ts_fixed_quantity} contracts)", "INFO")
+            logger.info(f"Position sizing changed to fixed quantity: {self.ts_fixed_quantity}")
+        else:
+            self.ts_use_fixed_quantity = False
+            self.log_message(f"📊 Position sizing: {self.ts_percent_of_account}% of account", "INFO")
+            logger.info(f"Position sizing changed to percent of account: {self.ts_percent_of_account}%")
+        self.save_settings()
+    
+    def on_ts_fixed_qty_changed(self, value: int):
+        """Handle fixed quantity spinbox change"""
+        self.ts_fixed_quantity = value
+        if self.ts_use_fixed_quantity:
+            self.log_message(f"📊 Fixed quantity updated: {value} contracts", "INFO")
+            logger.info(f"Fixed quantity changed to {value}")
+        self.save_settings()
+    
+    def on_ts_pct_account_changed(self, value: float):
+        """Handle percent of account spinbox change"""
+        self.ts_percent_of_account = value
+        if not self.ts_use_fixed_quantity:
+            self.log_message(f"📊 Account percentage updated: {value}%", "INFO")
+            logger.info(f"Percent of account changed to {value}%")
+        self.save_settings()
+    
+    def on_ts_entry_delta_changed(self, value: int):
+        """Handle entry delta spinbox change"""
+        self.ts_entry_delta = value
+        self.log_message(f"📊 Entry delta updated: {value}Δ", "INFO")
+        logger.info(f"Entry delta changed to {value}")
+        self.save_settings()
+    
+    def update_ts_schedule_status(self):
+        """Update the schedule status label based on current time settings (daily recurring)"""
+        try:
+            if not hasattr(self, 'ts_schedule_status_label'):
+                return
+            
+            from datetime import datetime as dt_class
+            now = dt_class.now(tz=self.local_tz)
+            current_time = QTime(now.hour, now.minute, now.second)
+            
+            status_parts = []
+            
+            if self.ts_use_start_time:
+                # Calculate time until start (within today)
+                start_secs = self.ts_start_time.hour() * 3600 + self.ts_start_time.minute() * 60 + self.ts_start_time.second()
+                current_secs = current_time.hour() * 3600 + current_time.minute() * 60 + current_time.second()
+                
+                if current_secs < start_secs:
+                    delta_secs = start_secs - current_secs
+                    hours = delta_secs // 3600
+                    minutes = (delta_secs % 3600) // 60
+                    status_parts.append(f"⏳ Starts in {hours}h {minutes}m")
+                else:
+                    status_parts.append(f"✅ Past start time (today)")
+            
+            if self.ts_use_stop_time:
+                # Calculate time until stop (within today)
+                stop_secs = self.ts_stop_time.hour() * 3600 + self.ts_stop_time.minute() * 60 + self.ts_stop_time.second()
+                current_secs = current_time.hour() * 3600 + current_time.minute() * 60 + current_time.second()
+                
+                if current_secs < stop_secs:
+                    delta_secs = stop_secs - current_secs
+                    hours = delta_secs // 3600
+                    minutes = (delta_secs % 3600) // 60
+                    status_parts.append(f"⏱️ Stops in {hours}h {minutes}m")
+                else:
+                    status_parts.append(f"🛑 Past stop time (today)")
+            
+            if status_parts:
+                self.ts_schedule_status_label.setText(f"Schedule (Daily): {' | '.join(status_parts)}")
+                self.ts_schedule_status_label.setStyleSheet("color: #4CAF50; font-style: italic;")
+            else:
+                self.ts_schedule_status_label.setText("Schedule: Inactive")
+                self.ts_schedule_status_label.setStyleSheet("color: #9E9E9E; font-style: italic;")
+                
+        except Exception as e:
+            logger.error(f"Error updating schedule status: {e}", exc_info=True)
+    
+    def check_ts_schedule(self):
+        """
+        Check if we should auto-start or auto-stop TS automation based on time settings.
+        Uses time-only comparison for DAILY recurring automation.
+        Called by timer every 30 seconds.
+        """
+        try:
+            from datetime import datetime as dt_class
+            now = dt_class.now(tz=self.local_tz)
+            current_time = QTime(now.hour, now.minute, now.second)
+            
+            # Check START time (daily recurring)
+            if self.ts_use_start_time:
+                # Compare time only - triggers every day at this time
+                start_secs = self.ts_start_time.hour() * 3600 + self.ts_start_time.minute() * 60 + self.ts_start_time.second()
+                current_secs = current_time.hour() * 3600 + current_time.minute() * 60 + current_time.second()
+                
+                # Within 30-second window of start time and automation is OFF
+                if abs(current_secs - start_secs) <= 30 and not self.ts_auto_trading_enabled:
+                    logger.info(f"⏰ AUTO-START: Current time {now.strftime('%I:%M:%S %p')} matches start time {self.ts_start_time.toString('hh:mm:ss AP')}")
+                    self.log_message(f"⏰ Auto-starting TS automation at {now.strftime('%I:%M %p')} CT", "SUCCESS")
+                    
+                    # Reset the stopped flag for new day
+                    self.ts_auto_stopped_by_time = False
+                    
+                    # Enable automation (will follow join/wait settings)
+                    self.ts_auto_trading_checkbox.blockSignals(True)
+                    self.ts_auto_trading_checkbox.setChecked(True)
+                    self.ts_auto_trading_checkbox.blockSignals(False)
+                    self.on_auto_trading_toggled(True)  # Manually trigger the handler
+            
+            # Check STOP time (daily recurring)
+            if self.ts_use_stop_time:
+                # Compare time only - triggers every day at this time
+                stop_secs = self.ts_stop_time.hour() * 3600 + self.ts_stop_time.minute() * 60 + self.ts_stop_time.second()
+                current_secs = current_time.hour() * 3600 + current_time.minute() * 60 + current_time.second()
+                
+                # Within 30-second window of stop time, automation is ON, and not already stopped today
+                if abs(current_secs - stop_secs) <= 30 and self.ts_auto_trading_enabled and not self.ts_auto_stopped_by_time:
+                    logger.info(f"⏰ AUTO-STOP: Current time {now.strftime('%I:%M:%S %p')} matches stop time {self.ts_stop_time.toString('hh:mm:ss AP')}")
+                    self.log_message(f"⏰ Auto-stopping TS automation at {now.strftime('%I:%M %p')} CT", "WARNING")
+                    
+                    # Exit any open automated positions FIRST (close all regardless of direction)
+                    current_direction = getattr(self, 'ts_strategy_direction', 0)
+                    self._close_automated_positions(current_direction)
+                    
+                    # Disable automation
+                    self.ts_auto_trading_checkbox.blockSignals(True)
+                    self.ts_auto_trading_checkbox.setChecked(False)
+                    self.ts_auto_trading_checkbox.blockSignals(False)
+                    self.on_auto_trading_toggled(False)  # Manually trigger the handler
+                    
+                    # Set flag to prevent repeated stops today (resets at next start time)
+                    self.ts_auto_stopped_by_time = True
+            
+            # Update schedule status display
+            self.update_ts_schedule_status()
+            
+        except Exception as e:
+            logger.error(f"Error checking TS schedule: {e}", exc_info=True)
     
     def check_immediate_entry_on_startup(self):
         """Check if we should immediately enter a trade based on current TS strategy state"""
@@ -12304,6 +13086,19 @@ class MainWindow(QMainWindow):
     def sync_ts_automation_ui_from_settings(self):
         """Sync TradeStation automation UI controls with loaded settings"""
         try:
+            logger.info("===== SYNCING TS AUTOMATION UI FROM SETTINGS =====")
+            logger.info(f"ts_auto_trading_enabled: {self.ts_auto_trading_enabled}")
+            logger.info(f"ts_auto_long_enabled: {self.ts_auto_long_enabled}")
+            logger.info(f"ts_auto_short_enabled: {self.ts_auto_short_enabled}")
+            logger.info(f"ts_immediate_join: {self.ts_immediate_join}")
+            logger.info(f"ts_wait_for_next_entry: {self.ts_wait_for_next_entry}")
+            logger.info(f"ts_use_start_time: {self.ts_use_start_time}")
+            logger.info(f"ts_use_stop_time: {self.ts_use_stop_time}")
+            logger.info(f"ts_use_position_profit_target: {self.ts_use_position_profit_target}")
+            logger.info(f"ts_use_account_profit_target: {self.ts_use_account_profit_target}")
+            logger.info(f"ts_use_account_stop_loss: {self.ts_use_account_stop_loss}")
+            logger.info(f"ts_use_fixed_quantity: {self.ts_use_fixed_quantity}")
+            
             # Block signals while updating to avoid triggering callbacks during setup
             self.ts_auto_long_checkbox.blockSignals(True)
             self.ts_auto_short_checkbox.blockSignals(True)
@@ -12312,6 +13107,21 @@ class MainWindow(QMainWindow):
             self.ts_auto_trading_checkbox.blockSignals(True)
             self.ts_pure_0dte_radio.blockSignals(True)
             self.ts_hybrid_radio.blockSignals(True)
+            self.ts_use_start_checkbox.blockSignals(True)
+            self.ts_use_stop_checkbox.blockSignals(True)
+            self.ts_start_time_edit.blockSignals(True)
+            self.ts_stop_time_edit.blockSignals(True)
+            self.ts_use_position_profit_checkbox.blockSignals(True)
+            self.ts_position_profit_target_spin.blockSignals(True)
+            self.ts_use_account_profit_checkbox.blockSignals(True)
+            self.ts_account_profit_target_spin.blockSignals(True)
+            self.ts_use_account_stop_checkbox.blockSignals(True)
+            self.ts_account_stop_loss_spin.blockSignals(True)
+            self.ts_fixed_qty_radio.blockSignals(True)
+            self.ts_pct_account_radio.blockSignals(True)
+            self.ts_fixed_qty_spin.blockSignals(True)
+            self.ts_pct_account_spin.blockSignals(True)
+            self.ts_entry_delta_spin.blockSignals(True)
             
             # Set checkbox states from loaded settings (widget.setChecked(boolean_value))
             self.ts_auto_long_checkbox.setChecked(self.ts_auto_long_enabled)
@@ -12326,6 +13136,32 @@ class MainWindow(QMainWindow):
             else:
                 self.ts_hybrid_radio.setChecked(True)
             
+            # Set start/stop time controls
+            self.ts_use_start_checkbox.setChecked(self.ts_use_start_time)
+            self.ts_use_stop_checkbox.setChecked(self.ts_use_stop_time)
+            # Time edits are always enabled (allow editing when unchecked)
+            
+            # Load time values into QTimeEdit widgets
+            self.ts_start_time_edit.setTime(self.ts_start_time)
+            self.ts_stop_time_edit.setTime(self.ts_stop_time)
+            
+            # Load profit targets and stop loss settings
+            self.ts_use_position_profit_checkbox.setChecked(self.ts_use_position_profit_target)
+            self.ts_position_profit_target_spin.setValue(self.ts_position_profit_target_pct)
+            self.ts_use_account_profit_checkbox.setChecked(self.ts_use_account_profit_target)
+            self.ts_account_profit_target_spin.setValue(self.ts_account_profit_target_pct)
+            self.ts_use_account_stop_checkbox.setChecked(self.ts_use_account_stop_loss)
+            self.ts_account_stop_loss_spin.setValue(self.ts_account_stop_loss_pct)
+            
+            # Load position sizing settings
+            if self.ts_use_fixed_quantity:
+                self.ts_fixed_qty_radio.setChecked(True)
+            else:
+                self.ts_pct_account_radio.setChecked(True)
+            self.ts_fixed_qty_spin.setValue(self.ts_fixed_quantity)
+            self.ts_pct_account_spin.setValue(self.ts_percent_of_account)
+            self.ts_entry_delta_spin.setValue(self.ts_entry_delta)
+            
             # Update status display
             if self.ts_auto_trading_enabled:
                 self.ts_trading_status.setText("Status: 🟢 ENABLED")
@@ -12337,6 +13173,9 @@ class MainWindow(QMainWindow):
             # Update current position display
             self.ts_current_auto_position_label.setText("None")  # Will be updated by position tracking
             
+            # Update schedule status
+            self.update_ts_schedule_status()
+            
             # Re-enable signals
             self.ts_auto_long_checkbox.blockSignals(False)
             self.ts_auto_short_checkbox.blockSignals(False)
@@ -12345,6 +13184,21 @@ class MainWindow(QMainWindow):
             self.ts_auto_trading_checkbox.blockSignals(False)
             self.ts_pure_0dte_radio.blockSignals(False)
             self.ts_hybrid_radio.blockSignals(False)
+            self.ts_use_start_checkbox.blockSignals(False)
+            self.ts_use_stop_checkbox.blockSignals(False)
+            self.ts_start_time_edit.blockSignals(False)
+            self.ts_stop_time_edit.blockSignals(False)
+            self.ts_use_position_profit_checkbox.blockSignals(False)
+            self.ts_position_profit_target_spin.blockSignals(False)
+            self.ts_use_account_profit_checkbox.blockSignals(False)
+            self.ts_account_profit_target_spin.blockSignals(False)
+            self.ts_use_account_stop_checkbox.blockSignals(False)
+            self.ts_account_stop_loss_spin.blockSignals(False)
+            self.ts_fixed_qty_radio.blockSignals(False)
+            self.ts_pct_account_radio.blockSignals(False)
+            self.ts_fixed_qty_spin.blockSignals(False)
+            self.ts_pct_account_spin.blockSignals(False)
+            self.ts_entry_delta_spin.blockSignals(False)
             
             logger.info(f"TS automation UI synced: enabled={self.ts_auto_trading_enabled}, "
                        f"long={self.ts_auto_long_enabled}, short={self.ts_auto_short_enabled}, "
@@ -12465,9 +13319,6 @@ class MainWindow(QMainWindow):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                     table_to_update.setItem(row_to_update, 3, item)
                 
-                logger.debug(f"Updated {contract_type} CALL row {row_to_update} strike {strike:.0f}: "
-                           f"Δ={delta_val:.3f} Γ={gamma_val:.4f} Bid={bid_val:.2f} Ask={ask_val:.2f}")
-                
             elif right == 'P':  # Put option - update PUT columns only (5-8)
                 # CRITICAL: Update existing items in-place to prevent flickering
                 # Put Bid (column 5)
@@ -12509,9 +13360,6 @@ class MainWindow(QMainWindow):
                     item = QTableWidgetItem(f"{delta_val:.3f}")
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                     table_to_update.setItem(row_to_update, 8, item)
-                
-                logger.debug(f"Updated {contract_type} PUT row {row_to_update} strike {strike:.0f}: "
-                           f"Bid={bid_val:.2f} Ask={ask_val:.2f} Γ={gamma_val:.4f} Δ={delta_val:.3f}")
             
         except Exception as e:
             logger.error(f"Error updating TS chain cell for {contract_key}: {e}", exc_info=True)
@@ -13197,6 +14045,34 @@ class MainWindow(QMainWindow):
                 self.ts_wait_for_next_entry = settings.get('ts_wait_for_next_entry', True)
                 self.ts_last_strategy_state = settings.get('ts_last_strategy_state', 'FLAT')
                 self.ts_use_pure_0dte = settings.get('ts_use_pure_0dte', False)  # Default to Hybrid
+                
+                # TradeStation Start/Stop Time Settings (Daily Recurring)
+                self.ts_use_start_time = settings.get('ts_use_start_time', False)
+                start_time_str = settings.get('ts_start_time', '17:00:10')  # Default 5:00:10 PM
+                self.ts_start_time = QTime.fromString(start_time_str, 'hh:mm:ss')
+                if not self.ts_start_time.isValid():
+                    self.ts_start_time = QTime(17, 0, 10)  # Fallback to default
+                    
+                self.ts_use_stop_time = settings.get('ts_use_stop_time', False)
+                stop_time_str = settings.get('ts_stop_time', '15:55:00')  # Default 3:55:00 PM
+                self.ts_stop_time = QTime.fromString(stop_time_str, 'hh:mm:ss')
+                if not self.ts_stop_time.isValid():
+                    self.ts_stop_time = QTime(15, 55, 0)  # Fallback to default
+                
+                # TradeStation Profit Targets & Stop Loss
+                self.ts_use_position_profit_target = settings.get('ts_use_position_profit_target', False)
+                self.ts_position_profit_target_pct = settings.get('ts_position_profit_target_pct', 50.0)
+                self.ts_use_account_profit_target = settings.get('ts_use_account_profit_target', False)
+                self.ts_account_profit_target_pct = settings.get('ts_account_profit_target_pct', 4.0)
+                self.ts_use_account_stop_loss = settings.get('ts_use_account_stop_loss', False)
+                self.ts_account_stop_loss_pct = settings.get('ts_account_stop_loss_pct', 2.0)
+                self.ts_account_start_balance = settings.get('ts_account_start_balance', 0.0)
+                
+                # TradeStation Position Sizing
+                self.ts_use_fixed_quantity = settings.get('ts_use_fixed_quantity', True)
+                self.ts_fixed_quantity = settings.get('ts_fixed_quantity', 1)
+                self.ts_percent_of_account = settings.get('ts_percent_of_account', 15.0)
+                self.ts_entry_delta = settings.get('ts_entry_delta', 30)
                 
                 # Order Chasing Settings
                 self.chase_give_in_interval = settings.get('chase_give_in_interval', 3.0)
