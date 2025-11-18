@@ -769,9 +769,14 @@ class IBKRWrapper(EWrapper):
             multiplier = int(contract.multiplier) if contract.multiplier else 100
             per_option_cost = avgCost / multiplier
             
-            # Mark this position as confirmed by IBKR
+            # Mark this position as confirmed by IBKR (cross-verification with saved positions)
             if self._main_window:
+                was_saved = contract_key in self._main_window.saved_positions if hasattr(self._main_window, 'saved_positions') else False
                 self._main_window.positions_confirmed_by_ibkr.add(contract_key)
+                if was_saved:
+                    logger.info(f"✅ CONFIRMED: Position {contract_key} exists in both TWS and saved file")
+                else:
+                    logger.debug(f"Position {contract_key} confirmed by IBKR (new position)")
             
             # Check if this position came from an automated order
             # CRITICAL: Check persistent mapping first (stores flag before order is deleted)
@@ -875,6 +880,7 @@ class IBKRWrapper(EWrapper):
         """
         Called when initial position data is complete.
         Clean up any stale positions that weren't confirmed by IBKR.
+        If position was closed while app was off, log it to CSV as manual close.
         """
         if self._main_window:
             # Find positions that were loaded from file but not confirmed by IBKR
@@ -883,14 +889,52 @@ class IBKRWrapper(EWrapper):
                 if contract_key not in self._main_window.positions_confirmed_by_ibkr:
                     stale_positions.append(contract_key)
             
-            # Remove stale positions
+            # Handle stale positions (closed while app was off)
             if stale_positions:
-                logger.info(f"Cleaning up {len(stale_positions)} stale position(s) not confirmed by IBKR")
+                logger.info(f"⚠️ Found {len(stale_positions)} position(s) closed while app was offline")
                 for contract_key in stale_positions:
+                    # Get saved position data
+                    saved_pos = self._main_window.positions[contract_key]
+                    
+                    logger.warning(f"❌ POSITION CLOSED OFFLINE: {contract_key}")
+                    logger.warning(f"   Was opened: {saved_pos.get('entryTime', 'Unknown').strftime('%Y-%m-%d %H:%M:%S') if isinstance(saved_pos.get('entryTime'), datetime) else 'Unknown'}")
+                    logger.warning(f"   Entry Cost: ${saved_pos.get('avgCost', 0):.2f}")
+                    logger.warning(f"   Quantity: {abs(saved_pos.get('position', 0))}")
+                    logger.warning(f"   Source: {'Strategy' if saved_pos.get('is_automated', False) else 'Manual'}")
+                    logger.warning(f"   ⚠️ Unable to determine exit price/time - closed manually in TWS while app offline")
+                    
+                    # Log to CSV with unavailable exit data
+                    # We mark exit as Manual since we can't verify how it was closed
+                    entry_data = {
+                        'datetime': saved_pos.get('entryTime', datetime.now()).strftime('%Y-%m-%d %H:%M:%S'),
+                        'action': 'BUY',  # Assume BUY entry (we're long options)
+                        'quantity': abs(saved_pos.get('position', 0)),
+                        'avg_price': saved_pos.get('avgCost', 0),
+                        'is_automated': saved_pos.get('is_automated', False)
+                    }
+                    
+                    exit_data = {
+                        'datetime': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        'action': 'SELL',
+                        'quantity': abs(saved_pos.get('position', 0)),
+                        'avg_price': 0,  # Unknown - closed offline
+                        'is_automated': False  # Mark as Manual since closed outside app
+                    }
+                    
+                    # Log to CSV with $0 P&L since we don't have exit price
+                    self._main_window.log_pnl_to_csv(contract_key, entry_data, exit_data)
+                    
+                    # Log to activity
+                    self.signals.connection_message.emit(
+                        f"⚠️ Position {contract_key} was closed offline - logged as Manual exit with $0 P&L (actual P&L unknown)",
+                        "WARNING"
+                    )
+                    
+                    # Remove from positions
                     logger.info(f"Removing stale position: {contract_key}")
                     self.signals.position_closed.emit(contract_key)
             else:
-                logger.info("All saved positions confirmed by IBKR")
+                logger.info("✅ All saved positions confirmed by IBKR")
             
             # Clear the confirmation set for next connection
             self._main_window.positions_confirmed_by_ibkr.clear()
@@ -3466,6 +3510,7 @@ class MainWindow(QMainWindow):
         self.ts_enabled = False
         self.ts_strategy_state = "FLAT"
         self.ts_strategy_direction = 0  # 1=Long, -1=Short, 0=Flat
+        self.ts_first_signal_after_startup = True  # Flag to prevent closing positions on first signal
         self.ts_signal_log = []
         self.ts_0dte_chain_data = {}
         self.ts_1dte_chain_data = {}
@@ -3496,6 +3541,12 @@ class MainWindow(QMainWindow):
         self.load_settings()
         self.load_positions()  # Load saved positions to preserve entryTime
         self.reconstruct_trade_entries_from_log()  # Reconstruct open trades for P&L tracking
+        
+        # Calculate initial session P&L from PnL.csv (for realized trades from previous sessions)
+        logger.info("📊 Calculating initial session P&L from PnL.csv...")
+        self.calculate_session_pnl()
+        self.update_session_pnl_labels()
+        logger.info(f"📊 Initial session P&L: Realized=${self.ts_session_realized_pnl:.2f}, Total=${self.ts_session_total_pnl:.2f}")
         
         # Log ES offset tracking status at startup
         if self.is_market_hours():
@@ -4258,6 +4309,19 @@ class MainWindow(QMainWindow):
         self.mkt_value_label = QLabel("Total Mkt Value: $0.00")
         self.mkt_value_label.setStyleSheet("font-weight: bold; color: #aaaaaa; padding: 2px 12px;")
         self.status_bar.addPermanentWidget(self.mkt_value_label)
+        
+        # Add spacer
+        spacer3 = QLabel("  |  ")
+        spacer3.setStyleSheet("color: #666666;")
+        self.status_bar.addPermanentWidget(spacer3)
+        
+        # Automation status indicator
+        self.automation_status_label = QLabel("Automation: OFF")
+        self.automation_status_label.setStyleSheet(
+            "font-weight: bold; color: #F44336; background-color: #2D0D0D; "
+            "padding: 4px 12px; border-radius: 3px;"
+        )
+        self.status_bar.addPermanentWidget(self.automation_status_label)
     
     def create_option_chart(self, title: str, border_color: str):
         """Create a single option chart widget"""
@@ -6477,6 +6541,10 @@ class MainWindow(QMainWindow):
             self.connect_btn.setEnabled(True)
             
             # Initialize after connection
+            # Clear confirmed positions set before requesting positions (for stale position detection)
+            self.positions_confirmed_by_ibkr.clear()
+            logger.info("Cleared positions_confirmed_by_ibkr set - ready to cross-verify with TWS")
+            
             self.ibkr_client.reqAccountUpdates(True, "")
             self.ibkr_client.reqPositions()  # This will trigger position() callbacks, which auto-subscribe to market data
             
@@ -7617,6 +7685,19 @@ class MainWindow(QMainWindow):
         # Merge with saved positions to restore entryTime from previous session
         self.merge_saved_positions(contract_key)
         
+        # Check if this is a restored Strategy position and enable auto-trading
+        if position_data.get('is_automated', False):
+            # This is a Strategy position - enable auto-trading if not already enabled
+            if not self.ts_auto_trading_enabled:
+                logger.info(f"🔄 RESTORED Strategy position detected: {contract_key}")
+                logger.info(f"🔄 Auto-enabling trading to manage existing Strategy position")
+                self.ts_auto_trading_checkbox.blockSignals(True)
+                self.ts_auto_trading_checkbox.setChecked(True)
+                self.ts_auto_trading_checkbox.blockSignals(False)
+                self.ts_auto_trading_enabled = True
+                self.update_automation_status_label(True)
+                self.log_message("Auto-Trading ENABLED (Strategy position restored)", "SUCCESS")
+        
         # Subscribe to market data for this position (if not already subscribed)
         # This ensures market data is available for P&L and close orders
         self.subscribe_position_market_data(contract_key, position_data.get('contract'))
@@ -7624,6 +7705,9 @@ class MainWindow(QMainWindow):
         # Update session PnL whenever positions change
         self.calculate_session_pnl()
         self.update_session_pnl_labels()
+        
+        # Save positions whenever they update (periodic persistence)
+        self.save_positions()
         
         # No need to call update_positions_display() - timer does it automatically every second
     
@@ -8946,10 +9030,10 @@ class MainWindow(QMainWindow):
         martingale_layout.addWidget(self.ts_martingale_multiplier_label)
         
         # Upcoming Contracts Display
-        self.ts_martingale_next_qty_label = QLabel("Next Entry: -- contracts")
+        self.ts_martingale_next_qty_label = QLabel("Next Entry: $--")
         self.ts_martingale_next_qty_label.setToolTip(
-            "Quantity for next automated entry\n"
-            "• Shows actual contract count\n"
+            "Dollar amount for next automated entry\n"
+            "• Shows estimated position cost\n"
             "• Based on: (Qty or Acct%) × Multiplier\n"
             "• Updates as multiplier changes"
         )
@@ -11446,13 +11530,28 @@ class MainWindow(QMainWindow):
                 cost = pos['avgCost'] * abs(pos['position']) * int(self.instrument['multiplier'])
                 if cost > 0:
                     pnl_pct = (pnl / cost) * 100
+                    logger.debug(
+                        f"📊 POSITION TARGET CHECK: {contract_key} PnL={pnl_pct:.2f}%, "
+                        f"Target={self.ts_position_profit_target_pct:.1f}%, "
+                        f"${pnl:,.2f} / ${cost:,.2f}"
+                    )
                     if pnl_pct >= self.ts_position_profit_target_pct:
                         self.log_message(
                             f"💰 POSITION TARGET HIT! {contract_key} up {pnl_pct:.2f}% "
                             f"(target: {self.ts_position_profit_target_pct}%) - Closing position",
                             "SUCCESS"
                         )
-                        logger.info(f"Position profit target hit: {contract_key} at {pnl_pct:.2f}%")
+                        logger.warning(f"🎯 POSITION TARGET HIT: {contract_key} at {pnl_pct:.2f}% >= {self.ts_position_profit_target_pct}%")
+                        # Show popup alert
+                        QMessageBox.information(
+                            self,
+                            "💰 Position Profit Target Hit!",
+                            f"Position: {contract_key}\n\n"
+                            f"Profit: {pnl_pct:+.2f}%\n"
+                            f"Target: {self.ts_position_profit_target_pct:.1f}%\n\n"
+                            f"P&L: ${pnl:+,.2f}\n\n"
+                            f"Position is being closed."
+                        )
                         self.close_single_position(contract_key, f"Profit target {pnl_pct:.2f}%")
                         return
         
@@ -11467,6 +11566,11 @@ class MainWindow(QMainWindow):
                 cost = pos['avgCost'] * abs(pos['position']) * int(self.instrument['multiplier'])
                 if cost > 0:
                     pnl_pct = (pnl / cost) * 100
+                    logger.debug(
+                        f"📊 POSITION STOP CHECK: {contract_key} PnL={pnl_pct:.2f}%, "
+                        f"Stop=-{self.ts_position_stop_loss_pct:.1f}%, "
+                        f"${pnl:,.2f} / ${cost:,.2f}"
+                    )
                     # Check for loss (negative P&L percentage)
                     if pnl_pct <= -self.ts_position_stop_loss_pct:
                         self.log_message(
@@ -11474,7 +11578,17 @@ class MainWindow(QMainWindow):
                             f"(stop: {self.ts_position_stop_loss_pct}%) - Closing position",
                             "ERROR"
                         )
-                        logger.info(f"Position stop loss hit: {contract_key} at {pnl_pct:.2f}%")
+                        logger.warning(f"🛑 POSITION STOP HIT: {contract_key} at {pnl_pct:.2f}% <= -{self.ts_position_stop_loss_pct}%")
+                        # Show popup alert
+                        QMessageBox.warning(
+                            self,
+                            "🚨 Position Stop Loss Hit!",
+                            f"Position: {contract_key}\n\n"
+                            f"Loss: {pnl_pct:.2f}%\n"
+                            f"Stop: -{self.ts_position_stop_loss_pct:.1f}%\n\n"
+                            f"P&L: ${pnl:+,.2f}\n\n"
+                            f"Position is being closed."
+                        )
                         self.close_single_position(contract_key, f"Stop loss {abs(pnl_pct):.2f}%")
                         return
         
@@ -11518,33 +11632,71 @@ class MainWindow(QMainWindow):
         
         # Check session profit target (if enabled)
         if self.ts_use_session_account_target:
+            logger.debug(
+                f"📊 SESSION TARGET CHECK: Current={self.ts_session_total_pct:.3f}%, "
+                f"Target={self.ts_session_account_target_pct:.1f}%, "
+                f"PnL=${self.ts_session_total_pnl:,.2f} "
+                f"(Unrealized=${self.ts_session_unrealized_pnl:,.2f}, Realized=${self.ts_session_realized_pnl:,.2f})"
+            )
             if self.ts_session_total_pct >= self.ts_session_account_target_pct:
                 self.log_message(
                     f"💰 SESSION PROFIT TARGET HIT! Total P&L: ${self.ts_session_total_pnl:,.2f} "
                     f"({self.ts_session_total_pct:+.2f}%) - Target: {self.ts_session_account_target_pct}%",
                     "SUCCESS"
                 )
-                logger.info(
-                    f"Session profit target hit: ${self.ts_session_total_pnl:.2f} "
-                    f"({self.ts_session_total_pct:.2f}%)"
+                logger.warning(
+                    f"🎯 SESSION PROFIT TARGET HIT! ${self.ts_session_total_pnl:.2f} "
+                    f"({self.ts_session_total_pct:.2f}%) >= {self.ts_session_account_target_pct}% target"
+                )
+                # Show popup alert
+                QMessageBox.information(
+                    self,
+                    "💰 Session Profit Target Hit!",
+                    f"Session Total P&L: ${self.ts_session_total_pnl:+,.2f}\n"
+                    f"Percentage: {self.ts_session_total_pct:+.2f}%\n"
+                    f"Target: {self.ts_session_account_target_pct:.1f}%\n\n"
+                    f"Unrealized: ${self.ts_session_unrealized_pnl:+,.2f}\n"
+                    f"Realized: ${self.ts_session_realized_pnl:+,.2f}\n\n"
+                    f"All positions are being closed."
                 )
                 self.handle_profit_target_hit(f"Session profit {self.ts_session_total_pct:+.2f}%")
                 return
+        else:
+            logger.debug("📊 SESSION TARGET: Disabled")
         
         # Check session stop loss (if enabled)
         if self.ts_use_session_account_stop:
+            logger.debug(
+                f"📊 SESSION STOP CHECK: Current={self.ts_session_total_pct:.3f}%, "
+                f"Stop=-{self.ts_session_account_stop_pct:.1f}%, "
+                f"PnL=${self.ts_session_total_pnl:,.2f} "
+                f"(Unrealized=${self.ts_session_unrealized_pnl:,.2f}, Realized=${self.ts_session_realized_pnl:,.2f})"
+            )
             if self.ts_session_total_pct <= -self.ts_session_account_stop_pct:
                 self.log_message(
                     f"📉 SESSION STOP LOSS HIT! Total P&L: ${self.ts_session_total_pnl:,.2f} "
                     f"({self.ts_session_total_pct:+.2f}%) - Stop: -{self.ts_session_account_stop_pct}%",
                     "ERROR"
                 )
-                logger.info(
-                    f"Session stop loss hit: ${self.ts_session_total_pnl:.2f} "
-                    f"({self.ts_session_total_pct:.2f}%)"
+                logger.warning(
+                    f"🛑 SESSION STOP LOSS HIT! ${self.ts_session_total_pnl:.2f} "
+                    f"({self.ts_session_total_pct:.2f}%) <= -{self.ts_session_account_stop_pct}% stop"
+                )
+                # Show popup alert
+                QMessageBox.critical(
+                    self,
+                    "🚨 Session Stop Loss Hit!",
+                    f"Session Total P&L: ${self.ts_session_total_pnl:+,.2f}\n"
+                    f"Percentage: {self.ts_session_total_pct:+.2f}%\n"
+                    f"Stop: -{self.ts_session_account_stop_pct:.1f}%\n\n"
+                    f"Unrealized: ${self.ts_session_unrealized_pnl:+,.2f}\n"
+                    f"Realized: ${self.ts_session_realized_pnl:+,.2f}\n\n"
+                    f"All positions are being closed."
                 )
                 self.handle_profit_target_hit(f"Session stop {self.ts_session_total_pct:+.2f}%")
                 return
+        else:
+            logger.debug("📊 SESSION STOP: Disabled")
     
     def close_single_position(self, contract_key: str, reason: str):
         """Close a single position due to target/stop hit, but keep automation running for re-entry."""
@@ -11559,6 +11711,14 @@ class MainWindow(QMainWindow):
             if position_size == 0:
                 logger.warning(f"Cannot close {contract_key} - position size is 0")
                 return
+            
+            # Calculate P&L to determine if this is a profit or loss (for Martingale)
+            pnl = pos.get('pnl', 0)
+            is_profit = pnl > 0
+            is_loss = pnl < 0
+            
+            # Determine if this was an automated position (for Martingale tracking)
+            is_automated = pos.get('is_automated', False)
             
             # Determine action
             if position_size > 0:
@@ -11577,10 +11737,67 @@ class MainWindow(QMainWindow):
                 f"❌ Closing {contract_key}: {action} {qty} @ ${mid_price:.2f} - Reason: {reason}",
                 "INFO"
             )
-            logger.info(f"Closing single position {contract_key} due to {reason}")
+            logger.info(f"Closing single position {contract_key} due to {reason} (P&L: ${pnl:.2f})")
             
-            # Place immediate market-style exit order
-            self.place_manual_order(contract_key, action, qty, mid_price)
+            # Place exit order using place_order() directly to maintain Strategy source tracking
+            # Get market data for slippage tracking
+            market_data = self.market_data.get(contract_key, {})
+            bid = market_data.get('bid', 0)
+            ask = market_data.get('ask', 0)
+            unrounded_mid = (bid + ask) / 2 if (bid > 0 and ask > 0) else mid_price
+            
+            # Place order with chasing enabled (Strategy exit, not Manual)
+            self.place_order(contract_key, action, qty, mid_price, enable_chasing=True, mid_price=unrounded_mid)
+            
+            # ═══════════════════════════════════════════════════════════════
+            # MARTINGALE LOGIC: Update based on profit/loss
+            # ═══════════════════════════════════════════════════════════════
+            if is_automated:
+                if "Profit target" in reason and is_profit:
+                    # PROFIT TARGET HIT: Reset Martingale to initial quantities
+                    self.ts_martingale_consecutive_losses = 0
+                    self.ts_martingale_stopped = False
+                    self.ts_martingale_just_reset = False
+                    
+                    if self.ts_use_martingale:
+                        old_qty = self.ts_martingale_current_qty
+                        self.ts_martingale_current_qty = self.ts_martingale_initial_qty
+                        logger.info(f"🎯 PROFIT TARGET: Martingale reset {old_qty}→{self.ts_martingale_current_qty}, losses: 0/{self.ts_martingale_max_losses}")
+                        self.log_message(f"🎯 Profit Target: Martingale reset to {self.ts_martingale_current_qty} contracts", "SUCCESS")
+                    else:
+                        logger.info(f"🎯 PROFIT TARGET: Loss counter reset to 0/{self.ts_martingale_max_losses}")
+                    
+                    self.update_martingale_loss_label()
+                
+                elif "Stop loss" in reason and is_loss:
+                    # STOP LOSS HIT: Iterate Martingale by one loss
+                    self.ts_martingale_consecutive_losses += 1
+                    
+                    # Check if reached max losses - AUTO-RESET
+                    if self.ts_martingale_consecutive_losses >= self.ts_martingale_max_losses:
+                        logger.warning(f"🔄 STOP LOSS + MAX LOSSES: {self.ts_martingale_consecutive_losses}/{self.ts_martingale_max_losses} - AUTO-RESETTING to 1x")
+                        self.log_message(f"🔄 Stop Loss + Max Losses: Auto-reset to 1x multiplier", "WARNING")
+                        
+                        # Reset to initial state
+                        self.ts_martingale_consecutive_losses = 0
+                        self.ts_martingale_stopped = False
+                        self.ts_martingale_just_reset = True
+                        
+                        if self.ts_use_martingale:
+                            self.ts_martingale_current_qty = self.ts_martingale_initial_qty
+                            logger.info(f"🔄 Martingale RESET: qty→{self.ts_martingale_current_qty}, losses: 0/{self.ts_martingale_max_losses}")
+                    else:
+                        # Normal loss - increment and double if Martingale enabled
+                        self.ts_martingale_just_reset = False
+                        if self.ts_use_martingale:
+                            old_qty = self.ts_martingale_current_qty
+                            self.ts_martingale_current_qty *= 2
+                            logger.info(f"🛑 STOP LOSS: Martingale double {old_qty}→{self.ts_martingale_current_qty}, losses: {self.ts_martingale_consecutive_losses}/{self.ts_martingale_max_losses}")
+                            self.log_message(f"🛑 Stop Loss: Martingale next size {self.ts_martingale_current_qty} contracts ({self.ts_martingale_consecutive_losses}/{self.ts_martingale_max_losses})", "WARNING")
+                        else:
+                            logger.info(f"🛑 STOP LOSS: Loss counter now {self.ts_martingale_consecutive_losses}/{self.ts_martingale_max_losses}")
+                    
+                    self.update_martingale_loss_label()
             
             # Log that automation continues
             self.log_message(
@@ -11605,6 +11822,14 @@ class MainWindow(QMainWindow):
         self.log_message("Closing all positions and disabling automation for the day", "INFO")
         self.log_message("=" * 60, "INFO")
         
+        # Disable automation FIRST to prevent new trades during position closing
+        if self.ts_auto_trading_checkbox.isChecked():
+            self.ts_auto_trading_checkbox.setChecked(False)
+            self.log_message("✅ Automation disabled (risk management)", "INFO")
+        
+        # Set flag to prevent repeated triggers today
+        self.ts_profit_target_hit = True
+        
         # Close all positions
         positions_to_close = list(self.positions.keys())
         for contract_key in positions_to_close:
@@ -11628,14 +11853,6 @@ class MainWindow(QMainWindow):
                     
                     self.log_message(f"Closing {contract_key}: {action} {qty} @ ${mid_price:.2f}", "INFO")
                     self.place_manual_order(contract_key, action, qty, mid_price)
-        
-        # Disable automation
-        if self.ts_auto_trading_checkbox.isChecked():
-            self.ts_auto_trading_checkbox.setChecked(False)
-            self.log_message("✅ Automation disabled", "INFO")
-        
-        # Set flag to prevent repeated triggers today
-        self.ts_profit_target_hit = True
         
         self.log_message(f"🎯 Risk management complete: {reason}", "SUCCESS")
         logger.info(f"Risk management triggered: {reason}")
@@ -11666,6 +11883,9 @@ class MainWindow(QMainWindow):
         
         # Update account percentage dollar display
         self.update_acct_pct_dollar_display()
+        
+        # Update martingale next entry dollar display
+        self.update_martingale_loss_label()
         
         # Calculate P&L if we have start balance
         if self.ts_account_start_balance > 0:
@@ -11749,6 +11969,11 @@ class MainWindow(QMainWindow):
         
         # Get current P&L for logging
         current_pnl = pos.get('pnl', 0)
+        
+        # Disable automation when manually closing positions
+        if self.ts_auto_trading_checkbox.isChecked():
+            self.ts_auto_trading_checkbox.setChecked(False)
+            self.log_message("✅ Automation disabled (manual close)", "INFO")
         
         # Log close details (no confirmation for speed)
         self.log_message("=" * 60, "INFO")
@@ -12880,6 +13105,37 @@ class MainWindow(QMainWindow):
             logger.info(f"===== PROCESSING STRATEGY CHANGE: {old_direction} → {new_direction} =====")
             logger.info(f"Settings: ts_auto_trading_enabled={self.ts_auto_trading_enabled}, LONG={self.ts_auto_long_enabled}, SHORT={self.ts_auto_short_enabled}")
             
+            # CRITICAL: First signal after startup - check if we have existing Strategy positions
+            if self.ts_first_signal_after_startup:
+                logger.info("🔄 FIRST SIGNAL AFTER STARTUP - checking for existing positions")
+                self.ts_first_signal_after_startup = False  # Clear flag
+                
+                # Count existing Strategy positions
+                strategy_calls = 0
+                strategy_puts = 0
+                for contract_key, pos in self.positions.items():
+                    if pos.get('is_automated', False):  # Strategy position
+                        if '_C_' in contract_key:
+                            strategy_calls += 1
+                        elif '_P_' in contract_key:
+                            strategy_puts += 1
+                
+                logger.info(f"   Existing Strategy positions: {strategy_calls} CALLs, {strategy_puts} PUTs")
+                
+                # If we have existing positions that match the signal, skip closing
+                if new_direction == 1 and strategy_calls > 0:
+                    logger.info("   ✅ Have existing CALL positions matching LONG signal - keeping them")
+                    self.log_message("✅ Existing Strategy CALL position retained on startup", "SUCCESS")
+                    return  # Don't close, don't re-enter
+                elif new_direction == 2 and strategy_puts > 0:
+                    logger.info("   ✅ Have existing PUT positions matching SHORT signal - keeping them")
+                    self.log_message("✅ Existing Strategy PUT position retained on startup", "SUCCESS")
+                    return  # Don't close, don't re-enter
+                elif new_direction == 0:
+                    logger.info("   Signal is FLAT - will close any existing Strategy positions")
+                else:
+                    logger.info("   Signal direction doesn't match existing positions - will process normally")
+            
             # CRITICAL SAFETY CHECKS before trading
             
             # 1. Check if automation is enabled (MASTER SWITCH)
@@ -13665,22 +13921,37 @@ class MainWindow(QMainWindow):
             realized_pnl = 0.0
             csv_file_path = self.get_environment_file_path('PnL.csv')
             
+            logger.debug(f"📊 Reading realized P&L from: {csv_file_path}")
+            
             if Path(csv_file_path).exists():
                 try:
                     import csv
+                    trade_count = 0
                     with open(csv_file_path, 'r', encoding='utf-8') as f:
                         reader = csv.DictReader(f)
                         for row in reader:
-                            # Only sum Strategy trades (exclude Manual/Vega)
-                            if row.get('Type') == 'Strategy':
-                                trade_pnl_str = row.get('TradePnL$', '0').replace('$', '').replace(',', '')
+                            # Log the row to see what we're reading
+                            source = row.get('Source', 'N/A')
+                            trade_pnl_str = row.get('TradePnL$', '0')
+                            logger.debug(f"  Row: Source='{source}', TradePnL$='{trade_pnl_str}'")
+                            
+                            # FIXED: Include any trade with 'Strategy' in Source (Strategy or Strategy/Manual)
+                            # Exclude pure Manual or Vega trades
+                            if 'Strategy' in source:
+                                trade_pnl_str_clean = trade_pnl_str.replace('$', '').replace(',', '')
                                 try:
-                                    trade_pnl = float(trade_pnl_str)
+                                    trade_pnl = float(trade_pnl_str_clean)
                                     realized_pnl += trade_pnl
-                                except ValueError:
-                                    pass
+                                    trade_count += 1
+                                    logger.debug(f"    ✅ Added ${trade_pnl:.2f} to realized P&L (running total: ${realized_pnl:.2f})")
+                                except ValueError as e:
+                                    logger.warning(f"    ⚠️ Could not parse TradePnL$: '{trade_pnl_str_clean}' - {e}")
+                    
+                    logger.debug(f"📊 Realized P&L: Processed {trade_count} Strategy trades = ${realized_pnl:.2f}")
                 except Exception as e:
-                    logger.error(f"Error reading PnL CSV for session tracking: {e}")
+                    logger.error(f"Error reading PnL CSV for session tracking: {e}", exc_info=True)
+            else:
+                logger.warning(f"📊 PnL CSV file not found: {csv_file_path}")
             
             self.ts_session_realized_pnl = realized_pnl
             
@@ -13928,6 +14199,7 @@ class MainWindow(QMainWindow):
             self.ts_auto_trading_checkbox.setChecked(False)
             self.ts_auto_trading_checkbox.blockSignals(False)
             self.ts_auto_trading_enabled = False
+            self.update_automation_status_label(False)
             self.log_message("🛑 Master auto-trading disabled (no sides enabled)", "INFO")
             
         # Save settings
@@ -13950,6 +14222,7 @@ class MainWindow(QMainWindow):
             self.ts_auto_trading_checkbox.setChecked(False)
             self.ts_auto_trading_checkbox.blockSignals(False)
             self.ts_auto_trading_enabled = False
+            self.update_automation_status_label(False)
             self.log_message("🛑 Master auto-trading disabled (no sides enabled)", "INFO")
             
         # Save settings
@@ -14030,6 +14303,7 @@ class MainWindow(QMainWindow):
             # All validations passed
             self.ts_trading_status.setText("Status: 🟢 ENABLED")
             self.ts_trading_status.setStyleSheet("color: #4CAF50; font-weight: bold;")
+            self.update_automation_status_label(True)
             self.log_message("🚀 AUTOMATED TRADING ENABLED - System will respond to TS strategy signals", "SUCCESS")
             
             # Set account start balance for profit/loss tracking
@@ -14050,7 +14324,7 @@ class MainWindow(QMainWindow):
             logger.info(f"Account start balance: ${start_balance:.2f}")
             
             # CRITICAL: Reset first signal flag when enabling automation
-            # This ensures immediate join treats it as a fresh start
+            # This ensures both immediate join AND wait for next entry treat it as a fresh start
             if hasattr(self, '_ts_first_signal_received'):
                 delattr(self, '_ts_first_signal_received')
                 logger.info("🔄 Reset _ts_first_signal_received flag for fresh start")
@@ -14058,11 +14332,27 @@ class MainWindow(QMainWindow):
             # If immediate join is enabled, check current strategy state and enter if needed
             if self.ts_immediate_join_checkbox.isChecked():
                 QTimer.singleShot(1000, self.check_immediate_entry_on_startup)
+            elif self.ts_wait_for_next_entry_checkbox.isChecked():
+                # Wait for next entry: Mark current signal as "observed" so next change triggers entry
+                direction_map = {0: "FLAT", 1: "LONG", 2: "SHORT"}
+                current_direction = direction_map.get(self.ts_strategy_direction, "UNKNOWN")
+                
+                # If there's already an active signal (not FLAT), treat it as the "first signal observed"
+                # so the NEXT change will trigger entry
+                if self.ts_strategy_direction != 0:
+                    self._ts_first_signal_received = True
+                    self.log_message(f"⏳ Wait mode active - Observed current: {current_direction} | Will ENTER on next signal change", "INFO")
+                    logger.info(f"Wait for Next Entry mode: Current direction={current_direction} marked as observed, next change will trigger entry")
+                else:
+                    # Signal is FLAT, wait for first non-FLAT signal
+                    self.log_message(f"⏳ Wait mode active - Current: FLAT | Waiting for LONG/SHORT signal", "INFO")
+                    logger.info(f"Wait for Next Entry mode: Current FLAT, waiting for first LONG/SHORT signal")
                 
         else:
             # Disabled
             self.ts_trading_status.setText("Status: 🔴 DISABLED")
             self.ts_trading_status.setStyleSheet("color: #FF5722; font-weight: bold;")
+            self.update_automation_status_label(False)
             self.log_message("🛑 Automated trading DISABLED", "INFO")
         
         # Update settings value
@@ -14072,6 +14362,21 @@ class MainWindow(QMainWindow):
         # Save settings
         self.save_settings()
         logger.info(f"💾 Settings saved with ts_auto_trading_enabled={self.ts_auto_trading_enabled}")
+    
+    def update_automation_status_label(self, enabled: bool):
+        """Update the automation status label in the status bar"""
+        if enabled:
+            self.automation_status_label.setText("Automation: ON")
+            self.automation_status_label.setStyleSheet(
+                "font-weight: bold; color: #4CAF50; background-color: #0D2D0D; "
+                "padding: 4px 12px; border-radius: 3px;"
+            )
+        else:
+            self.automation_status_label.setText("Automation: OFF")
+            self.automation_status_label.setStyleSheet(
+                "font-weight: bold; color: #F44336; background-color: #2D0D0D; "
+                "padding: 4px 12px; border-radius: 3px;"
+            )
     
     def on_contract_strategy_changed(self, checked: bool):
         """Handle contract strategy selection (Pure 0DTE vs Hybrid)"""
@@ -14313,36 +14618,37 @@ class MainWindow(QMainWindow):
         # Update multiplier display
         self.ts_martingale_multiplier_label.setText(f"Multiplier: {martingale_multiplier}x")
         
-        # Calculate and display next entry quantity
+        # Calculate and display next entry dollar amount
         try:
             if self.ts_use_fixed_quantity:
-                # Fixed quantity mode
+                # Fixed quantity mode - estimate dollar amount
                 base_qty = self.ts_fixed_quantity
+                # Use typical option price estimate ($10 average)
+                estimated_option_price = 10.0
+                multiplier = int(self.instrument['multiplier'])
+                base_dollar_amount = base_qty * estimated_option_price * multiplier
             else:
-                # Percent of account mode - need to estimate
-                # Use current account balance if available
+                # Percent of account mode - use actual account balance
                 account_balance = self.app_state.get('account_balance', 0)
                 if account_balance > 0:
-                    # Estimate based on typical option price (e.g., $1.00)
-                    estimated_option_price = 1.0
-                    base_qty = int((account_balance * self.ts_percent_of_account / 100) / (estimated_option_price * 100))
+                    base_dollar_amount = account_balance * (self.ts_percent_of_account / 100)
                 else:
-                    base_qty = 0
+                    base_dollar_amount = 0
             
-            # Apply multiplier if Martingale is enabled
+            # Apply Martingale multiplier if enabled
             if self.ts_use_martingale:
-                next_qty = base_qty * martingale_multiplier
+                next_dollar_amount = base_dollar_amount * martingale_multiplier
             else:
-                next_qty = base_qty
+                next_dollar_amount = base_dollar_amount
             
-            if next_qty > 0:
-                self.ts_martingale_next_qty_label.setText(f"Next Entry: {next_qty} contracts")
+            if next_dollar_amount > 0:
+                self.ts_martingale_next_qty_label.setText(f"Next Entry: ${next_dollar_amount:,.0f}")
             else:
-                self.ts_martingale_next_qty_label.setText(f"Next Entry: -- contracts")
+                self.ts_martingale_next_qty_label.setText(f"Next Entry: $--")
                 
         except Exception as e:
-            logger.error(f"Error calculating next entry quantity: {e}")
-            self.ts_martingale_next_qty_label.setText(f"Next Entry: -- contracts")
+            logger.error(f"Error calculating next entry dollar amount: {e}")
+            self.ts_martingale_next_qty_label.setText(f"Next Entry: $--")
     
     def update_acct_pct_dollar_display(self):
         """Update the account percentage dollar amount display"""
@@ -14687,6 +14993,9 @@ class MainWindow(QMainWindow):
             else:
                 self.ts_trading_status.setText("Status: 🔴 DISABLED")
                 self.ts_trading_status.setStyleSheet("color: #FF5722; font-weight: bold;")
+            
+            # Update automation status label in status bar
+            self.update_automation_status_label(self.ts_auto_trading_enabled)
                 
             # Update current position display
             self.ts_current_auto_position_label.setText("None")  # Will be updated by position tracking
@@ -15307,17 +15616,8 @@ class MainWindow(QMainWindow):
         
         self.log_message(f"Exit order: {action} {qty} @ ${mid_price:.2f}", "INFO")
         
-        # CRITICAL: Disable TS automation to prevent re-entry
-        if self.ts_auto_trading_enabled:
-            self.ts_auto_trading_enabled = False
-            if hasattr(self, 'ts_auto_trading_checkbox'):
-                self.ts_auto_trading_checkbox.setChecked(False)
-            self.log_message("🛑 TS AUTOMATION DISABLED (manual close)", "WARNING")
-            logger.info("TS automation disabled due to manual close button click")
-            
-            # ACTIVITY LOG: Automation disabled
-            if hasattr(self, 'ts_signals'):
-                self.ts_signals.ts_activity.emit("🛑 TS AUTOMATION DISABLED (manual position close)")
+        # NOTE: Automation stays enabled - position-level exit logic handles re-entry blocking
+        # Individual position exits use close_single_position() which properly tracks exit state
         
         # Place exit order with mid-price chasing enabled
         self.place_manual_order(contract_key, action, qty, mid_price)
@@ -15824,7 +16124,12 @@ class MainWindow(QMainWindow):
                 self.positions[contract_key]['entryTime'] = saved_pos['entryTime']
                 self.positions[contract_key]['is_automated'] = saved_pos.get('is_automated', False)
                 source = 'Strategy' if saved_pos.get('is_automated', False) else 'Manual'
-                logger.info(f"Restored {contract_key}: entryTime={saved_pos['entryTime'].strftime('%Y-%m-%d %H:%M:%S')}, Source={source}")
+                time_in_trade = datetime.now() - saved_pos['entryTime']
+                logger.info(f"✅ RESTORED POSITION: {contract_key}")
+                logger.info(f"   Entry: {saved_pos['entryTime'].strftime('%Y-%m-%d %H:%M:%S')}")
+                logger.info(f"   Time in trade: {time_in_trade}")
+                logger.info(f"   Source: {source}")
+                self.log_message(f"Restored {source} position: {contract_key} ({time_in_trade})", "INFO")
     
     # ========================================================================
     # WINDOW LIFECYCLE
