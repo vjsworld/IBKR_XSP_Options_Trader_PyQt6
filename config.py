@@ -48,7 +48,7 @@ ENVIRONMENT_OVERRIDE = 'development'  # Change to 'production' in prod directory
 # - 'XSP': Mini S&P 500 Index Options ($100 multiplier, $1 strikes)
 # - 'ES': E-mini S&P 500 Futures Options (FOP, $50 multiplier, $5 strikes)
 # - 'MES': Micro E-mini S&P 500 Futures Options (FOP, $5 multiplier, $5 strikes)
-SELECTED_INSTRUMENT = 'XSP'  # Must be 'SPX', 'XSP', 'ES', or 'MES'
+SELECTED_INSTRUMENT = 'ES'  # Must be 'SPX', 'XSP', 'ES', or 'MES'
 # ============================================================================
 
 # ============================================================================

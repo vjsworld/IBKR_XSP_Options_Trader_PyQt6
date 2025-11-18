@@ -3194,6 +3194,11 @@ class MainWindow(QMainWindow):
         self.chasing_orders = {}  # order_id -> chasing_order_info (for all orders with mid-price chasing enabled)
         self.historical_data = {}  # contract_key -> bars
         
+        # Expiration tracking for virtual closes
+        self.expired_positions_prompt_shown = False  # Track if we've shown the prompt today
+        self.virtually_closed_positions = set()  # Track contract_keys that we've virtually closed
+        self.ignored_expired_contracts = set()  # Contract_keys to ignore in positions grid (waiting for TWS removal)
+        
         # Chart data storage - separate from general historical_data for chart-specific needs
         self.chart_data = {
             'underlying': [],  # SPX/XSP bars for confirmation chart
@@ -11397,7 +11402,11 @@ class MainWindow(QMainWindow):
         total_cost_basis = 0
         total_mkt_value = 0
         
-        for row, (contract_key, pos) in enumerate(self.positions.items()):
+        # Filter out virtually closed expired positions
+        visible_positions = {k: v for k, v in self.positions.items() 
+                           if k not in self.ignored_expired_contracts}
+        
+        for row, (contract_key, pos) in enumerate(visible_positions.items()):
             self.positions_table.insertRow(row)
             
             # Update P&L from current market data (mid-price)
@@ -11503,12 +11512,214 @@ class MainWindow(QMainWindow):
         # Check profit targets and stop loss
         self.check_profit_targets_and_stop_loss()
     
+    def check_expired_positions(self):
+        """
+        Check for expired options that are still held 10+ minutes after expiration.
+        Prompt user once to virtually close them for P&L logging.
+        """
+        try:
+            ct_tz = pytz.timezone('America/Chicago')
+            now_ct = datetime.now(ct_tz)
+            
+            # Only check during trading hours or shortly after market close
+            current_hour = now_ct.hour
+            if current_hour < 8 or current_hour > 17:
+                return
+            
+            expired_positions = []
+            
+            for contract_key, pos in list(self.positions.items()):
+                # Skip if already virtually closed or ignored
+                if contract_key in self.virtually_closed_positions or contract_key in self.ignored_expired_contracts:
+                    continue
+                
+                # Parse contract_key to get expiry date: SYMBOL_STRIKE_RIGHT_EXPIRY
+                # Example: XSP_664.0_C_20251118
+                parts = contract_key.split('_')
+                if len(parts) != 4:
+                    continue
+                
+                symbol, strike, right, expiry_str = parts
+                
+                try:
+                    # Parse expiry date (YYYYMMDD format)
+                    expiry_date = datetime.strptime(expiry_str, '%Y%m%d')
+                    expiry_date_ct = ct_tz.localize(expiry_date.replace(hour=15, minute=0, second=0))  # 3:00 PM CT close
+                    
+                    # Check if expired more than 10 minutes ago
+                    time_since_expiry = (now_ct - expiry_date_ct).total_seconds() / 60  # minutes
+                    
+                    if time_since_expiry >= 10:
+                        # This position is expired and held 10+ minutes
+                        current_value = self.market_data.get(contract_key, {}).get('last', 0)
+                        expired_positions.append({
+                            'contract_key': contract_key,
+                            'position': pos,
+                            'current_value': current_value,
+                            'expiry_date': expiry_date_ct
+                        })
+                        
+                except ValueError:
+                    logger.error(f"Could not parse expiry date from contract_key: {contract_key}")
+                    continue
+            
+            # If we have expired positions and haven't prompted yet today
+            if expired_positions and not self.expired_positions_prompt_shown:
+                self.prompt_virtual_close_expired(expired_positions)
+                
+        except Exception as e:
+            logger.error(f"Error checking expired positions: {e}", exc_info=True)
+    
+    def prompt_virtual_close_expired(self, expired_positions):
+        """
+        Show popup asking user if they want to virtually close expired positions.
+        """
+        try:
+            # Build message
+            msg = "The following options have EXPIRED and are still held:\\n\\n"
+            
+            for exp_pos in expired_positions:
+                contract_key = exp_pos['contract_key']
+                pos = exp_pos['position']
+                current_value = exp_pos['current_value']
+                position_size = abs(pos.get('position', 0))
+                
+                msg += f"  • {contract_key}\\n"
+                msg += f"    Qty: {position_size}, Current Value: ${current_value:.2f}\\n"
+            
+            msg += "\\n" + "="*60 + "\\n"
+            msg += "Would you like to VIRTUALLY CLOSE these for P&L logging?\\n\\n"
+            msg += "• If current value is $0.00: Full loss will be recorded\\n"
+            msg += "• If current value > $0: P&L will be calculated from value\\n\\n"
+            msg += "Positions will be removed from the grid and added to realized P&L."
+            
+            # Show dialog
+            reply = QMessageBox.question(
+                self,
+                "⏰ Expired Options Detected",
+                msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            
+            # Mark that we've shown the prompt today
+            self.expired_positions_prompt_shown = True
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                self.virtual_close_expired_positions(expired_positions)
+            else:
+                self.log_message("⏰ Expired positions kept - will not prompt again today", "INFO")
+                
+        except Exception as e:
+            logger.error(f"Error prompting virtual close: {e}", exc_info=True)
+    
+    def virtual_close_expired_positions(self, expired_positions):
+        """
+        Virtually close expired positions for P&L tracking.
+        Remove from positions grid and log to realized P&L.
+        """
+        try:
+            ct_tz = pytz.timezone('America/Chicago')
+            now_ct = datetime.now(ct_tz)
+            
+            for exp_pos in expired_positions:
+                contract_key = exp_pos['contract_key']
+                pos = exp_pos['position']
+                current_value = exp_pos['current_value']
+                
+                # Calculate P&L
+                position_size = abs(pos.get('position', 0))
+                avg_cost = pos.get('avgCost', 0)
+                multiplier = int(self.instrument['multiplier'])
+                
+                # Calculate entry cost
+                entry_cost = avg_cost * position_size * multiplier
+                
+                # Calculate exit value
+                if current_value <= 0:
+                    # Total loss - option expired worthless
+                    exit_value = 0
+                    pnl = -entry_cost
+                    pnl_pct = -100.0
+                else:
+                    # Has some value
+                    exit_value = current_value * position_size * multiplier
+                    
+                    # Determine if LONG or SHORT
+                    if pos.get('position', 0) > 0:
+                        # LONG position: bought option
+                        pnl = exit_value - entry_cost
+                    else:
+                        # SHORT position: sold option
+                        pnl = entry_cost - exit_value
+                    
+                    pnl_pct = (pnl / entry_cost * 100) if entry_cost > 0 else 0
+                
+                # Log to trade CSV using virtual order ID (0)
+                is_automated = self._position_source_map.get(contract_key, False)
+                
+                self.log_trade_to_csv(
+                    order_id=0,  # Virtual close has no order ID
+                    contract_key=contract_key,
+                    action='VIRTUAL_CLOSE',
+                    quantity=position_size,
+                    avg_fill_price=current_value,  # Exit price
+                    is_automated=is_automated,
+                    mid_price=current_value  # Use current value as "mid" for virtual close
+                )
+                
+                # Log message
+                self.log_message(
+                    f"⏰ VIRTUAL CLOSE (EXPIRED): {contract_key} - "
+                    f"P&L: ${pnl:+,.2f} ({pnl_pct:+.2f}%)",
+                    "WARNING" if pnl < 0 else "SUCCESS"
+                )
+                logger.info(
+                    f"Virtual close expired position: {contract_key}, "
+                    f"Qty={position_size}, Entry=${avg_cost:.2f}, "
+                    f"Exit=${current_value:.2f}, P&L=${pnl:.2f}"
+                )
+                
+                # Mark as virtually closed (don't remove yet - let TWS do it)
+                self.virtually_closed_positions.add(contract_key)
+                self.ignored_expired_contracts.add(contract_key)
+                
+                # Remove from positions dict immediately for grid display
+                if contract_key in self.positions:
+                    del self.positions[contract_key]
+                
+                # Clean up tracking
+                if contract_key in self._position_source_map:
+                    del self._position_source_map[contract_key]
+            
+            # Update positions display
+            self.update_positions_display()
+            
+            # Show summary
+            total_pnl = sum(
+                exp_pos['position'].get('pnl', 0) 
+                for exp_pos in expired_positions
+            )
+            
+            self.log_message(
+                f"⏰ Virtually closed {len(expired_positions)} expired positions. "
+                f"Total P&L: ${total_pnl:+,.2f}",
+                "SUCCESS" if total_pnl >= 0 else "WARNING"
+            )
+            
+        except Exception as e:
+            logger.error(f"Error virtually closing expired positions: {e}", exc_info=True)
+            self.log_message(f"❌ Error virtually closing expired positions: {e}", "ERROR")
+    
     def check_profit_targets_and_stop_loss(self):
         """
         Check if profit targets or stop loss have been hit.
         Called every second from update_positions_display.
         When target hit: exit all positions and disable automation for the day.
         """
+        # First check for expired positions
+        self.check_expired_positions()
+        
         # Skip if already hit target today
         if self.ts_profit_target_hit:
             return
@@ -11537,6 +11748,10 @@ class MainWindow(QMainWindow):
         # Check position profit target (if enabled) - ONLY AUTOMATED POSITIONS
         if self.ts_use_position_profit_target:
             for contract_key, pos in self.positions.items():
+                # Skip virtually closed expired positions
+                if contract_key in self.ignored_expired_contracts:
+                    continue
+                
                 # Only check automated strategy positions
                 if not pos.get('is_automated', False):
                     continue
@@ -11589,6 +11804,10 @@ class MainWindow(QMainWindow):
         # Check position stop loss (if enabled) - ONLY AUTOMATED POSITIONS
         if self.ts_use_position_stop_loss:
             for contract_key, pos in self.positions.items():
+                # Skip virtually closed expired positions
+                if contract_key in self.ignored_expired_contracts:
+                    continue
+                
                 # Only check automated strategy positions
                 if not pos.get('is_automated', False):
                     continue
@@ -12363,6 +12582,10 @@ class MainWindow(QMainWindow):
         if current_date > self.last_refresh_date:
             logger.info(f"New day detected ({current_date}), refreshing option chain")
             self.last_refresh_date = current_date
+            
+            # Reset expired positions prompt for new trading day
+            self.expired_positions_prompt_shown = False
+            
             if self.connection_state == ConnectionState.CONNECTED:
                 # Recalculate expiry (will auto-switch to tomorrow if after 4PM)
                 old_expiry = self.current_expiry

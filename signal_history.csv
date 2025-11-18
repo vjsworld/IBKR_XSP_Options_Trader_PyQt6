@@ -209,3 +209,6 @@ DateTime,Signal,Action,Contract,Status,Price,Details
 2025-11-18 14:55:15,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
 2025-11-18 14:55:15,SHORT (Put),BUY,XSP 661.0 P 20251118,Preparing,N/A,Entry: SHORT (Put) at 30Δ
 2025-11-18 14:55:15,SHORT (Put),BUY,XSP 661.0 P 20251118,Placing Order,0.01,Qty: 2 @ $0.01
+2025-11-18 15:36:05,SHORT,Signal,N/A,Received,N/A,Strategy changed: FLAT → SHORT
+2025-11-18 15:37:45,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 15:41:15,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
