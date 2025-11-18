@@ -11515,15 +11515,18 @@ class MainWindow(QMainWindow):
     def check_expired_positions(self):
         """
         Check for expired options that are still held 10+ minutes after expiration.
+        SPX/XSP options expire at 3:00 PM CT, check starts at 3:10 PM CT.
+        ES/MES options expire at 4:00 PM CT, check starts at 4:10 PM CT.
+        Continues checking until midnight CT.
         Prompt user once to virtually close them for P&L logging.
         """
         try:
             ct_tz = pytz.timezone('America/Chicago')
             now_ct = datetime.now(ct_tz)
             
-            # Only check during trading hours or shortly after market close
+            # Check from appropriate time until midnight (no upper limit except midnight)
             current_hour = now_ct.hour
-            if current_hour < 8 or current_hour > 17:
+            if current_hour >= 24:  # After midnight, stop checking
                 return
             
             expired_positions = []
@@ -11544,7 +11547,23 @@ class MainWindow(QMainWindow):
                 try:
                     # Parse expiry date (YYYYMMDD format)
                     expiry_date = datetime.strptime(expiry_str, '%Y%m%d')
-                    expiry_date_ct = ct_tz.localize(expiry_date.replace(hour=15, minute=0, second=0))  # 3:00 PM CT close
+                    
+                    # Determine expiration time based on instrument type
+                    # SPX/XSP: 3:00 PM CT, ES/MES: 4:00 PM CT
+                    if self.selected_instrument in ['ES', 'MES']:
+                        expiry_hour = 16  # 4:00 PM CT
+                    else:  # SPX, XSP
+                        expiry_hour = 15  # 3:00 PM CT
+                    
+                    expiry_date_ct = ct_tz.localize(expiry_date.replace(hour=expiry_hour, minute=0, second=0))
+                    
+                    # Check if contract expired TODAY (compare dates only)
+                    today_ct = now_ct.date()
+                    expiry_date_only = expiry_date_ct.date()
+                    
+                    if expiry_date_only != today_ct:
+                        # Not expired today, skip
+                        continue
                     
                     # Check if expired more than 10 minutes ago
                     time_since_expiry = (now_ct - expiry_date_ct).total_seconds() / 60  # minutes
