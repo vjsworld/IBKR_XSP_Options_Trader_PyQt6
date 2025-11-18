@@ -11453,7 +11453,15 @@ class MainWindow(QMainWindow):
                 pos['pnl'] = (0.0 - pos['avgCost']) * pos['position'] * multiplier
             
             pnl = pos.get('pnl', 0)
-            pnl_pct = (pos['currentPrice'] / pos['avgCost'] - 1) * 100 if pos['avgCost'] > 0 else 0
+            
+            # Calculate P&L% correctly for both LONG and SHORT positions
+            # P&L% = (actual P&L / cost basis) × 100
+            # For LONG: cost basis = what we paid (debit)
+            # For SHORT: cost basis = what we received (credit)
+            # This makes expired worthless shorts show +100% (kept all premium)
+            cost_basis = pos['avgCost'] * abs(pos['position']) * int(self.instrument['multiplier'])
+            pnl_pct = (pnl / cost_basis * 100) if cost_basis > 0 else 0
+            
             total_pnl += pnl
             
             # Calculate time tracking
@@ -16044,7 +16052,15 @@ class MainWindow(QMainWindow):
                 pos['pnl'] = (0.0 - pos['avgCost']) * pos['position'] * multiplier
             
             pnl = pos.get('pnl', 0)
-            pnl_pct = (pos['currentPrice'] / pos['avgCost'] - 1) * 100 if pos['avgCost'] > 0 else 0
+            
+            # Calculate P&L% correctly for both LONG and SHORT positions
+            # P&L% = (actual P&L / cost basis) × 100
+            # For LONG: cost basis = what we paid (debit)
+            # For SHORT: cost basis = what we received (credit)
+            # This makes expired worthless shorts show +100% (kept all premium)
+            cost_basis = pos['avgCost'] * abs(pos['position']) * int(self.instrument['multiplier'])
+            pnl_pct = (pnl / cost_basis * 100) if cost_basis > 0 else 0
+            
             total_pnl += pnl
             
             # Calculate time tracking

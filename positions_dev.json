@@ -16,5 +16,11 @@
     "avgCost": 0.1400493335,
     "entryTime": "2025-11-18T14:37:54.904350",
     "is_automated": false
+  },
+  "ES_6680.0_C_20251119": {
+    "position": 1.0,
+    "avgCost": 15.0284,
+    "entryTime": "2025-11-18T17:42:17.602067",
+    "is_automated": true
   }
 }

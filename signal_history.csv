@@ -214,3 +214,8 @@ DateTime,Signal,Action,Contract,Status,Price,Details
 2025-11-18 15:41:15,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
 2025-11-18 17:12:11,LONG,Signal,N/A,Received,N/A,Strategy changed: FLAT → LONG
 2025-11-18 17:20:51,LONG,Signal,N/A,Received,N/A,Strategy changed: FLAT → LONG
+2025-11-18 17:34:49,LONG,Signal,N/A,Received,N/A,Strategy changed: FLAT → LONG
+2025-11-18 17:38:45,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 17:42:15,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 17:42:15,LONG (Call),BUY,ES 6680.0 C 20251119,Preparing,N/A,Entry: LONG (Call) at 30Δ
+2025-11-18 17:42:15,LONG (Call),BUY,ES 6680.0 C 20251119,Placing Order,14.25,Qty: 1 @ $14.25
