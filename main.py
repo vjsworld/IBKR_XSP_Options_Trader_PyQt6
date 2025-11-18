@@ -11514,9 +11514,9 @@ class MainWindow(QMainWindow):
     
     def check_expired_positions(self):
         """
-        Check for expired options that are still held 10+ minutes after expiration.
-        SPX/XSP options expire at 3:00 PM CT, check starts at 3:10 PM CT.
-        ES/MES options expire at 4:00 PM CT, check starts at 4:10 PM CT.
+        Check for expired options that are still held 1+ minute after expiration.
+        SPX/XSP options expire at 3:00 PM CT, check starts at 3:01 PM CT.
+        ES/MES options expire at 4:00 PM CT, check starts at 4:01 PM CT.
         Continues checking until midnight CT.
         Prompt user once to virtually close them for P&L logging.
         """
@@ -11565,10 +11565,10 @@ class MainWindow(QMainWindow):
                         # Not expired today, skip
                         continue
                     
-                    # Check if expired more than 10 minutes ago
+                    # Check if expired more than 1 minute ago
                     time_since_expiry = (now_ct - expiry_date_ct).total_seconds() / 60  # minutes
                     
-                    if time_since_expiry >= 10:
+                    if time_since_expiry >= 1:
                         # This position is expired and held 10+ minutes
                         current_value = self.market_data.get(contract_key, {}).get('last', 0)
                         expired_positions.append({

@@ -4,7 +4,7 @@
 This feature automatically detects expired options that are still held 10+ minutes after expiration and prompts the user to virtually close them for proper P&L logging.
 
 ## Problem Statement
-When 0DTE options expire, they often remain in the IBKR positions list temporarily. If these expired options have no value ($0), they represent a total loss, but if they still have some value, the P&L should be calculated from that exit price. Without proper tracking, these positions:
+When 0DTE options expire, they often remain in the IBKR positions list temporarily. If these expired options have no value ($0), they represent a total loss, but if they still have some value, the P&L should be calculated from that exit price. The system checks starting 1 minute after expiration to catch these positions early. Without proper tracking, these positions:
 - Clutter the positions grid
 - Lack proper P&L logging
 - May trigger false risk management alerts
@@ -15,11 +15,11 @@ When 0DTE options expire, they often remain in the IBKR positions list temporari
 ### Detection Logic
 - Timer-based check runs every second via `check_expired_positions()`
 - Instrument-specific expiration times:
-  - **SPX/XSP options**: Expire at 3:00 PM CT → Check starts at 3:10 PM CT
-  - **ES/MES options**: Expire at 4:00 PM CT → Check starts at 4:10 PM CT
+  - **SPX/XSP options**: Expire at 3:00 PM CT → Check starts at 3:01 PM CT
+  - **ES/MES options**: Expire at 4:00 PM CT → Check starts at 4:01 PM CT
 - Continues checking until midnight CT
 - Only checks contracts that expired **today** (compares system clock date with contract expiry date)
-- Detects options held **10+ minutes** after expiration time
+- Detects options held **1+ minute** after expiration time
 
 ### User Interaction
 - **One prompt per day**: `expired_positions_prompt_shown` flag prevents multiple popups
@@ -66,7 +66,7 @@ self.ignored_expired_contracts = set()       # Contracts to hide from grid
 
 #### `check_expired_positions()` (lines 11515-11593)
 - **Called by**: `check_profit_targets_and_stop_loss()` timer (every second)
-- **Purpose**: Detect expired options held 10+ minutes past expiration
+- **Purpose**: Detect expired options held 1+ minute past expiration
 - **Logic**:
   1. Check until midnight CT (24:00), then stop
   2. Parse contract_key expiry date (format: YYYYMMDD)
@@ -74,7 +74,7 @@ self.ignored_expired_contracts = set()       # Contracts to hide from grid
      - ES/MES: `expiry_date + 16:00 CT` (4:00 PM)
      - SPX/XSP: `expiry_date + 15:00 CT` (3:00 PM)
   4. Compare expiry date with today's date (system clock) - **only process if expired today**
-  5. Check if `now > expiry_time + 10 minutes`
+  5. Check if `now > expiry_time + 1 minute`
   6. Skip if in `virtually_closed_positions` or `ignored_expired_contracts`
   7. Get current market value from `self.market_data`
   8. Call `prompt_virtual_close_expired()` if positions found
@@ -174,9 +174,9 @@ self.expired_positions_prompt_shown = False
    - Positions remain visible and tracked normally
    
 5. **After-Hours Operation**:
-   - Check runs continuously from expiry+10min until midnight CT
-   - SPX/XSP: 3:10 PM - 11:59 PM CT window
-   - ES/MES: 4:10 PM - 11:59 PM CT window
+   - Check runs continuously from expiry+1min until midnight CT
+   - SPX/XSP: 3:01 PM - 11:59 PM CT window
+   - ES/MES: 4:01 PM - 11:59 PM CT window
    - Only processes contracts expired TODAY (prevents stale contract triggers)
    
 6. **Next Day Handling**:
