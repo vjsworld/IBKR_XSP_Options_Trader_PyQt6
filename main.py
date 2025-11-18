@@ -3198,6 +3198,7 @@ class MainWindow(QMainWindow):
         self.expired_positions_prompt_shown = False  # Track if we've shown the prompt today
         self.virtually_closed_positions = set()  # Track contract_keys that we've virtually closed
         self.ignored_expired_contracts = set()  # Contract_keys to ignore in positions grid (waiting for TWS removal)
+        self.expired_options_check_delay_minutes = 1  # Minutes after expiration to check (default: 1)
         
         # Chart data storage - separate from general historical_data for chart-specific needs
         self.chart_data = {
@@ -6317,6 +6318,24 @@ class MainWindow(QMainWindow):
         self.chase_give_in_spin.valueChanged.connect(self.on_chase_interval_changed)
         
         layout.addWidget(chase_group)
+        
+        # Expired Options Settings
+        expired_group = QGroupBox("Expired Options Virtual Close")
+        expired_layout = QFormLayout(expired_group)
+        
+        self.expired_check_delay_spin = QSpinBox()
+        self.expired_check_delay_spin.setRange(1, 60)
+        self.expired_check_delay_spin.setSingleStep(1)
+        self.expired_check_delay_spin.setValue(self.expired_options_check_delay_minutes)
+        self.expired_check_delay_spin.setSuffix(" min")
+        self.expired_check_delay_spin.setToolTip(
+            "Minutes after expiration to wait before prompting for virtual close.\n"
+            "SPX/XSP expire at 3:00 PM CT, ES/MES expire at 4:00 PM CT.\n"
+            "Check continues until midnight CT for positions expired today."
+        )
+        expired_layout.addRow("Check Delay After Expiry:", self.expired_check_delay_spin)
+        
+        layout.addWidget(expired_group)
         
         # TradeStation GlobalDictionary Settings
         gd_group = QGroupBox("TradeStation GlobalDictionary")
@@ -11514,9 +11533,9 @@ class MainWindow(QMainWindow):
     
     def check_expired_positions(self):
         """
-        Check for expired options that are still held 1+ minute after expiration.
-        SPX/XSP options expire at 3:00 PM CT, check starts at 3:01 PM CT.
-        ES/MES options expire at 4:00 PM CT, check starts at 4:01 PM CT.
+        Check for expired options that are still held N minutes after expiration.
+        SPX/XSP options expire at 3:00 PM CT, ES/MES options expire at 4:00 PM CT.
+        Delay is configurable in Settings (default: 1 minute).
         Continues checking until midnight CT.
         Prompt user once to virtually close them for P&L logging.
         """
@@ -11565,10 +11584,10 @@ class MainWindow(QMainWindow):
                         # Not expired today, skip
                         continue
                     
-                    # Check if expired more than 1 minute ago
+                    # Check if expired more than configured delay minutes ago
                     time_since_expiry = (now_ct - expiry_date_ct).total_seconds() / 60  # minutes
                     
-                    if time_since_expiry >= 1:
+                    if time_since_expiry >= self.expired_options_check_delay_minutes:
                         # This position is expired and held 10+ minutes
                         current_value = self.market_data.get(contract_key, {}).get('last', 0)
                         expired_positions.append({
@@ -11655,23 +11674,23 @@ class MainWindow(QMainWindow):
                 entry_cost = avg_cost * position_size * multiplier
                 
                 # Calculate exit value
-                if current_value <= 0:
-                    # Total loss - option expired worthless
-                    exit_value = 0
-                    pnl = -entry_cost
-                    pnl_pct = -100.0
+                # For LONG: entry_cost is what we PAID (debit), exit_value is what we GET
+                # For SHORT: entry_cost is what we RECEIVED (credit), exit_value is what we OWE
+                exit_value = current_value * position_size * multiplier
+                
+                # Determine if LONG or SHORT
+                if pos.get('position', 0) > 0:
+                    # LONG position: bought option (paid premium)
+                    # P&L = exit_value - entry_cost
+                    # If expired worthless ($0): P&L = 0 - entry_cost = -entry_cost (loss)
+                    pnl = exit_value - entry_cost
+                    pnl_pct = (pnl / entry_cost * 100) if entry_cost > 0 else 0
                 else:
-                    # Has some value
-                    exit_value = current_value * position_size * multiplier
-                    
-                    # Determine if LONG or SHORT
-                    if pos.get('position', 0) > 0:
-                        # LONG position: bought option
-                        pnl = exit_value - entry_cost
-                    else:
-                        # SHORT position: sold option
-                        pnl = entry_cost - exit_value
-                    
+                    # SHORT position: sold option (received premium)
+                    # P&L = entry_cost - exit_value
+                    # If expired worthless ($0): P&L = entry_cost - 0 = +entry_cost (profit - keep all premium)
+                    # If has value: P&L = entry_cost - exit_value (we owe exit_value)
+                    pnl = entry_cost - exit_value
                     pnl_pct = (pnl / entry_cost * 100) if entry_cost > 0 else 0
                 
                 # Log to trade CSV using virtual order ID (0)
@@ -12980,6 +12999,9 @@ class MainWindow(QMainWindow):
             self.chain_refresh_interval = self.chain_refresh_settings_spin.value()
             self.chain_drift_threshold = self.chain_drift_settings_spin.value()
             
+            # Sync expired options settings
+            self.expired_options_check_delay_minutes = self.expired_check_delay_spin.value()
+            
             # Sync TradeStation chain settings
             self.ts_strikes_above = self.ts_strikes_above_spin.value()
             self.ts_strikes_below = self.ts_strikes_below_spin.value()
@@ -13092,6 +13114,9 @@ class MainWindow(QMainWindow):
                 
                 # Order Chasing Settings
                 'chase_give_in_interval': self.chase_give_in_interval,
+                
+                # Expired Options Settings
+                'expired_options_check_delay_minutes': self.expired_options_check_delay_minutes,
             }
             
             Path(self.get_environment_file_path('settings.json')).write_text(json.dumps(settings, indent=2))
@@ -16324,6 +16349,10 @@ class MainWindow(QMainWindow):
                 # Order Chasing Settings
                 self.chase_give_in_interval = settings.get('chase_give_in_interval', 3.0)
                 self.chase_give_in_spin.setValue(self.chase_give_in_interval)
+                
+                # Expired Options Settings
+                self.expired_options_check_delay_minutes = settings.get('expired_options_check_delay_minutes', 1)
+                self.expired_check_delay_spin.setValue(self.expired_options_check_delay_minutes)
                 
                 # Update TradeStation UI widgets (if tab exists)
                 if TRADESTATION_AVAILABLE and hasattr(self, 'ts_auto_trading_checkbox'):
