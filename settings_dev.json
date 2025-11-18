@@ -59,5 +59,6 @@
   "ts_use_martingale": true,
   "ts_martingale_initial_qty": 1,
   "ts_martingale_max_losses": 5,
-  "chase_give_in_interval": 2.0
+  "chase_give_in_interval": 2.0,
+  "expired_options_check_delay_minutes": 1
 }

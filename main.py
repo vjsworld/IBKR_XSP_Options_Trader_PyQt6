@@ -11689,6 +11689,7 @@ class MainWindow(QMainWindow):
                     # SHORT position: sold option (received premium)
                     # P&L = entry_cost - exit_value
                     # If expired worthless ($0): P&L = entry_cost - 0 = +entry_cost (profit - keep all premium)
+                    # P&L% = (entry_cost / entry_cost) × 100 = +100% (kept 100% of premium received)
                     # If has value: P&L = entry_cost - exit_value (we owe exit_value)
                     pnl = entry_cost - exit_value
                     pnl_pct = (pnl / entry_cost * 100) if entry_cost > 0 else 0
