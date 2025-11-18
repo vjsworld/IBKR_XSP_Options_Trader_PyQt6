@@ -11540,6 +11540,10 @@ class MainWindow(QMainWindow):
                 # Only check automated strategy positions
                 if not pos.get('is_automated', False):
                     continue
+                
+                # Skip if position is already being closed
+                if pos.get('is_closing', False):
+                    continue
                     
                 pnl = pos.get('pnl', 0)
                 cost = pos['avgCost'] * abs(pos['position']) * int(self.instrument['multiplier'])
@@ -11551,6 +11555,15 @@ class MainWindow(QMainWindow):
                         f"${pnl:,.2f} / ${cost:,.2f}"
                     )
                     if pnl_pct >= self.ts_position_profit_target_pct:
+                        # Mark position as closing to prevent re-triggers
+                        pos['is_closing'] = True
+                        
+                        # Capture values before they change (for popup)
+                        _contract_key = contract_key
+                        _pnl_pct = pnl_pct
+                        _target = self.ts_position_profit_target_pct
+                        _pnl = pnl
+                        
                         self.log_message(
                             f"💰 POSITION TARGET HIT! {contract_key} up {pnl_pct:.2f}% "
                             f"(target: {self.ts_position_profit_target_pct}%) - Closing position",
@@ -11562,13 +11575,13 @@ class MainWindow(QMainWindow):
                         self.close_single_position(contract_key, f"Profit target {pnl_pct:.2f}%")
                         
                         # Show non-blocking popup AFTER with slight delay
-                        QTimer.singleShot(100, lambda: QMessageBox.information(
+                        QTimer.singleShot(100, lambda key=_contract_key, pct=_pnl_pct, tgt=_target, p=_pnl: QMessageBox.information(
                             self,
                             "💰 Position Profit Target Hit!",
-                            f"Position: {contract_key}\n\n"
-                            f"Profit: {pnl_pct:+.2f}%\n"
-                            f"Target: {self.ts_position_profit_target_pct:.1f}%\n\n"
-                            f"P&L: ${pnl:+,.2f}\n\n"
+                            f"Position: {key}\n\n"
+                            f"Profit: {pct:+.2f}%\n"
+                            f"Target: {tgt:.1f}%\n\n"
+                            f"P&L: ${p:+,.2f}\n\n"
                             f"Position has been closed."
                         ))
                         return
@@ -11578,6 +11591,10 @@ class MainWindow(QMainWindow):
             for contract_key, pos in self.positions.items():
                 # Only check automated strategy positions
                 if not pos.get('is_automated', False):
+                    continue
+                
+                # Skip if position is already being closed
+                if pos.get('is_closing', False):
                     continue
                     
                 pnl = pos.get('pnl', 0)
@@ -11591,6 +11608,15 @@ class MainWindow(QMainWindow):
                     )
                     # Check for loss (negative P&L percentage)
                     if pnl_pct <= -self.ts_position_stop_loss_pct:
+                        # Mark position as closing to prevent re-triggers
+                        pos['is_closing'] = True
+                        
+                        # Capture values before they change (for popup)
+                        _contract_key = contract_key
+                        _pnl_pct = pnl_pct
+                        _stop = self.ts_position_stop_loss_pct
+                        _pnl = pnl
+                        
                         self.log_message(
                             f"🚨 POSITION STOP HIT! {contract_key} down {abs(pnl_pct):.2f}% "
                             f"(stop: {self.ts_position_stop_loss_pct}%) - Closing position",
@@ -11602,13 +11628,13 @@ class MainWindow(QMainWindow):
                         self.close_single_position(contract_key, f"Stop loss {abs(pnl_pct):.2f}%")
                         
                         # Show non-blocking popup AFTER with slight delay
-                        QTimer.singleShot(100, lambda: QMessageBox.warning(
+                        QTimer.singleShot(100, lambda key=_contract_key, pct=_pnl_pct, stp=_stop, p=_pnl: QMessageBox.warning(
                             self,
                             "🚨 Position Stop Loss Hit!",
-                            f"Position: {contract_key}\n\n"
-                            f"Loss: {pnl_pct:.2f}%\n"
-                            f"Stop: -{self.ts_position_stop_loss_pct:.1f}%\n\n"
-                            f"P&L: ${pnl:+,.2f}\n\n"
+                            f"Position: {key}\n\n"
+                            f"Loss: {pct:.2f}%\n"
+                            f"Stop: -{stp:.1f}%\n\n"
+                            f"P&L: ${p:+,.2f}\n\n"
                             f"Position has been closed."
                         ))
                         return

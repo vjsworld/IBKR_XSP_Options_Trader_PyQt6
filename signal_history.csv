@@ -1,0 +1,211 @@
+DateTime,Signal,Action,Contract,Status,Price,Details
+2025-11-17 20:53:25,SHORT,Signal,N/A,Received,N/A,Strategy changed: FLAT → SHORT
+2025-11-17 20:53:51,SHORT (Put),BUY,ES 6655.0 P 20251118,Preparing,N/A,Entry: SHORT (Put) at 30Δ
+2025-11-17 20:53:51,SHORT (Put),BUY,ES 6655.0 P 20251118,Placing Order,16.25,Qty: 6 @ $16.25
+2025-11-17 20:54:00,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-17 20:54:00,EXIT,SELL,ES 6655.0 P 20251118,Closing,16.25,Exit PUT: 6.0 @ $16.25
+2025-11-17 20:54:00,LONG (Call),BUY,ES 6730.0 C 20251118,Preparing,N/A,Entry: LONG (Call) at 30Δ
+2025-11-17 20:54:00,LONG (Call),BUY,ES 6730.0 C 20251118,Placing Order,13.50,Qty: 8 @ $13.50
+2025-11-17 20:56:45,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-17 20:56:45,EXIT,SELL,ES 6730.0 C 20251118,Closing,12.25,Exit CALL: 8.0 @ $12.25
+2025-11-17 20:56:45,SHORT (Put),BUY,ES 6650.0 P 20251118,Preparing,N/A,Entry: SHORT (Put) at 30Δ
+2025-11-17 20:56:45,SHORT (Put),BUY,ES 6650.0 P 20251118,Placing Order,15.25,Qty: 14 @ $15.25
+2025-11-17 20:58:50,SHORT,Signal,N/A,Received,N/A,Strategy changed: FLAT → SHORT
+2025-11-17 21:10:15,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-17 21:30:00,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-17 21:39:30,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-17 21:45:15,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-17 21:55:00,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-17 22:01:15,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-17 22:25:30,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-17 23:02:15,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-17 23:05:15,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-17 23:18:15,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-17 23:20:00,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-17 23:26:15,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-17 23:44:30,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-17 23:52:30,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 00:01:30,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 00:04:30,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 00:12:45,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 00:20:45,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 00:40:45,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 00:58:00,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 01:08:45,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 01:51:00,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 02:00:15,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 02:16:00,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 02:30:15,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 02:45:45,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 03:00:30,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 03:01:15,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 03:12:00,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 03:20:30,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 03:32:45,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 03:35:00,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 03:44:45,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 04:07:45,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 04:18:30,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 04:22:30,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 04:31:30,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 04:35:15,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 04:46:45,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 05:00:15,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 05:23:00,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 05:25:45,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 05:41:45,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 05:45:30,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 05:47:45,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 05:51:00,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 05:55:15,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 06:01:00,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 06:18:00,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 06:25:45,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 06:36:45,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 06:41:15,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 06:59:45,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 07:19:00,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 07:30:45,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 07:36:30,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 07:41:30,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 07:45:45,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 07:54:15,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 07:59:45,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 08:30:15,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 08:31:15,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 08:32:30,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 08:34:45,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 09:07:15,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 09:17:00,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 09:21:00,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 09:35:15,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 09:55:45,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 10:00:00,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 10:07:30,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 10:37:42,LONG,Signal,N/A,Received,N/A,Strategy changed: FLAT → LONG
+2025-11-18 10:38:07,LONG (Call),BUY,ES 6680.0 C 20251118,Preparing,N/A,Entry: LONG (Call) at 30Δ
+2025-11-18 10:38:07,LONG (Call),BUY,ES 6680.0 C 20251118,Placing Order,9.75,Qty: 44 @ $9.75
+2025-11-18 10:40:15,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 10:44:24,EXIT,SELL,ES 6680.0 C 20251118,Closing,9.00,Exit CALL: 44.0 @ $9.00
+2025-11-18 10:44:24,SHORT (Put),BUY,ES 6625.0 P 20251118,Preparing,N/A,Entry: SHORT (Put) at 30Δ
+2025-11-18 10:44:24,SHORT (Put),BUY,ES 6625.0 P 20251118,Placing Order,10.00,Qty: 40 @ $10.00
+2025-11-18 11:21:45,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 11:21:45,LONG (Call),BUY,ES 6695.0 C 20251119,Preparing,N/A,Entry: LONG (Call) at 30Δ
+2025-11-18 11:21:45,LONG (Call),BUY,ES 6695.0 C 20251119,Placing Order,15.50,Qty: 7 @ $15.50
+2025-11-18 11:21:55,LONG,Signal,N/A,Received,N/A,Strategy changed: FLAT → LONG
+2025-11-18 11:22:12,LONG (Call),BUY,ES 6680.0 C 20251119,Preparing,N/A,Entry: LONG (Call) at 30Δ
+2025-11-18 11:22:12,LONG (Call),BUY,ES 6680.0 C 20251119,Placing Order,19.75,Qty: 40 @ $19.75
+2025-11-18 11:27:15,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 11:27:15,EXIT,SELL,ES 6680.0 C 20251119,Closing,17.00,Exit CALL: 40.0 @ $17.00
+2025-11-18 11:27:15,SHORT (Put),BUY,ES 6600.0 P 20251119,Preparing,N/A,Entry: SHORT (Put) at 30Δ
+2025-11-18 11:27:15,SHORT (Put),BUY,ES 6600.0 P 20251119,Placing Order,26.50,Qty: 32 @ $26.50
+2025-11-18 11:35:30,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 11:35:30,EXIT,SELL,ES 6600.0 P 20251119,Closing,28.00,Exit PUT: 32.0 @ $28.00
+2025-11-18 11:35:30,LONG (Call),BUY,ES 6675.0 C 20251119,Preparing,N/A,Entry: LONG (Call) at 30Δ
+2025-11-18 11:35:30,LONG (Call),BUY,ES 6675.0 C 20251119,Placing Order,17.50,Qty: 96 @ $17.50
+2025-11-18 11:47:18,LONG,Signal,N/A,Received,N/A,Strategy changed: FLAT → LONG
+2025-11-18 11:47:59,LONG (Call),BUY,ES 6700.0 C 20251119,Preparing,N/A,Entry: LONG (Call) at 30Δ
+2025-11-18 11:47:59,LONG (Call),BUY,ES 6700.0 C 20251119,Placing Order,19.00,Qty: 6 @ $19.00
+2025-11-18 11:58:02,LONG,Signal,N/A,Received,N/A,Strategy changed: FLAT → LONG
+2025-11-18 12:21:00,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 12:27:30,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 12:30:38,LONG,Signal,N/A,Received,N/A,Strategy changed: FLAT → LONG
+2025-11-18 12:37:15,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 12:40:15,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 12:40:15,LONG (Call),BUY,ES 6715.0 C 20251119,Preparing,N/A,Entry: LONG (Call) at 30Δ
+2025-11-18 12:40:15,LONG (Call),BUY,ES 6715.0 C 20251119,Placing Order,18.00,Qty: 6 @ $18.00
+2025-11-18 12:49:58,LONG,Signal,N/A,Received,N/A,Strategy changed: FLAT → LONG
+2025-11-18 12:54:00,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 12:54:00,SHORT (Put),BUY,ES 6660.0 P 20251118,Preparing,N/A,Entry: SHORT (Put) at 30Δ
+2025-11-18 12:54:00,SHORT (Put),BUY,ES 6660.0 P 20251118,Placing Order,6.25,Qty: 18 @ $6.25
+2025-11-18 13:00:45,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 13:00:45,LONG (Call),BUY,ES 6685.0 C 20251118,Preparing,N/A,Entry: LONG (Call) at 30Δ
+2025-11-18 13:00:45,LONG (Call),BUY,ES 6685.0 C 20251118,Placing Order,6.50,Qty: 34 @ $6.50
+2025-11-18 13:02:00,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 13:02:00,EXIT,SELL,ES 6685.0 C 20251118,Closing,7.50,Exit CALL: 34.0 @ $7.50
+2025-11-18 13:02:00,SHORT (Put),BUY,ES 6655.0 P 20251118,Preparing,N/A,Entry: SHORT (Put) at 30Δ
+2025-11-18 13:02:00,SHORT (Put),BUY,ES 6655.0 P 20251118,Placing Order,7.00,Qty: 32 @ $7.00
+2025-11-18 13:03:00,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 13:03:00,EXIT,SELL,ES 6655.0 P 20251118,Closing,7.00,Exit PUT: 32.0 @ $7.00
+2025-11-18 13:03:00,LONG (Call),BUY,ES 6690.0 C 20251118,Preparing,N/A,Entry: LONG (Call) at 30Δ
+2025-11-18 13:03:00,LONG (Call),BUY,ES 6690.0 C 20251118,Placing Order,6.00,Qty: 19 @ $6.00
+2025-11-18 13:03:45,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 13:03:45,EXIT,SELL,ES 6690.0 C 20251118,Closing,4.50,Exit CALL: 19.0 @ $4.50
+2025-11-18 13:03:45,SHORT (Put),BUY,ES 6650.0 P 20251118,Preparing,N/A,Entry: SHORT (Put) at 30Δ
+2025-11-18 13:03:45,SHORT (Put),BUY,ES 6650.0 P 20251118,Placing Order,7.50,Qty: 30 @ $7.50
+2025-11-18 13:05:30,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 13:05:30,EXIT,SELL,ES 6650.0 P 20251118,Closing,5.75,Exit PUT: 30.0 @ $5.75
+2025-11-18 13:05:30,LONG (Call),BUY,ES 6690.0 C 20251118,Preparing,N/A,Entry: LONG (Call) at 30Δ
+2025-11-18 13:05:30,LONG (Call),BUY,ES 6690.0 C 20251118,Placing Order,5.50,Qty: 80 @ $5.50
+2025-11-18 13:07:45,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 13:07:45,EXIT,SELL,ES 6690.0 C 20251118,Closing,4.50,Exit CALL: 80.0 @ $4.50
+2025-11-18 13:07:45,SHORT (Put),BUY,ES 6650.0 P 20251118,Preparing,N/A,Entry: SHORT (Put) at 30Δ
+2025-11-18 13:07:45,SHORT (Put),BUY,ES 6650.0 P 20251118,Placing Order,6.50,Qty: 136 @ $6.50
+2025-11-18 13:09:45,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 13:09:45,EXIT,SELL,ES 6650.0 P 20251118,Closing,4.75,Exit PUT: 136.0 @ $4.75
+2025-11-18 13:09:45,LONG (Call),BUY,ES 6690.0 C 20251118,Preparing,N/A,Entry: LONG (Call) at 30Δ
+2025-11-18 13:09:45,LONG (Call),BUY,ES 6690.0 C 20251118,Placing Order,6.00,Qty: 304 @ $6.00
+2025-11-18 13:10:45,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 13:10:45,EXIT,SELL,ES 6690.0 C 20251118,Closing,4.75,Exit CALL: 304.0 @ $4.75
+2025-11-18 13:10:45,SHORT (Put),BUY,ES 6655.0 P 20251118,Preparing,N/A,Entry: SHORT (Put) at 30Δ
+2025-11-18 13:10:45,SHORT (Put),BUY,ES 6655.0 P 20251118,Placing Order,7.25,Qty: 15 @ $7.25
+2025-11-18 13:12:30,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 13:12:30,EXIT,SELL,ES 6655.0 P 20251118,Closing,6.25,Exit PUT: 15.0 @ $6.25
+2025-11-18 13:12:30,LONG (Call),BUY,ES 6690.0 C 20251118,Preparing,N/A,Entry: LONG (Call) at 30Δ
+2025-11-18 13:12:30,LONG (Call),BUY,ES 6690.0 C 20251118,Placing Order,5.25,Qty: 42 @ $5.25
+2025-11-18 13:15:30,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 13:15:30,EXIT,SELL,ES 6690.0 C 20251118,Closing,5.50,Exit CALL: 42.0 @ $5.50
+2025-11-18 13:15:30,SHORT (Put),BUY,ES 6655.0 P 20251118,Preparing,N/A,Entry: SHORT (Put) at 30Δ
+2025-11-18 13:15:30,SHORT (Put),BUY,ES 6655.0 P 20251118,Placing Order,5.75,Qty: 80 @ $5.75
+2025-11-18 13:18:15,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 13:18:15,EXIT,SELL,ES 6655.0 P 20251118,Closing,7.25,Exit PUT: 80.0 @ $7.25
+2025-11-18 13:18:15,LONG (Call),BUY,ES 6685.0 C 20251118,Preparing,N/A,Entry: LONG (Call) at 30Δ
+2025-11-18 13:18:15,LONG (Call),BUY,ES 6685.0 C 20251118,Placing Order,5.75,Qty: 160 @ $5.75
+2025-11-18 13:20:45,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 13:20:45,SHORT (Put),BUY,ES 6660.0 P 20251118,Preparing,N/A,Entry: SHORT (Put) at 30Δ
+2025-11-18 13:20:45,SHORT (Put),BUY,ES 6660.0 P 20251118,Placing Order,7.00,Qty: 16 @ $7.00
+2025-11-18 13:22:45,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 13:22:45,EXIT,SELL,ES 6660.0 P 20251118,Closing,7.50,Exit PUT: 16.0 @ $7.50
+2025-11-18 13:22:45,LONG (Call),BUY,ES 6685.0 C 20251118,Preparing,N/A,Entry: LONG (Call) at 30Δ
+2025-11-18 13:22:45,LONG (Call),BUY,ES 6685.0 C 20251118,Placing Order,6.00,Qty: 19 @ $6.00
+2025-11-18 13:23:15,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 13:23:15,EXIT,SELL,ES 6685.0 C 20251118,Closing,5.00,Exit CALL: 19.0 @ $5.00
+2025-11-18 13:23:15,SHORT (Put),BUY,ES 6650.0 P 20251118,Preparing,N/A,Entry: SHORT (Put) at 30Δ
+2025-11-18 13:23:15,SHORT (Put),BUY,ES 6650.0 P 20251118,Placing Order,5.75,Qty: 20 @ $5.75
+2025-11-18 13:25:15,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 13:25:15,EXIT,SELL,ES 6650.0 P 20251118,Closing,5.25,Exit PUT: 20.0 @ $5.25
+2025-11-18 13:25:15,LONG (Call),BUY,ES 6685.0 C 20251118,Preparing,N/A,Entry: LONG (Call) at 30Δ
+2025-11-18 13:25:15,LONG (Call),BUY,ES 6685.0 C 20251118,Placing Order,5.50,Qty: 40 @ $5.50
+2025-11-18 13:27:15,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 13:27:15,EXIT,SELL,ES 6685.0 C 20251118,Closing,4.75,Exit CALL: 40.0 @ $4.75
+2025-11-18 13:27:15,SHORT (Put),BUY,ES 6650.0 P 20251118,Preparing,N/A,Entry: SHORT (Put) at 30Δ
+2025-11-18 13:27:15,SHORT (Put),BUY,ES 6650.0 P 20251118,Placing Order,5.25,Qty: 84 @ $5.25
+2025-11-18 13:37:00,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 13:37:00,EXIT,SELL,ES 6650.0 P 20251118,Closing,4.00,Exit PUT: 84.0 @ $4.00
+2025-11-18 13:37:00,LONG (Call),BUY,ES 6685.0 C 20251118,Preparing,N/A,Entry: LONG (Call) at 30Δ
+2025-11-18 13:37:00,LONG (Call),BUY,ES 6685.0 C 20251118,Placing Order,5.00,Qty: 184 @ $5.00
+2025-11-18 13:43:33,LONG,Signal,N/A,Received,N/A,Strategy changed: FLAT → LONG
+2025-11-18 13:44:30,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 13:50:22,LONG,Signal,N/A,Received,N/A,Strategy changed: FLAT → LONG
+2025-11-18 13:53:31,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 13:53:31,SHORT (Put),BUY,XSP 664.0 P 20251118,Preparing,N/A,Entry: SHORT (Put) at 30Δ
+2025-11-18 13:53:31,SHORT (Put),BUY,XSP 664.0 P 20251118,Placing Order,0.52,Qty: 1 @ $0.52
+2025-11-18 13:59:45,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 13:59:45,LONG (Call),BUY,XSP 667.0 C 20251118,Preparing,N/A,Entry: LONG (Call) at 30Δ
+2025-11-18 13:59:45,LONG (Call),BUY,XSP 667.0 C 20251118,Placing Order,0.54,Qty: 16 @ $0.54
+2025-11-18 14:04:45,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 14:04:45,EXIT,SELL,XSP 667.0 C 20251118,Closing,0.35,Exit CALL: 16.0 @ $0.35
+2025-11-18 14:04:45,SHORT (Put),BUY,XSP 664.0 P 20251118,Preparing,N/A,Entry: SHORT (Put) at 30Δ
+2025-11-18 14:04:45,SHORT (Put),BUY,XSP 664.0 P 20251118,Placing Order,0.43,Qty: 16 @ $0.43
+2025-11-18 14:12:41,SHORT,Signal,N/A,Received,N/A,Strategy changed: FLAT → SHORT
+2025-11-18 14:25:59,SHORT,Signal,N/A,Received,N/A,Strategy changed: FLAT → SHORT
+2025-11-18 14:34:19,LONG,Signal,N/A,Received,N/A,Strategy changed: FLAT → LONG
+2025-11-18 14:34:45,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 14:36:13,SHORT (Put),BUY,XSP 662.0 P 20251118,Preparing,N/A,Entry: SHORT (Put) at 30Δ
+2025-11-18 14:36:13,SHORT (Put),BUY,XSP 662.0 P 20251118,Placing Order,0.28,Qty: 2 @ $0.28
+2025-11-18 14:50:30,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 14:50:30,LONG (Call),BUY,XSP 664.0 C 20251118,Preparing,N/A,Entry: LONG (Call) at 30Δ
+2025-11-18 14:50:30,LONG (Call),BUY,XSP 664.0 C 20251118,Placing Order,0.31,Qty: 2 @ $0.31
+2025-11-18 14:55:15,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 14:55:15,SHORT (Put),BUY,XSP 661.0 P 20251118,Preparing,N/A,Entry: SHORT (Put) at 30Δ
+2025-11-18 14:55:15,SHORT (Put),BUY,XSP 661.0 P 20251118,Placing Order,0.01,Qty: 2 @ $0.01
