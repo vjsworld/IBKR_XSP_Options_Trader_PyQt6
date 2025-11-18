@@ -9040,6 +9040,21 @@ class MainWindow(QMainWindow):
         self.ts_martingale_next_qty_label.setStyleSheet("color: #FF9800; font-weight: bold; font-size: 10px;")
         martingale_layout.addWidget(self.ts_martingale_next_qty_label)
         
+        # Reset Button
+        self.ts_martingale_reset_btn = QPushButton("Reset to 1x")
+        self.ts_martingale_reset_btn.setToolTip(
+            "Reset Martingale multiplier to 1x\n"
+            "• Sets consecutive losses to 0\n"
+            "• Next trade will use initial quantity\n"
+            "• Use this to manually restart the cycle"
+        )
+        self.ts_martingale_reset_btn.setStyleSheet(
+            "QPushButton { background-color: #FF5722; color: white; font-weight: bold; padding: 4px; }"
+            "QPushButton:hover { background-color: #E64A19; }"
+        )
+        self.ts_martingale_reset_btn.clicked.connect(self.on_martingale_reset_clicked)
+        martingale_layout.addWidget(self.ts_martingale_reset_btn)
+        
         top_settings_row.addWidget(martingale_group)
         
         # 10. Reserved for Future Control
@@ -11542,17 +11557,20 @@ class MainWindow(QMainWindow):
                             "SUCCESS"
                         )
                         logger.warning(f"🎯 POSITION TARGET HIT: {contract_key} at {pnl_pct:.2f}% >= {self.ts_position_profit_target_pct}%")
-                        # Show popup alert
-                        QMessageBox.information(
+                        
+                        # Close position FIRST
+                        self.close_single_position(contract_key, f"Profit target {pnl_pct:.2f}%")
+                        
+                        # Show non-blocking popup AFTER with slight delay
+                        QTimer.singleShot(100, lambda: QMessageBox.information(
                             self,
                             "💰 Position Profit Target Hit!",
                             f"Position: {contract_key}\n\n"
                             f"Profit: {pnl_pct:+.2f}%\n"
                             f"Target: {self.ts_position_profit_target_pct:.1f}%\n\n"
                             f"P&L: ${pnl:+,.2f}\n\n"
-                            f"Position is being closed."
-                        )
-                        self.close_single_position(contract_key, f"Profit target {pnl_pct:.2f}%")
+                            f"Position has been closed."
+                        ))
                         return
         
         # Check position stop loss (if enabled) - ONLY AUTOMATED POSITIONS
@@ -11579,17 +11597,20 @@ class MainWindow(QMainWindow):
                             "ERROR"
                         )
                         logger.warning(f"🛑 POSITION STOP HIT: {contract_key} at {pnl_pct:.2f}% <= -{self.ts_position_stop_loss_pct}%")
-                        # Show popup alert
-                        QMessageBox.warning(
+                        
+                        # Close position FIRST
+                        self.close_single_position(contract_key, f"Stop loss {abs(pnl_pct):.2f}%")
+                        
+                        # Show non-blocking popup AFTER with slight delay
+                        QTimer.singleShot(100, lambda: QMessageBox.warning(
                             self,
                             "🚨 Position Stop Loss Hit!",
                             f"Position: {contract_key}\n\n"
                             f"Loss: {pnl_pct:.2f}%\n"
                             f"Stop: -{self.ts_position_stop_loss_pct:.1f}%\n\n"
                             f"P&L: ${pnl:+,.2f}\n\n"
-                            f"Position is being closed."
-                        )
-                        self.close_single_position(contract_key, f"Stop loss {abs(pnl_pct):.2f}%")
+                            f"Position has been closed."
+                        ))
                         return
         
         # Check account profit target (if enabled and have start balance)
@@ -11639,27 +11660,38 @@ class MainWindow(QMainWindow):
                 f"(Unrealized=${self.ts_session_unrealized_pnl:,.2f}, Realized=${self.ts_session_realized_pnl:,.2f})"
             )
             if self.ts_session_total_pct >= self.ts_session_account_target_pct:
+                # Save values before they change
+                total_pnl = self.ts_session_total_pnl
+                total_pct = self.ts_session_total_pct
+                unrealized = self.ts_session_unrealized_pnl
+                realized = self.ts_session_realized_pnl
+                target = self.ts_session_account_target_pct
+                
                 self.log_message(
-                    f"💰 SESSION PROFIT TARGET HIT! Total P&L: ${self.ts_session_total_pnl:,.2f} "
-                    f"({self.ts_session_total_pct:+.2f}%) - Target: {self.ts_session_account_target_pct}%",
+                    f"💰 SESSION PROFIT TARGET HIT! Total P&L: ${total_pnl:,.2f} "
+                    f"({total_pct:+.2f}%) - Target: {target}%",
                     "SUCCESS"
                 )
                 logger.warning(
-                    f"🎯 SESSION PROFIT TARGET HIT! ${self.ts_session_total_pnl:.2f} "
-                    f"({self.ts_session_total_pct:.2f}%) >= {self.ts_session_account_target_pct}% target"
+                    f"🎯 SESSION PROFIT TARGET HIT! ${total_pnl:.2f} "
+                    f"({total_pct:.2f}%) >= {target}% target"
                 )
-                # Show popup alert
-                QMessageBox.information(
+                
+                # Close positions and disable automation FIRST
+                self.handle_profit_target_hit(f"Session profit {total_pct:+.2f}%")
+                
+                # Show non-blocking popup AFTER with slight delay
+                QTimer.singleShot(100, lambda: QMessageBox.information(
                     self,
                     "💰 Session Profit Target Hit!",
-                    f"Session Total P&L: ${self.ts_session_total_pnl:+,.2f}\n"
-                    f"Percentage: {self.ts_session_total_pct:+.2f}%\n"
-                    f"Target: {self.ts_session_account_target_pct:.1f}%\n\n"
-                    f"Unrealized: ${self.ts_session_unrealized_pnl:+,.2f}\n"
-                    f"Realized: ${self.ts_session_realized_pnl:+,.2f}\n\n"
-                    f"All positions are being closed."
-                )
-                self.handle_profit_target_hit(f"Session profit {self.ts_session_total_pct:+.2f}%")
+                    f"Session Total P&L: ${total_pnl:+,.2f}\n"
+                    f"Percentage: {total_pct:+.2f}%\n"
+                    f"Target: {target:.1f}%\n\n"
+                    f"Unrealized: ${unrealized:+,.2f}\n"
+                    f"Realized: ${realized:+,.2f}\n\n"
+                    f"All positions have been closed.\n"
+                    f"Automation has been disabled."
+                ))
                 return
         else:
             logger.debug("📊 SESSION TARGET: Disabled")
@@ -11673,27 +11705,38 @@ class MainWindow(QMainWindow):
                 f"(Unrealized=${self.ts_session_unrealized_pnl:,.2f}, Realized=${self.ts_session_realized_pnl:,.2f})"
             )
             if self.ts_session_total_pct <= -self.ts_session_account_stop_pct:
+                # Save values before they change
+                total_pnl = self.ts_session_total_pnl
+                total_pct = self.ts_session_total_pct
+                unrealized = self.ts_session_unrealized_pnl
+                realized = self.ts_session_realized_pnl
+                stop = self.ts_session_account_stop_pct
+                
                 self.log_message(
-                    f"📉 SESSION STOP LOSS HIT! Total P&L: ${self.ts_session_total_pnl:,.2f} "
-                    f"({self.ts_session_total_pct:+.2f}%) - Stop: -{self.ts_session_account_stop_pct}%",
+                    f"📉 SESSION STOP LOSS HIT! Total P&L: ${total_pnl:,.2f} "
+                    f"({total_pct:+.2f}%) - Stop: -{stop}%",
                     "ERROR"
                 )
                 logger.warning(
-                    f"🛑 SESSION STOP LOSS HIT! ${self.ts_session_total_pnl:.2f} "
-                    f"({self.ts_session_total_pct:.2f}%) <= -{self.ts_session_account_stop_pct}% stop"
+                    f"🛑 SESSION STOP LOSS HIT! ${total_pnl:.2f} "
+                    f"({total_pct:.2f}%) <= -{stop}% stop"
                 )
-                # Show popup alert
-                QMessageBox.critical(
+                
+                # Close positions and disable automation FIRST
+                self.handle_profit_target_hit(f"Session stop {total_pct:+.2f}%")
+                
+                # Show non-blocking popup AFTER with slight delay
+                QTimer.singleShot(100, lambda: QMessageBox.critical(
                     self,
                     "🚨 Session Stop Loss Hit!",
-                    f"Session Total P&L: ${self.ts_session_total_pnl:+,.2f}\n"
-                    f"Percentage: {self.ts_session_total_pct:+.2f}%\n"
-                    f"Stop: -{self.ts_session_account_stop_pct:.1f}%\n\n"
-                    f"Unrealized: ${self.ts_session_unrealized_pnl:+,.2f}\n"
-                    f"Realized: ${self.ts_session_realized_pnl:+,.2f}\n\n"
-                    f"All positions are being closed."
-                )
-                self.handle_profit_target_hit(f"Session stop {self.ts_session_total_pct:+.2f}%")
+                    f"Session Total P&L: ${total_pnl:+,.2f}\n"
+                    f"Percentage: {total_pct:+.2f}%\n"
+                    f"Stop: -{stop:.1f}%\n\n"
+                    f"Unrealized: ${unrealized:+,.2f}\n"
+                    f"Realized: ${realized:+,.2f}\n\n"
+                    f"All positions have been closed.\n"
+                    f"Automation has been disabled."
+                ))
                 return
         else:
             logger.debug("📊 SESSION STOP: Disabled")
@@ -14649,6 +14692,26 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.error(f"Error calculating next entry dollar amount: {e}")
             self.ts_martingale_next_qty_label.setText(f"Next Entry: $--")
+    
+    def on_martingale_reset_clicked(self):
+        """Reset Martingale counter to zero losses (1x multiplier)"""
+        old_losses = self.ts_martingale_consecutive_losses
+        old_multiplier = 2 ** old_losses
+        
+        # Reset counter
+        self.ts_martingale_consecutive_losses = 0
+        self.ts_martingale_stopped = False
+        self.ts_martingale_just_reset = False
+        
+        # Update display
+        self.update_martingale_loss_label()
+        
+        # Log the reset
+        self.log_message(
+            f"🔄 Martingale MANUALLY RESET: {old_multiplier}x → 1x (losses: {old_losses} → 0)",
+            "SUCCESS"
+        )
+        logger.info(f"Martingale manually reset: {old_losses} losses → 0, multiplier {old_multiplier}x → 1x")
     
     def update_acct_pct_dollar_display(self):
         """Update the account percentage dollar amount display"""
