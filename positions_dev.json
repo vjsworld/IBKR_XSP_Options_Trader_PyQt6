@@ -1,26 +1,8 @@
 {
-  "XSP_664.0_C_20251118": {
-    "position": -24.0,
-    "avgCost": 0.14871600000000001,
-    "entryTime": "2025-11-18T17:50:10.726821",
-    "is_automated": false
-  },
-  "XSP_661.0_P_20251118": {
-    "position": -12.0,
-    "avgCost": 0.002716,
-    "entryTime": "2025-11-18T14:55:39.949916",
-    "is_automated": true
-  },
-  "XSP_662.0_P_20251118": {
-    "position": -12.0,
-    "avgCost": 0.1400493335,
-    "entryTime": "2025-11-18T17:50:10.747822",
-    "is_automated": false
-  },
   "ES_6670.0_C_20251119": {
-    "position": 1.0,
-    "avgCost": 14.2784,
-    "entryTime": "2025-11-18T18:22:47.446297",
+    "position": 4.0,
+    "avgCost": 15.0284,
+    "entryTime": "2025-11-18T18:32:18.438181",
     "is_automated": true
   }
 }

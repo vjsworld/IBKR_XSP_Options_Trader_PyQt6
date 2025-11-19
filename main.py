@@ -3199,6 +3199,7 @@ class MainWindow(QMainWindow):
         self.virtually_closed_positions = set()  # Track contract_keys that we've virtually closed
         self.ignored_expired_contracts = set()  # Contract_keys to ignore in positions grid (waiting for TWS removal)
         self.expired_options_check_delay_minutes = 1  # Minutes after expiration to check (default: 1)
+        self.virtually_closed_cleanup_counter = 0  # Counter for periodic cleanup (every 60 seconds)
         
         # Chart data storage - separate from general historical_data for chart-specific needs
         self.chart_data = {
@@ -3546,6 +3547,7 @@ class MainWindow(QMainWindow):
         # Load settings
         self.load_settings()
         self.load_positions()  # Load saved positions to preserve entryTime
+        self.load_virtually_closed_contracts()  # Load virtually closed expired contracts
         self.reconstruct_trade_entries_from_log()  # Reconstruct open trades for P&L tracking
         
         # Calculate initial session P&L from PnL.csv (for realized trades from previous sessions)
@@ -11536,6 +11538,12 @@ class MainWindow(QMainWindow):
         # Update session PnL display (runs every second with position updates)
         self.update_session_pnl_labels()
         
+        # Periodic cleanup of virtually closed contracts (every 60 seconds)
+        self.virtually_closed_cleanup_counter += 1
+        if self.virtually_closed_cleanup_counter >= 60:
+            self.virtually_closed_cleanup_counter = 0
+            self.cleanup_virtually_closed_contracts()
+        
         # Check profit targets and stop loss
         self.check_profit_targets_and_stop_loss()
     
@@ -11767,6 +11775,9 @@ class MainWindow(QMainWindow):
                 # Clean up tracking
                 if contract_key in self._position_source_map:
                     del self._position_source_map[contract_key]
+            
+            # Save virtually closed contracts to persistence
+            self.save_virtually_closed_contracts()
             
             # Update positions display
             self.update_positions_display()
@@ -16490,6 +16501,24 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.error(f"Error saving positions: {e}", exc_info=True)
     
+    def save_virtually_closed_contracts(self):
+        """
+        Save virtually closed contracts to persistent storage.
+        These are contracts that were virtually closed but TWS still reports them.
+        They need to be ignored until TWS removes them from the portfolio.
+        """
+        try:
+            data = {
+                'virtually_closed': list(self.virtually_closed_positions),
+                'ignored_expired': list(self.ignored_expired_contracts)
+            }
+            
+            vc_file = self.get_environment_file_path('virtually_closed.json')
+            Path(vc_file).write_text(json.dumps(data, indent=2))
+            logger.debug(f"Saved {len(self.virtually_closed_positions)} virtually closed contracts")
+        except Exception as e:
+            logger.error(f"Error saving virtually closed contracts: {e}", exc_info=True)
+    
     def load_positions(self):
         """
         Load positions from environment-specific JSON file on startup
@@ -16517,6 +16546,47 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.error(f"Error loading positions: {e}", exc_info=True)
             self.saved_positions = {}
+    
+    def load_virtually_closed_contracts(self):
+        """
+        Load virtually closed contracts from persistent storage.
+        These contracts were virtually closed in a previous session and need to remain
+        ignored until TWS removes them from the portfolio.
+        """
+        try:
+            vc_file = self.get_environment_file_path('virtually_closed.json')
+            if Path(vc_file).exists():
+                data = json.loads(Path(vc_file).read_text())
+                self.virtually_closed_positions = set(data.get('virtually_closed', []))
+                self.ignored_expired_contracts = set(data.get('ignored_expired', []))
+                logger.info(f"Loaded {len(self.virtually_closed_positions)} virtually closed contracts")
+                logger.info(f"Ignoring {len(self.ignored_expired_contracts)} expired contracts until TWS removes them")
+        except Exception as e:
+            logger.error(f"Error loading virtually closed contracts: {e}", exc_info=True)
+    
+    def cleanup_virtually_closed_contracts(self):
+        """
+        Clean up virtually closed contracts that TWS no longer reports.
+        Called periodically to remove stale entries from persistence.
+        """
+        try:
+            # Get current TWS positions (contracts that TWS is still reporting)
+            tws_contracts = set(self.positions.keys())
+            
+            # Find contracts that were virtually closed but TWS no longer reports
+            removed_contracts = self.ignored_expired_contracts - tws_contracts
+            
+            if removed_contracts:
+                logger.info(f"🧹 Cleaning up {len(removed_contracts)} contracts no longer reported by TWS")
+                for contract_key in removed_contracts:
+                    self.virtually_closed_positions.discard(contract_key)
+                    self.ignored_expired_contracts.discard(contract_key)
+                
+                # Save updated lists
+                self.save_virtually_closed_contracts()
+                logger.info(f"✅ Cleanup complete: {len(self.ignored_expired_contracts)} contracts still ignored")
+        except Exception as e:
+            logger.error(f"Error cleaning up virtually closed contracts: {e}", exc_info=True)
     
     def merge_saved_positions(self, contract_key: str):
         """

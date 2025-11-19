@@ -229,3 +229,12 @@ DateTime,Signal,Action,Contract,Status,Price,Details
 2025-11-18 18:22:45,EXIT,SELL,ES 6590.0 P 20251119,Closing,18.50,Exit PUT: 1.0 @ $18.50
 2025-11-18 18:22:45,LONG (Call),BUY,ES 6670.0 C 20251119,Preparing,N/A,Entry: LONG (Call) at 30Δ
 2025-11-18 18:22:45,LONG (Call),BUY,ES 6670.0 C 20251119,Placing Order,14.00,Qty: 1 @ $14.00
+2025-11-18 18:29:30,SHORT,Signal,N/A,Received,N/A,Strategy changed: LONG → SHORT
+2025-11-18 18:29:30,EXIT,SELL,ES 6670.0 C 20251119,Closing,13.00,Exit CALL: 1.0 @ $13.00
+2025-11-18 18:29:30,SHORT (Put),BUY,ES 6590.0 P 20251119,Preparing,N/A,Entry: SHORT (Put) at 30Δ
+2025-11-18 18:29:30,SHORT (Put),BUY,ES 6590.0 P 20251119,Placing Order,20.00,Qty: 2 @ $20.00
+2025-11-18 18:32:15,LONG,Signal,N/A,Received,N/A,Strategy changed: SHORT → LONG
+2025-11-18 18:32:15,EXIT,SELL,ES 6590.0 P 20251119,Closing,18.00,Exit PUT: 2.0 @ $18.00
+2025-11-18 18:32:15,LONG (Call),BUY,ES 6670.0 C 20251119,Preparing,N/A,Entry: LONG (Call) at 30Δ
+2025-11-18 18:32:15,LONG (Call),BUY,ES 6670.0 C 20251119,Placing Order,14.75,Qty: 4 @ $14.75
+2025-11-18 18:42:06,LONG,Signal,N/A,Received,N/A,Strategy changed: FLAT → LONG
