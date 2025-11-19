@@ -11715,6 +11715,35 @@ class MainWindow(QMainWindow):
                     mid_price=current_value  # Use current value as "mid" for virtual close
                 )
                 
+                # Log to PnL.csv for realized P&L tracking
+                entry_time = pos.get('entryTime', now_ct)
+                
+                # Determine entry action based on position sign
+                if pos.get('position', 0) > 0:
+                    entry_action = 'BUY'   # LONG position
+                    exit_action = 'SELL'   # Close by selling
+                else:
+                    entry_action = 'SELL'  # SHORT position
+                    exit_action = 'BUY'    # Close by buying back
+                
+                entry_data = {
+                    'datetime': entry_time.strftime('%Y-%m-%d %H:%M:%S') if isinstance(entry_time, datetime) else str(entry_time),
+                    'action': entry_action,
+                    'quantity': position_size,
+                    'avg_price': avg_cost,
+                    'is_automated': is_automated
+                }
+                
+                exit_data = {
+                    'datetime': now_ct.strftime('%Y-%m-%d %H:%M:%S'),
+                    'action': exit_action,
+                    'quantity': position_size,
+                    'avg_price': current_value,
+                    'is_automated': False  # Virtual close is always manual trigger
+                }
+                
+                self.log_pnl_to_csv(contract_key, entry_data, exit_data)
+                
                 # Log message
                 self.log_message(
                     f"⏰ VIRTUAL CLOSE (EXPIRED): {contract_key} - "
